@@ -99,3 +99,31 @@ async fn get_missing_is_not_found() {
         Err(RepoError::NotFound(LeadId(-1)))
     ));
 }
+
+#[tokio::test]
+async fn unknown_status_in_db_fails_closed() {
+    // Fail-closed on bad data: a row whose status string the engine does not
+    // recognize must surface a Storage error, never a silent default. We write
+    // an invalid status directly (bypassing the typed API) and read it back.
+    let Some(db) = db().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let campaign = make_campaign(&db).await;
+    let lead = db
+        .leads()
+        .create(nl(campaign, "+15550009999"))
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE leads SET status = 'bogus_status' WHERE id = $1")
+        .bind(lead.id.0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    match db.leads().get(lead.id).await {
+        Err(RepoError::Storage(msg)) => assert!(msg.contains("unknown lead status")),
+        other => panic!("expected Storage error on unknown status, got {other:?}"),
+    }
+}

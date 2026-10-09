@@ -192,3 +192,102 @@ fn up_count_ordering_fresh_first() {
     let ids: Vec<i64> = sel.eligible.iter().map(|l| l.id.0).collect();
     assert_eq!(ids, vec![2, 3, 1]); // called_count 0,1,2
 }
+
+#[test]
+fn up_count_ties_break_by_id_ascending() {
+    // All same call_count -> stable tie-break by id ascending.
+    let input = SelectionInput {
+        leads: vec![
+            lead(3, LeadStatus::New, 5, Some("America/New_York"), "+1c"),
+            lead(1, LeadStatus::New, 5, Some("America/New_York"), "+1a"),
+            lead(2, LeadStatus::New, 5, Some("America/New_York"), "+1b"),
+        ],
+        windows: &windows(),
+        dnc: &DncSet::default(),
+        call_count_limit: None,
+        order: Order::UpCount,
+        ruleset: None,
+    };
+    let ids: Vec<i64> = select(&clock_inside(), input)
+        .eligible
+        .iter()
+        .map(|l| l.id.0)
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[test]
+fn oldest_order_is_id_ascending_ignoring_call_count() {
+    let input = SelectionInput {
+        leads: vec![
+            lead(2, LeadStatus::New, 0, Some("America/New_York"), "+1b"),
+            lead(1, LeadStatus::New, 9, Some("America/New_York"), "+1a"),
+        ],
+        windows: &windows(),
+        dnc: &DncSet::default(),
+        call_count_limit: None,
+        order: Order::Oldest,
+        ruleset: None,
+    };
+    let ids: Vec<i64> = select(&clock_inside(), input)
+        .eligible
+        .iter()
+        .map(|l| l.id.0)
+        .collect();
+    assert_eq!(ids, vec![1, 2]); // by id, not by call_count
+}
+
+#[test]
+fn routing_rule_that_does_not_match_leaves_lead_eligible() {
+    // Rule only skips TX; an NY lead passes through eligible.
+    let rs = Ruleset::new(vec![
+        Detail::condition("state", "^TX$", 0, 0),
+        Detail::action("skip", "", 0, 10),
+    ]);
+    let input = SelectionInput {
+        leads: vec![lead(
+            1,
+            LeadStatus::New,
+            0,
+            Some("America/New_York"),
+            "+1ny",
+        )],
+        windows: &windows(),
+        dnc: &DncSet::default(),
+        call_count_limit: None,
+        order: Order::UpCount,
+        ruleset: Some(&rs),
+    };
+    let sel = select(&clock_inside(), input);
+    assert_eq!(sel.eligible.len(), 1);
+    assert!(sel.excluded.is_empty());
+}
+
+#[test]
+fn every_lead_appears_exactly_once_across_eligible_and_excluded() {
+    let mut tx_lead = lead(4, LeadStatus::New, 0, Some("America/New_York"), "+1tx");
+    tx_lead.state = Some("TX".into());
+    let rs = Ruleset::new(vec![
+        Detail::condition("state", "^TX$", 0, 0),
+        Detail::action("skip", "", 0, 10),
+    ]);
+    let input = SelectionInput {
+        leads: vec![
+            lead(1, LeadStatus::New, 0, Some("America/New_York"), "+1ok"), // eligible
+            lead(2, LeadStatus::Done, 0, Some("America/New_York"), "+1done"), // status
+            lead(3, LeadStatus::New, 0, None, "+1notz"),                   // compliance
+            tx_lead,                                                       // routing
+        ],
+        windows: &windows(),
+        dnc: &DncSet::default(),
+        call_count_limit: None,
+        order: Order::UpCount,
+        ruleset: Some(&rs),
+    };
+    let sel = select(&clock_inside(), input);
+    assert_eq!(sel.eligible.len(), 1);
+    assert_eq!(sel.excluded.len(), 3);
+    // No lead lost or duplicated: 1 + 3 == 4 inputs.
+    let total = sel.eligible.len() + sel.excluded.len();
+    assert_eq!(total, 4);
+}

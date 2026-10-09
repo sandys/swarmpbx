@@ -32,3 +32,26 @@ pub fn version() -> &'static str {
 /// Marker for values that are safe to show in logs (no PII). Used to make the
 /// "never echo secrets/PII" rule visible at the type level over time.
 pub trait NonSensitive: fmt::Debug {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_error_display_is_informative() {
+        assert_eq!(
+            CoreError::Config("bad".into()).to_string(),
+            "configuration error: bad"
+        );
+        assert_eq!(CoreError::NotFound("x".into()).to_string(), "not found: x");
+        assert_eq!(
+            CoreError::Invalid("y".into()).to_string(),
+            "invalid input: y"
+        );
+    }
+
+    #[test]
+    fn version_is_nonempty() {
+        assert!(!version().is_empty());
+    }
+}

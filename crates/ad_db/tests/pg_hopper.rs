@@ -100,3 +100,51 @@ async fn concurrent_claims_are_disjoint() {
     // Hopper fully drained.
     assert_eq!(db.hopper().available_count(campaign).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn rolled_back_claim_releases_lock_for_recovery() {
+    // Crash recovery: SKIP LOCKED means an in-flight claim holds a row lock
+    // that other workers skip; if that worker "crashes" (its transaction rolls
+    // back), the lock is released and the lead becomes claimable again. We
+    // simulate the crash by holding a FOR UPDATE SKIP LOCKED lock in one
+    // transaction, then rolling it back.
+    let Some(db) = db().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (campaign, ids) = seed(&db, 1).await; // exactly one hopper item
+    let only_lead = ids[0].0;
+
+    // Transaction A locks the single row (worker mid-claim), does NOT commit.
+    let mut tx_a = db.pool().begin().await.unwrap();
+    let locked: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM hopper WHERE campaign_id = $1 AND claimed_by IS NULL \
+         ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(campaign.0)
+    .fetch_optional(&mut *tx_a)
+    .await
+    .unwrap();
+    assert!(locked.is_some(), "A should have locked the row");
+
+    // While A holds the lock, a normal claim by B must find nothing (SKIP
+    // LOCKED skips the locked row rather than blocking on it).
+    let b_before = db
+        .hopper()
+        .claim_batch(campaign, "worker-b", 10)
+        .await
+        .unwrap();
+    assert!(b_before.is_empty(), "B must skip the row A has locked");
+
+    // A "crashes": roll back. The lock releases and the row is available again.
+    tx_a.rollback().await.unwrap();
+
+    // Now B claims it successfully — recovery without any manual cleanup.
+    let b_after = db
+        .hopper()
+        .claim_batch(campaign, "worker-b", 10)
+        .await
+        .unwrap();
+    assert_eq!(b_after.len(), 1);
+    assert_eq!(b_after[0].lead_id.0, only_lead);
+}
