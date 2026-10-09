@@ -1,0 +1,38 @@
+# MVP end-to-end stack: a real LiveKit agent wired into a room, then a SIP call.
+# Order matters: the agent (subject under test) comes up and joins the room
+# first; the SIP call (stimulus) is driven afterward by run_mvp_test.sh.
+#
+# Host networking so SIP/RTP/WebRTC/agent-HTTP ports all work without NAT (WSL2).
+services:
+  redis:
+    image: redis:7
+    network_mode: host
+    command: ["redis-server", "--port", "6379"]
+
+  livekit:
+    image: livekit/livekit-server:latest
+    network_mode: host
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    depends_on: [redis]
+
+  livekit-sip:
+    image: livekit/sip:latest
+    network_mode: host
+    command: ["--config", "/etc/sip.yaml"]
+    volumes:
+      - ./sip.yaml:/etc/sip.yaml:ro
+    depends_on: [redis, livekit]
+
+  agent:
+    build:
+      context: ./agent
+    network_mode: host
+    environment:
+      LIVEKIT_URL: ws://127.0.0.1:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: devsecret_devsecret_devsecret_32b
+      AGENT_ROOM: spike-room
+      AGENT_IDENTITY: mvp-agent
+    depends_on: [livekit]

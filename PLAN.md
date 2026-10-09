@@ -273,6 +273,28 @@ working reference to conform to.
 LiveKit's own gateway is proven. The campaign/compliance brain (§0.10) is
 unaffected — it sits above `ad_gateway.initiate_call()` regardless of the WebRTC
 leg's implementation.
+
+**MVP wiring verdict (real agent subscriber, automated test).** The minimum
+viable product — *a real LiveKit agent wired into a room as a subscriber, then a
+SIP call driven into it* — is proven as a legitimate automated test
+(`spike/livekit/run_mvp_test.sh`, agent in `spike/livekit/agent/`). The agent is
+a genuine LiveKit RTC participant (subscribe + publish via the `livekit` SDK);
+it omits STT/LLM/TTS, which need API keys and are non-deterministic and so do
+not belong in a wiring test. Order enforced by the harness: the agent is wired
+and confirmed in the room **first**; the SIP call is the stimulus applied
+**after**, and the harness refuses to place the call if wiring fails. Assertions
+(polled with deadlines, non-zero exit on failure):
+
+- agent `connected: true` and present in the server-side room participant list
+  before any SIP call;
+- after the call: `subscribed_tracks ≥ 1`, `frames_in > 0` (caller→agent audio
+  received), `frames_out > 0` (agent→caller audio published).
+
+Positive run: PASS (`subscribed_tracks=1, frames_in=102, frames_out=3446`).
+Negative run (mutation: agent joins the wrong room): FAIL with exit 1
+(`subscribed_tracks=0, frames_in=0`) — the test has teeth. The next layer is a
+full `livekit-agents` brain (STT/LLM/TTS, needs keys); the wiring beneath it is
+done and automated.
 The bridge options we evaluate for the production `ad_gateway`, cheapest first:
 
 1. **rtpengine ↔ LiveKit WebRTC directly.** rtpengine speaks ICE/DTLS-SRTP and
