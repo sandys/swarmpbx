@@ -11,6 +11,9 @@ contract for anyone (human or agent) editing the code.
   `dispatch`, `migrate`). One image, many roles.
 
 ## Hard rules
+- **Docker-first, always.** Build and run everything in containers — locally and
+  in CI, identically. Do not assume a host toolchain (no host `cargo`, no host
+  Postgres). The test tier runs through `docker compose -f docker-compose.test.yml`.
 - **Vertical slices, not phases.** Every feature ships together: domain logic +
   its API endpoint (if user-facing) + its tests, all green in the same change.
   Never "logic now, API later, tests later." If a feature has no API surface
@@ -25,6 +28,10 @@ contract for anyone (human or agent) editing the code.
   registries. Adding a variant = its own module + a minimal, enumerated set of
   edits. No DB migration to add a variant (discriminator in data).
 - **RAII/Drop over manual cleanup** for slots, claims, SIP legs.
+- **Always stop the stack after tests.** When you start `docker compose up -d`
+  (or any test container) you MUST run `docker compose down` as soon as the
+  tests finish, including on failure. Never leave containers running between
+  tasks. See the Database section for the test workflow.
 - **Honest status.** `experimental` means experimental and is surfaced in APIs.
   Never overstate what works in commits/PRs/messages.
 
@@ -37,27 +44,30 @@ contract for anyone (human or agent) editing the code.
 - Property tests for invariants (compliance has fail-closed/always-open ones).
 
 ## Before you say "done"
-Run and pass:
+Run and pass the Docker-first test tier (fmt + clippy + full suite, including
+the Postgres integration tests, all inside containers):
 ```
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
+docker compose -f docker-compose.test.yml up --build \
+    --abort-on-container-exit --exit-code-from tests
+docker compose -f docker-compose.test.yml down        # keep cache volumes
 ```
-If you didn't run the tests, it isn't done.
+CI runs the exact same compose. If you didn't run the tests, it isn't done.
 
 ## Database (Postgres)
 
-The data layer is `ad_db` (sqlx + Postgres). Start a local database and run the
-integration tests against it:
+The data layer is `ad_db` (sqlx + Postgres). The dockerized test tier above
+starts Postgres as a compose service and points the integration tests at it via
+`DATABASE_URL`. For an interactive local database, use `docker-compose.yml`:
 ```
 docker compose up -d
-DATABASE_URL=postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer \
-    cargo test -p ad_db
 ```
-Database integration tests skip when `DATABASE_URL` is unset, so a plain
-`cargo test --all` stays green with no database. The API uses Postgres when
-`DATABASE_URL` is set, else an in-memory store. Apply migrations with
-`agentdialer migrate` (needs `DATABASE_URL`).
+The API uses Postgres when `DATABASE_URL` is set, else an in-memory store. Apply
+migrations with `agentdialer migrate` (needs `DATABASE_URL`).
+
+**Always stop the stack after tests. Never leave it up.** When you start
+`docker compose up -d` for a test run, run `docker compose down` as soon as the
+tests finish, including on failure. Do not leave containers running between
+tasks.
 
 ## Comments
 Comments must earn their place: would the next reader spend multiple tool calls

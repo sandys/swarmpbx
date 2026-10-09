@@ -1,0 +1,22 @@
+# Test runner image. Builds and runs the Rust test suite in a container so the
+# fast tier runs identically on a developer machine and in CI. No host Rust
+# toolchain is assumed.
+#
+# clippy + rustfmt ship with the official rust image's default toolchain.
+FROM rust:1.90-slim-bookworm
+
+# System deps: pkg-config + libssl are commonly needed by transitive crates;
+# ca-certificates for crates.io over TLS. Keep this layer small and cached.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add rustfmt clippy
+
+WORKDIR /app
+
+# A persistent cargo registry/target cache is mounted at run time (see
+# docker-compose.test.yml), so we do not COPY sources into the image. The
+# working tree is bind-mounted. This keeps the image tiny and builds fast
+# across runs because the cache volume survives.
+ENV CARGO_TERM_COLOR=always

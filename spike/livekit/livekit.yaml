@@ -1,0 +1,13 @@
+# LiveKit server config for the SIP<->WebRTC spike. Local throwaway only.
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50050
+  use_external_ip: false
+redis:
+  address: 127.0.0.1:6379
+keys:
+  devkey: devsecret_devsecret_devsecret_32b
+logging:
+  level: info

@@ -1,0 +1,31 @@
+# LiveKit SIP<->WebRTC spike stack.
+# Host networking so SIP (5062), RTP (20000-20050), WebRTC (50000-50050),
+# and the LiveKit WS (7880) all work without Docker NAT translation (WSL2).
+# Start: docker compose -f docker-compose.livekit.yml up -d
+# ALWAYS: docker compose -f docker-compose.livekit.yml down  (after tests)
+services:
+  redis:
+    image: redis:7
+    network_mode: host
+    command: ["redis-server", "--port", "6379"]
+    restart: unless-stopped
+
+  livekit:
+    image: livekit/livekit-server:latest
+    network_mode: host
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    depends_on: [redis]
+    restart: unless-stopped
+
+  livekit-sip:
+    image: livekit/sip:latest
+    network_mode: host
+    environment:
+      SIP_CONFIG_BODY: ""
+    command: ["--config", "/etc/sip.yaml"]
+    volumes:
+      - ./sip.yaml:/etc/sip.yaml:ro
+    depends_on: [redis, livekit]
+    restart: unless-stopped

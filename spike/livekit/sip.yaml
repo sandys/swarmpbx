@@ -1,0 +1,12 @@
+# LiveKit SIP service config. Bridges SIP<->WebRTC into a LiveKit room.
+api_key: devkey
+api_secret: devsecret_devsecret_devsecret_32b
+ws_url: ws://127.0.0.1:7880
+redis:
+  address: 127.0.0.1:6379
+sip_port: 5062
+rtp_port: 20000
+rtp_port_range_end: 20050
+use_external_ip: false
+logging:
+  level: info

@@ -4,44 +4,18 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test --all
-
-  db-tests:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: agentdialer
-          POSTGRES_PASSWORD: agentdialer
-          POSTGRES_DB: agentdialer
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "pg_isready -U agentdialer -d agentdialer"
-          --health-interval 2s --health-timeout 3s --health-retries 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: db integration tests
-        env:
-          DATABASE_URL: postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer
-        run: cargo test -p ad_db
+      # Docker-first: the exact same compose developers run locally. fmt +
+      # clippy + the full test suite (including the Postgres integration
+      # tests) all run inside containers. No host Rust toolchain is used.
+      - name: run dockerized test tier
+        run: >-
+          docker compose -f docker-compose.test.yml up
+          --build --abort-on-container-exit --exit-code-from tests
+      - name: tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

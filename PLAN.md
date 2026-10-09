@@ -259,11 +259,37 @@ before committing the production `ad_gateway`:
    escape hatch if (1)/(2) prove too costly — explicitly the thing we're trying
    to avoid, but it de-risks the schedule.
 
-**Interim stance.** Until the bridge is spiked, the §0.3.1 result stands as "SIP
-origination + media relay proven"; the LiveKit WebRTC leg is an **open
-integration risk** tracked here, not a solved one. The campaign/compliance brain
-(§0.10, below) is unaffected — it sits above `ad_gateway.initiate_call()`
-regardless of how the WebRTC leg is implemented.
+**Spike verdict (SIP↔WebRTC proven end to end).** A second spike
+(`spike/livekit/`) stood up **LiveKit server + Redis + the `livekit/sip`
+gateway** via docker-compose, created an inbound SIP trunk and a direct dispatch
+rule, and placed a real SIP INVITE with **SIPp**. The result, confirmed by
+polling the room:
+
+```
+[2s..10s] sip_+15550001111 (ACTIVE)  tracks: 1
+```
+
+The gateway logs show the full signaling path crossing SIP→WebRTC into the
+LiveKit room: `inviteToTryingMs: 2`, `inviteToRingingMs: 17`,
+`inviteToJoinRoomMs: 103`. So the "websocket/SIP nastiness" works: a SIP call
+becomes a live, audio-publishing LiveKit room participant.
+
+Honest nuance: the call then ended `reason: cannot-subscribe` with
+`audio_packets: 0`, because **no agent was in the room to subscribe** to the
+caller's track (and SIPp's container media timing was imperfect). So SIP→room
+join + publish is proven; the full two-way audio loop needs a subscriber (an
+agent) in the room — the next spike step.
+
+This used the `livekit/sip` gateway as the reference bridge. It proves the path
+and de-risks the architecture. Owning the bridge ourselves (`ad_gateway`,
+options 1/2 above) remains the §0.9a goal; the reference now exists to conform
+to.
+
+**Interim stance.** The §0.3.1 result proves "SIP origination + media relay"; the
+spike above proves "SIP→WebRTC→LiveKit room join + publish". Still open: our own
+`ad_gateway` bridge, and the two-way audio loop with an agent subscriber. The
+campaign/compliance brain (§0.10, below) is unaffected — it sits above
+`ad_gateway.initiate_call()` regardless of how the WebRTC leg is implemented.
 
 **Crate impact.** Add `ad_gateway` (the SIP↔WebRTC bridge orchestrator) to the
 media-plane crates in §0.7; it owns the room-join + RTP↔WebRTC wiring and is the

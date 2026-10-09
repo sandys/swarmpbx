@@ -1,0 +1,6 @@
+{
+  "trunk": {
+    "name": "spike-inbound",
+    "numbers": ["+10000000000"]
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "name": "spike-dispatch",
+  "rule": { "dispatchRuleDirect": { "roomName": "spike-room" } }
+}
