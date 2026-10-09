@@ -13,3 +13,7 @@
 
 # OS / editor
 .DS_Store
+
+# Regenerable spike media + logs
+spike/livekit/agent.ogg
+*.log

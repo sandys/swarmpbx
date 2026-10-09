@@ -243,11 +243,37 @@ media path becomes:
   audio to a LiveKit room as a participant (via LiveKit's server API + a WebRTC
   transport), bridging rtpengine's RTP to the room's WebRTC tracks.
 
-**New risk this introduces (and how we treat it).** The WebRTC egress leg is a
-*new* unproven piece — strictly larger than "drive drachtio+rtpengine," which is
-all the §0.3.1 spike proved. Honest status: **the SIP↔WebRTC bridge is NOT yet
-spiked.** Options to evaluate, cheapest first, in a dedicated follow-up spike
-before committing the production `ad_gateway`:
+**Spike verdict (SIP↔WebRTC path proven end to end, incl. two-way audio).**
+A docker-compose spike (`spike/livekit/`) ran **LiveKit server + Redis + the
+`livekit/sip` gateway**, created an inbound SIP trunk + a direct dispatch rule,
+and placed a real call. Results, verified:
+
+- **SIP tools (all containerized, no host install):** `sipsak` and `sipexer`
+  (`github.com/miconda/sipexer`) OPTIONS both returned `SIP/2.0 200 OK`; `SIPp`
+  placed full calls.
+- **Two-way audio PROVEN.** With an agent subscriber in the room
+  (`lk room join --auto-subscribe --publish agent.ogg`) and a codec-matched SIPp
+  call (PCMA, matching `g711a.pcap`), the gateway call statistics showed
+  `result=success`, `track_subscribes=1`, and non-zero audio in **both**
+  directions: caller→agent `audio_packets=201`, `audio_rx≈7983`; agent→caller
+  `audio_out_frames=300`, `audio_tx≈7944`.
+
+This proves the "websocket/SIP nastiness" works end to end: a SIP call becomes a
+live LiveKit room participant with a real bidirectional audio loop. Two findings
+that will inform `ad_gateway`: a subscriber must be present or the gateway
+abandons the call (`cannot-subscribe`); and codecs must match the media source.
+
+The spike used the **`livekit/sip` gateway as the reference bridge** to prove
+the path and surface the real failure modes cheaply. Owning the bridge ourselves
+(`ad_gateway`, options 1/2 above) is still the §0.9a goal — now de-risked by a
+working reference to conform to.
+
+**Remaining `ad_gateway` work (still open).** Our own SIP↔WebRTC bridge
+(rtpengine↔LiveKit WebRTC, or a Rust WebRTC participant) is not yet built; only
+LiveKit's own gateway is proven. The campaign/compliance brain (§0.10) is
+unaffected — it sits above `ad_gateway.initiate_call()` regardless of the WebRTC
+leg's implementation.
+The bridge options we evaluate for the production `ad_gateway`, cheapest first:
 
 1. **rtpengine ↔ LiveKit WebRTC directly.** rtpengine speaks ICE/DTLS-SRTP and
    can bridge RTP to a WebRTC endpoint; drive LiveKit's room join via its API and
@@ -258,38 +284,6 @@ before committing the production `ad_gateway`:
 3. **Fallback (not preferred):** run `livekit/sip` after all. Kept only as the
    escape hatch if (1)/(2) prove too costly — explicitly the thing we're trying
    to avoid, but it de-risks the schedule.
-
-**Spike verdict (SIP↔WebRTC proven end to end).** A second spike
-(`spike/livekit/`) stood up **LiveKit server + Redis + the `livekit/sip`
-gateway** via docker-compose, created an inbound SIP trunk and a direct dispatch
-rule, and placed a real SIP INVITE with **SIPp**. The result, confirmed by
-polling the room:
-
-```
-[2s..10s] sip_+15550001111 (ACTIVE)  tracks: 1
-```
-
-The gateway logs show the full signaling path crossing SIP→WebRTC into the
-LiveKit room: `inviteToTryingMs: 2`, `inviteToRingingMs: 17`,
-`inviteToJoinRoomMs: 103`. So the "websocket/SIP nastiness" works: a SIP call
-becomes a live, audio-publishing LiveKit room participant.
-
-Honest nuance: the call then ended `reason: cannot-subscribe` with
-`audio_packets: 0`, because **no agent was in the room to subscribe** to the
-caller's track (and SIPp's container media timing was imperfect). So SIP→room
-join + publish is proven; the full two-way audio loop needs a subscriber (an
-agent) in the room — the next spike step.
-
-This used the `livekit/sip` gateway as the reference bridge. It proves the path
-and de-risks the architecture. Owning the bridge ourselves (`ad_gateway`,
-options 1/2 above) remains the §0.9a goal; the reference now exists to conform
-to.
-
-**Interim stance.** The §0.3.1 result proves "SIP origination + media relay"; the
-spike above proves "SIP→WebRTC→LiveKit room join + publish". Still open: our own
-`ad_gateway` bridge, and the two-way audio loop with an agent subscriber. The
-campaign/compliance brain (§0.10, below) is unaffected — it sits above
-`ad_gateway.initiate_call()` regardless of how the WebRTC leg is implemented.
 
 **Crate impact.** Add `ad_gateway` (the SIP↔WebRTC bridge orchestrator) to the
 media-plane crates in §0.7; it owns the room-join + RTP↔WebRTC wiring and is the
