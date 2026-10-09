@@ -9,6 +9,7 @@ license.workspace = true
 ad_core = { path = "../ad_core" }
 ad_compliance = { path = "../ad_compliance" }
 ad_campaign = { path = "../ad_campaign" }
+ad_lead = { path = "../ad_lead" }
 ad_db = { path = "../ad_db" }
 axum = { workspace = true }
 serde = { workspace = true }

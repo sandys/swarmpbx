@@ -8,6 +8,7 @@ members = [
     "crates/ad_core",
     "crates/ad_compliance",
     "crates/ad_campaign",
+    "crates/ad_lead",
     "crates/ad_db",
     "crates/ad_api",
     "crates/ad_bin",
@@ -43,7 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Testing
 proptest = "1"
 # Database
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "json"] }
 
 [profile.release]
 lto = "thin"

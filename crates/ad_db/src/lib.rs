@@ -9,6 +9,9 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 
+pub mod leads;
+pub use leads::PgLeadRepo;
+
 use ad_campaign::repo::{CampaignRepo, NewCampaign, RepoError};
 use ad_campaign::{Campaign, CampaignState, Counters};
 use ad_core::{CampaignId, OrgId};
@@ -42,6 +45,10 @@ impl Db {
         PgCampaignRepo {
             pool: self.pool.clone(),
         }
+    }
+
+    pub fn leads(&self) -> PgLeadRepo {
+        PgLeadRepo::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {

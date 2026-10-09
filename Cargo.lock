@@ -10,6 +10,7 @@ dependencies = [
  "ad_compliance",
  "ad_core",
  "ad_db",
+ "ad_lead",
  "anyhow",
  "axum",
  "chrono",
@@ -73,9 +74,23 @@ version = "0.1.0"
 dependencies = [
  "ad_campaign",
  "ad_core",
+ "ad_lead",
  "anyhow",
  "chrono",
+ "serde_json",
  "sqlx",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "ad_lead"
+version = "0.1.0"
+dependencies = [
+ "ad_core",
+ "chrono",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
