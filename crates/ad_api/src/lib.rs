@@ -5,6 +5,7 @@
 //! network, no ports, fast and deterministic. `serve()` is the thin production
 //! wrapper the `agentdialer api` subcommand calls.
 
+mod campaign;
 mod compliance;
 
 use std::sync::Arc;
@@ -12,23 +13,27 @@ use std::sync::Arc;
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
 
+use ad_campaign::repo::InMemoryCampaignRepo;
 use ad_core::time::{Clock, SystemClock};
 
 /// Shared application state. The `Clock` is injected so time-dependent
-/// endpoints (compliance) are deterministic under test.
+/// endpoints (compliance) stay deterministic under test. The campaign repo is
+/// the persistence boundary; it is in-memory now and Postgres-backed later.
 #[derive(Clone)]
 pub struct AppState {
     pub clock: Arc<dyn Clock>,
+    pub campaigns: Arc<InMemoryCampaignRepo>,
 }
 
 impl AppState {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
-        Self { clock }
+        Self {
+            clock,
+            campaigns: Arc::new(InMemoryCampaignRepo::new()),
+        }
     }
     pub fn with_system_clock() -> Self {
-        Self {
-            clock: Arc::new(SystemClock),
-        }
+        Self::new(Arc::new(SystemClock))
     }
 }
 
@@ -51,6 +56,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(compliance::routes())
+        .merge(campaign::routes())
         .with_state(state)
 }
 

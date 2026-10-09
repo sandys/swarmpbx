@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ad_core = { path = "../ad_core" }
 ad_compliance = { path = "../ad_compliance" }
+ad_campaign = { path = "../ad_campaign" }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
