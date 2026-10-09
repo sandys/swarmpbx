@@ -1,0 +1,19 @@
+[package]
+name = "ad_bin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentdialer"
+path = "src/main.rs"
+
+[dependencies]
+ad_core = { path = "../ad_core" }
+ad_api = { path = "../ad_api" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

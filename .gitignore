@@ -1,0 +1,15 @@
+# Research corpus — cloned reference repos + downloaded VICIdial source.
+# Kept locally for reference while implementing; not part of this project.
+/_research/
+
+# Rust
+/target/
+/spike/target/
+**/*.rs.bk
+
+# Env / secrets
+.env
+*.local
+
+# OS / editor
+.DS_Store

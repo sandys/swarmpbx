@@ -1,0 +1,45 @@
+# AgentDialer — production Cargo workspace.
+# A workspace of focused crates (Bun-style). The campaign/compliance brain
+# (§0.10) and the media control plane (§0) live here as separate crates.
+# See PLAN.md for the authoritative architecture.
+[workspace]
+resolver = "2"
+members = [
+    "crates/ad_core",
+    "crates/ad_compliance",
+    "crates/ad_api",
+    "crates/ad_bin",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.90"
+license = "AGPL-3.0-or-later"
+repository = "local"
+
+[workspace.dependencies]
+# Foundation
+anyhow = "1"
+thiserror = "2"
+# Time / timezones — the compliance engine's backbone (IANA tz data).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Async runtime + HTTP (used by later phases; pinned here for one source of truth)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
+# CLI
+clap = { version = "4", features = ["derive"] }
+# HTTP API
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Logging / telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Testing
+proptest = "1"
+
+[profile.release]
+lto = "thin"

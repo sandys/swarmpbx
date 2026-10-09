@@ -1,0 +1,31 @@
+# Media-plane fail-fast spike: drachtio (SIP signaling) + rtpengine (media).
+# Goal: prove a Rust control plane can drive these to bridge one SIP call.
+# Note: WSL2 — rtpengine runs in USERSPACE forwarding mode (no kernel module).
+# host networking keeps SIP/RTP addressing simple for a local spike.
+services:
+  drachtio:
+    image: drachtio/drachtio-server:latest
+    network_mode: host
+    command: >
+      drachtio
+      --loglevel info
+      --sofia-loglevel 3
+      --contact "sip:*:5060;transport=udp"
+      --address 0.0.0.0 --port 9022
+      --secret spikesecret
+    restart: unless-stopped
+
+  rtpengine:
+    image: drachtio/rtpengine:latest
+    network_mode: host
+    # Bypass the image entrypoint (its baked conf starts a websocket listener
+    # that cannot bind on WSL2). Run rtpengine directly, userspace forwarding,
+    # ng control on UDP 22222, no HTTP/WS listener.
+    entrypoint: ["rtpengine"]
+    command: >
+      --interface=127.0.0.1
+      --listen-ng=127.0.0.1:22222
+      --port-min=30000 --port-max=30100
+      --foreground --log-stderr --log-level=6
+      --recording-dir=/tmp --recording-method=pcap --recording-format=eth
+    restart: unless-stopped

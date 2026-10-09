@@ -1,0 +1,12 @@
+[package]
+name = "ad_sip_ctl"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "drachtio_spike"
+path = "src/main.rs"
