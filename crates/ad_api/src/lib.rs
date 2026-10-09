@@ -7,6 +7,7 @@
 
 mod campaign;
 mod compliance;
+mod dispatch;
 mod hopper;
 mod lead;
 mod store;
@@ -73,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         .merge(campaign::routes())
         .merge(lead::routes())
         .merge(hopper::routes())
+        .merge(dispatch::routes())
         .with_state(state)
 }
 

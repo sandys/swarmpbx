@@ -1,0 +1,17 @@
+[package]
+name = "ad_orchestrator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ad_core = { path = "../ad_core" }
+ad_campaign = { path = "../ad_campaign" }
+ad_dispatch = { path = "../ad_dispatch" }
+ad_circuit_breaker = { path = "../ad_circuit_breaker" }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true }

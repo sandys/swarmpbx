@@ -12,6 +12,9 @@ ad_campaign = { path = "../ad_campaign" }
 ad_lead = { path = "../ad_lead" }
 ad_routing = { path = "../ad_routing" }
 ad_hopper = { path = "../ad_hopper" }
+ad_dispatch = { path = "../ad_dispatch" }
+ad_orchestrator = { path = "../ad_orchestrator" }
+ad_circuit_breaker = { path = "../ad_circuit_breaker" }
 ad_db = { path = "../ad_db" }
 axum = { workspace = true }
 serde = { workspace = true }

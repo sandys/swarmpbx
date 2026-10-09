@@ -10,6 +10,7 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 
 pub mod hopper;
+pub mod leader;
 pub mod leads;
 pub use hopper::PgHopperRepo;
 pub use leads::PgLeadRepo;

@@ -1,0 +1,15 @@
+[package]
+name = "ad_dispatch"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ad_core = { path = "../ad_core" }
+ad_lead = { path = "../ad_lead" }
+ad_compliance = { path = "../ad_compliance" }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

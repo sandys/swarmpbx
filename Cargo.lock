@@ -7,11 +7,14 @@ name = "ad_api"
 version = "0.1.0"
 dependencies = [
  "ad_campaign",
+ "ad_circuit_breaker",
  "ad_compliance",
  "ad_core",
  "ad_db",
+ "ad_dispatch",
  "ad_hopper",
  "ad_lead",
+ "ad_orchestrator",
  "ad_routing",
  "anyhow",
  "axum",
@@ -47,6 +50,13 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "ad_circuit_breaker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
 ]
 
 [[package]]
@@ -87,6 +97,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ad_dispatch"
+version = "0.1.0"
+dependencies = [
+ "ad_compliance",
+ "ad_core",
+ "ad_lead",
+ "chrono",
+ "tokio",
+]
+
+[[package]]
 name = "ad_hopper"
 version = "0.1.0"
 dependencies = [
@@ -106,6 +127,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "ad_orchestrator"
+version = "0.1.0"
+dependencies = [
+ "ad_campaign",
+ "ad_circuit_breaker",
+ "ad_core",
+ "ad_dispatch",
+ "chrono",
+ "chrono-tz",
  "tokio",
 ]
 
