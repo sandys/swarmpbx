@@ -9,7 +9,9 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 
+pub mod hopper;
 pub mod leads;
+pub use hopper::PgHopperRepo;
 pub use leads::PgLeadRepo;
 
 use ad_campaign::repo::{CampaignRepo, NewCampaign, RepoError};
@@ -49,6 +51,10 @@ impl Db {
 
     pub fn leads(&self) -> PgLeadRepo {
         PgLeadRepo::new(self.pool.clone())
+    }
+
+    pub fn hopper(&self) -> PgHopperRepo {
+        PgHopperRepo::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {

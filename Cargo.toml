@@ -9,6 +9,8 @@ members = [
     "crates/ad_compliance",
     "crates/ad_campaign",
     "crates/ad_lead",
+    "crates/ad_routing",
+    "crates/ad_hopper",
     "crates/ad_db",
     "crates/ad_api",
     "crates/ad_bin",
@@ -43,6 +45,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Testing
 proptest = "1"
+# Routing rule engine
+regex = "1"
 # Database
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "json"] }
 
