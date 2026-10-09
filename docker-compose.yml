@@ -1,0 +1,21 @@
+# Local development and integration-test database.
+# Start with: docker compose up -d
+# Connect:    postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer
+#
+# Port 5433 (not 5432) avoids a clash with any host Postgres.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agentdialer
+      POSTGRES_PASSWORD: agentdialer
+      POSTGRES_DB: agentdialer
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentdialer -d agentdialer"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # Ephemeral storage: a named volume is unnecessary for dev/test and keeps
+    # test runs reproducible. Add a volume later if you want persistence.

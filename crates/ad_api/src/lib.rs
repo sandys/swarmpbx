@@ -7,33 +7,39 @@
 
 mod campaign;
 mod compliance;
+mod store;
 
 use std::sync::Arc;
 
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
 
-use ad_campaign::repo::InMemoryCampaignRepo;
 use ad_core::time::{Clock, SystemClock};
 
+pub use store::CampaignStore;
+
 /// Shared application state. The `Clock` is injected so time-dependent
-/// endpoints (compliance) stay deterministic under test. The campaign repo is
-/// the persistence boundary; it is in-memory now and Postgres-backed later.
+/// endpoints (compliance) stay deterministic under test. The campaign store is
+/// the persistence boundary: in-memory for tests, Postgres in production.
 #[derive(Clone)]
 pub struct AppState {
     pub clock: Arc<dyn Clock>,
-    pub campaigns: Arc<InMemoryCampaignRepo>,
+    pub campaigns: CampaignStore,
 }
 
 impl AppState {
+    /// In-memory state with the given clock. Used by tests and by local runs
+    /// that set no database.
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             clock,
-            campaigns: Arc::new(InMemoryCampaignRepo::new()),
+            campaigns: CampaignStore::in_memory(),
         }
     }
-    pub fn with_system_clock() -> Self {
-        Self::new(Arc::new(SystemClock))
+
+    /// State with an explicit campaign store (for example Postgres).
+    pub fn with_store(clock: Arc<dyn Clock>, campaigns: CampaignStore) -> Self {
+        Self { clock, campaigns }
     }
 }
 
@@ -60,10 +66,24 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Production entrypoint: bind and serve the router.
+/// Production entrypoint: bind and serve. Uses Postgres when `DATABASE_URL` is
+/// set (and runs migrations first), else an in-memory store.
 pub async fn serve(addr: &str) -> anyhow::Result<()> {
-    let state = AppState::with_system_clock();
-    let app = router(state);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let campaigns = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => {
+            let db = ad_db::Db::connect(&url).await?;
+            db.migrate().await?;
+            tracing::info!("campaign store: postgres (migrations applied)");
+            CampaignStore::Pg(db.campaigns())
+        }
+        _ => {
+            tracing::warn!("campaign store: in-memory (DATABASE_URL unset; data is not durable)");
+            CampaignStore::in_memory()
+        }
+    };
+
+    let app = router(AppState::with_store(clock, campaigns));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "api listening");
     axum::serve(listener, app).await?;

@@ -22,3 +22,26 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test --all
+
+  db-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agentdialer
+          POSTGRES_PASSWORD: agentdialer
+          POSTGRES_DB: agentdialer
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U agentdialer -d agentdialer"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: db integration tests
+        env:
+          DATABASE_URL: postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer
+        run: cargo test -p ad_db

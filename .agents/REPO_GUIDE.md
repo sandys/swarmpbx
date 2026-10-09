@@ -45,6 +45,20 @@ cargo test --all
 ```
 If you didn't run the tests, it isn't done.
 
+## Database (Postgres)
+
+The data layer is `ad_db` (sqlx + Postgres). Start a local database and run the
+integration tests against it:
+```
+docker compose up -d
+DATABASE_URL=postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer \
+    cargo test -p ad_db
+```
+Database integration tests skip when `DATABASE_URL` is unset, so a plain
+`cargo test --all` stays green with no database. The API uses Postgres when
+`DATABASE_URL` is set, else an in-memory store. Apply migrations with
+`agentdialer migrate` (needs `DATABASE_URL`).
+
 ## Comments
 Comments must earn their place: would the next reader spend multiple tool calls
 to understand this without it? If not, delete it. If a workaround needs a

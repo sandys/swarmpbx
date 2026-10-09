@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 ad_core = { path = "../ad_core" }
 ad_api = { path = "../ad_api" }
+ad_db = { path = "../ad_db" }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "ad_db"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ad_core = { path = "../ad_core" }
+ad_campaign = { path = "../ad_campaign" }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

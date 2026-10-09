@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use ad_campaign::repo::{CampaignRepo, NewCampaign, RepoError};
+use ad_campaign::repo::{NewCampaign, RepoError};
 use ad_campaign::{Campaign, CampaignState, Counters, Transition};
 use ad_core::{CampaignId, OrgId};
 

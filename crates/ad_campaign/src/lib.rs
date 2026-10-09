@@ -29,6 +29,31 @@ impl CampaignState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, CampaignState::Completed | CampaignState::Failed)
     }
+
+    /// Stable wire/storage string. Used by the database layer.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CampaignState::Draft => "draft",
+            CampaignState::Syncing => "syncing",
+            CampaignState::Running => "running",
+            CampaignState::Paused => "paused",
+            CampaignState::Completed => "completed",
+            CampaignState::Failed => "failed",
+        }
+    }
+
+    /// Parse a stored state string. Returns None for an unknown value.
+    pub fn from_db_str(s: &str) -> Option<CampaignState> {
+        Some(match s {
+            "draft" => CampaignState::Draft,
+            "syncing" => CampaignState::Syncing,
+            "running" => CampaignState::Running,
+            "paused" => CampaignState::Paused,
+            "completed" => CampaignState::Completed,
+            "failed" => CampaignState::Failed,
+            _ => return None,
+        })
+    }
 }
 
 /// An operator- or system-initiated lifecycle action.
@@ -203,5 +228,20 @@ mod tests {
     #[test]
     fn cannot_resume_a_running_campaign() {
         assert!(next_state(CampaignState::Running, Transition::Resume).is_err());
+    }
+
+    #[test]
+    fn state_string_roundtrip() {
+        for s in [
+            CampaignState::Draft,
+            CampaignState::Syncing,
+            CampaignState::Running,
+            CampaignState::Paused,
+            CampaignState::Completed,
+            CampaignState::Failed,
+        ] {
+            assert_eq!(CampaignState::from_db_str(s.as_str()), Some(s));
+        }
+        assert_eq!(CampaignState::from_db_str("bogus"), None);
     }
 }

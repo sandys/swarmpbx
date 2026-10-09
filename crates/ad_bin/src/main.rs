@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         Command::Api => run_api(),
         Command::Orchestrator => not_yet("orchestrator"),
         Command::Dispatch => not_yet("dispatch"),
-        Command::Migrate => not_yet("migrate"),
+        Command::Migrate => run_migrate(),
     }
 }
 
@@ -49,6 +49,19 @@ fn run_api() -> anyhow::Result<()> {
     let addr = std::env::var("AD_API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(ad_api::serve(&addr))
+}
+
+fn run_migrate() -> anyhow::Result<()> {
+    let url = std::env::var("DATABASE_URL")
+        .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set to run migrations"))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let db = ad_db::Db::connect(&url).await?;
+        db.migrate().await?;
+        tracing::info!("migrations applied");
+        println!("agentdialer: migrations applied");
+        Ok(())
+    })
 }
 
 fn not_yet(role: &str) -> anyhow::Result<()> {
