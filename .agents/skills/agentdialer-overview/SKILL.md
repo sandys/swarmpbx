@@ -29,32 +29,46 @@ map and tells you where to go next.
    - We do NOT write a SIP stack or a media engine from scratch.
    - A spike proved this works (`PLAN.md` §0.3.1). The spike code is in `spike/`.
    - We own the SIP↔WebRTC bridge so LiveKit runs pure WebRTC rooms
-     (`PLAN.md` §0.9a). This bridge is not spiked yet. It is an open risk.
+     (`PLAN.md` §0.9a). `ad_gateway` owns it. The bridge seam (`RoomParticipant`,
+     `MediaBridge`, `AudioFrame`) and its in-memory tests are built; the real
+     libwebrtc-backed participant is behind the `webrtc` feature.
 
 2. The campaign brain (`PLAN.md` §0.10). This is the actual product:
    - campaigns, lists, the hopper (lead selection), pacing, dispositions,
      callbacks, recycle/retry, DNC, and the abandonment ledger.
    - a routing rule engine (`ad_routing`) modeled on the FusionPBX dialplan.
    - compliance: safe-hours, DNC, abandonment rate.
+   - a Redis event layer (`ad_events`) that drives the orchestrator on events,
+     not a blind poll.
 
 ## The crates
 
 The workspace is a set of focused crates under `crates/`. One crate = one
-concern. Current crates:
+concern. Current crates (all built):
 
 - `ad_core` — foundation. Typed ids, errors, and a `Clock` trait. The `Clock`
   trait makes time-dependent logic deterministic under test.
 - `ad_compliance` — safe-hours gate, DNC scrubbing, abandonment ledger. Pure.
   Fails closed. See the `compliance-engine` skill.
+- `ad_campaign` — the campaign aggregate and its lifecycle state machine.
+- `ad_lead` — the lead aggregate and the lead repository trait.
+- `ad_routing` — the FusionPBX-grade routing rule engine. See the
+  `routing-engine` skill.
+- `ad_hopper` — lead selection: status, call-count, DNC, safe-hours, routing.
+- `ad_circuit_breaker` — a pure rolling-window failure-rate breaker.
+- `ad_dispatch` — the dial loop. A `CallInitiator` seam + RAII capacity slots.
+- `ad_gateway` — the real `CallInitiator`. It originates calls into LiveKit
+  rooms, and owns the SIP↔WebRTC bridge (a native WebRTC participant, `webrtc`
+  feature).
+- `ad_orchestrator` — the pure scheduling gate, the run loop, and the event
+  reactor.
+- `ad_events` — the Redis event layer: typed events, pub/sub, due-timers, and
+  the persistent circuit-breaker store.
+- `ad_db` — the Postgres data layer (sqlx), migrations, advisory-lock leader.
 - `ad_api` — the HTTP API (axum). A `router()` factory makes the API testable
   in process. See the `vertical-slice` skill.
 - `ad_bin` — the single binary `agentdialer`. It runs roles by subcommand:
   `api`, `orchestrator`, `dispatch`, `migrate`. One image, many roles.
-
-Planned crates (see `PLAN.md` §0.10.12 and §0.7): `ad_campaign`, `ad_hopper`,
-`ad_routing`, `ad_pacing`, `ad_disposition`, `ad_concurrency`,
-`ad_orchestrator`, `ad_dispatch`, `ad_reports`, and the media crates
-`ad_sip_ctl`, `ad_rtpengine_ctl`, `ad_router`, `ad_gateway`, `ad_sipmsg`.
 
 ## The rules you must follow
 
@@ -70,19 +84,26 @@ Read `.agents/REPO_GUIDE.md` for the full list. The rules that block merges:
 
 ## Before you say "done"
 
-Run these commands. They must pass:
+Run the Docker-first test tier. It runs fmt + clippy + the full suite (including
+the Postgres and Redis integration tests) in containers, identically to CI:
 
 ```
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
+docker compose -f docker-compose.test.yml up --build \
+    --abort-on-container-exit --exit-code-from tests
+docker compose -f docker-compose.test.yml down
 ```
 
-If you did not run the tests, the work is not done.
+Always stop the stack after tests. If you did not run the tier, the work is not
+done.
 
 ## Where to go next
 
 - To change the dialer core, read `PLAN.md` §0.10 and the `routing-engine` skill.
 - To change compliance, read the `compliance-engine` skill.
 - To add an API endpoint, read the `vertical-slice` skill.
-- To work on the media plane, read `PLAN.md` §0 and the spike in `spike/`.
+- To work on the media plane or the SIP↔WebRTC bridge, read `PLAN.md` §0 and
+  §0.9a, the spike in `spike/`, and `crates/ad_gateway/src/bridge.rs`.
+- To change the orchestrator or the event layer, read `PLAN.md` §0.10.8a and
+  `crates/ad_events/`.
+- The `e2e/` directory holds the automated end-to-end proofs. Run them with
+  their scripts; each brings up a real stack and tears it down.

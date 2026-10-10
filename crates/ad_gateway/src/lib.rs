@@ -18,6 +18,17 @@ mod livekit_client;
 #[cfg(feature = "livekit")]
 pub use livekit_client::LiveKitGateway;
 
+pub mod bridge;
+pub use bridge::{
+    AudioFrame, BridgeError, BridgeStats, MediaBridge, RoomConnection, RoomParticipant,
+    RoomSession, RtpSink, RtpSource,
+};
+
+#[cfg(feature = "webrtc")]
+mod webrtc_participant;
+#[cfg(feature = "webrtc")]
+pub use webrtc_participant::LiveKitParticipant;
+
 /// Config to reach LiveKit and the SIP trunk used for origination.
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {

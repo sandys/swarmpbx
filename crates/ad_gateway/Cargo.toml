@@ -9,15 +9,20 @@ license.workspace = true
 # The real LiveKit server-SDK client. Off by default so the crate (and the fast
 # test tier) build without the heavy SDK; the orchestrator binary enables it.
 default = []
-livekit = ["dep:livekit-api", "dep:tokio"]
+livekit = ["dep:livekit-api"]
+# Our own native WebRTC participant (the SIP<->WebRTC bridge, §0.9a option 2).
+# Pulls libwebrtc via the livekit SDK; heavy native build, so off by default.
+webrtc = ["dep:livekit", "dep:livekit-api", "dep:futures-util"]
 
 [dependencies]
 ad_core = { path = "../ad_core" }
 ad_lead = { path = "../ad_lead" }
 ad_dispatch = { path = "../ad_dispatch" }
 serde = { workspace = true }
+tokio = { workspace = true }
+livekit = { version = "0.9", optional = true }
 livekit-api = { version = "0.8", optional = true }
-tokio = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

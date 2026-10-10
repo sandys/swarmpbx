@@ -1,0 +1,154 @@
+//! The real native WebRTC participant (feature `webrtc`, PLAN.md §0.9a option
+//! 2). It joins a LiveKit room via the Rust SDK, publishes an outbound audio
+//! track fed by `send_audio`, and forwards the agent's subscribed track into an
+//! inbound channel. This is OUR SIP↔WebRTC media leg — no `livekit/sip`.
+
+use futures_util::StreamExt;
+use livekit::options::TrackPublishOptions;
+use livekit::track::{LocalAudioTrack, LocalTrack, RemoteTrack, TrackSource};
+use livekit::webrtc::audio_source::native::NativeAudioSource;
+use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
+use livekit::webrtc::audio_stream::native::NativeAudioStream;
+use livekit::webrtc::prelude::AudioFrame as WebRtcAudioFrame;
+use livekit::{Room, RoomEvent, RoomOptions};
+use livekit_api::access_token::{AccessToken, VideoGrants};
+use tokio::sync::mpsc;
+
+use crate::bridge::{AudioFrame, BridgeError, RoomConnection, RoomParticipant, RoomSession};
+
+/// Mint a room-join token for a participant identity with publish + subscribe.
+pub fn mint_token(
+    api_key: &str,
+    api_secret: &str,
+    room: &str,
+    identity: &str,
+) -> Result<String, BridgeError> {
+    AccessToken::with_api_key(api_key, api_secret)
+        .with_identity(identity)
+        .with_name(identity)
+        .with_grants(VideoGrants {
+            room_join: true,
+            room: room.to_string(),
+            can_publish: Some(true),
+            can_subscribe: Some(true),
+            ..Default::default()
+        })
+        .to_jwt()
+        .map_err(|e| BridgeError::Join(e.to_string()))
+}
+
+/// Joins LiveKit rooms as a native WebRTC participant.
+pub struct LiveKitParticipant {
+    pub sample_rate: u32,
+    pub channels: u32,
+}
+
+impl Default for LiveKitParticipant {
+    fn default() -> Self {
+        // 48 kHz mono is the WebRTC-native rate; rtpengine transcodes 8 kHz
+        // telephony PCM up to this on the way in.
+        Self {
+            sample_rate: 48000,
+            channels: 1,
+        }
+    }
+}
+
+/// A live room session backed by the SDK.
+pub struct LiveKitSession {
+    room: Room,
+    source: NativeAudioSource,
+    sample_rate: u32,
+    channels: u32,
+    inbound: Option<mpsc::Receiver<AudioFrame>>,
+    _forward_task: tokio::task::JoinHandle<()>,
+}
+
+impl RoomParticipant for LiveKitParticipant {
+    type Session = LiveKitSession;
+
+    async fn join(&self, conn: RoomConnection) -> Result<Self::Session, BridgeError> {
+        let (room, mut events) = Room::connect(&conn.url, &conn.token, RoomOptions::default())
+            .await
+            .map_err(|e| BridgeError::Join(e.to_string()))?;
+
+        // Publish an outbound audio track fed from a native source.
+        let source = NativeAudioSource::new(
+            AudioSourceOptions::default(),
+            self.sample_rate,
+            self.channels,
+            None,
+        );
+        let track = LocalAudioTrack::create_audio_track(
+            "sip-outbound",
+            RtcAudioSource::Native(source.clone()),
+        );
+        room.local_participant()
+            .publish_track(
+                LocalTrack::Audio(track),
+                TrackPublishOptions {
+                    source: TrackSource::Microphone,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| BridgeError::Publish(e.to_string()))?;
+
+        // Forward the first subscribed remote audio track (the agent) into a
+        // channel the bridge drains.
+        let (in_tx, in_rx) = mpsc::channel::<AudioFrame>(256);
+        let forward_task = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let RoomEvent::TrackSubscribed {
+                    track: RemoteTrack::Audio(audio),
+                    ..
+                } = event
+                {
+                    let mut stream = NativeAudioStream::new(audio.rtc_track(), 48000, 1);
+                    while let Some(frame) = stream.next().await {
+                        let pcm = AudioFrame::new(
+                            frame.data.to_vec(),
+                            frame.sample_rate,
+                            frame.num_channels,
+                        );
+                        if in_tx.send(pcm).await.is_err() {
+                            return; // bridge dropped the receiver
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(LiveKitSession {
+            room,
+            source,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            inbound: Some(in_rx),
+            _forward_task: forward_task,
+        })
+    }
+}
+
+impl RoomSession for LiveKitSession {
+    async fn send_audio(&self, frame: AudioFrame) -> Result<(), BridgeError> {
+        let wf = WebRtcAudioFrame {
+            data: frame.samples.into(),
+            sample_rate: self.sample_rate,
+            num_channels: self.channels,
+            samples_per_channel: (frame.samples_per_channel as u32).max(1),
+        };
+        self.source
+            .capture_frame(&wf)
+            .await
+            .map_err(|e| BridgeError::Publish(e.to_string()))
+    }
+
+    fn take_inbound(&mut self) -> Option<mpsc::Receiver<AudioFrame>> {
+        self.inbound.take()
+    }
+
+    async fn close(self) {
+        let _ = self.room.close().await;
+    }
+}
