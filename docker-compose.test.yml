@@ -20,6 +20,14 @@ services:
       timeout: 3s
       retries: 30
 
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   tests:
     build:
       context: .
@@ -27,9 +35,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      # Point the integration tests at the compose Postgres service by name.
+      # Point the integration tests at the compose services by name.
       DATABASE_URL: postgres://agentdialer:agentdialer@postgres:5432/agentdialer
+      REDIS_URL: redis://redis:6379
       CARGO_HOME: /cache/cargo
       CARGO_TARGET_DIR: /cache/target
     volumes:
@@ -50,6 +61,8 @@ services:
         cargo clippy --all-targets -- -D warnings
         echo "== tests (incl. postgres integration) =="
         cargo test --all
+        echo "== redis integration tests (ad_events) =="
+        cargo test -p ad_events --features redis
         echo "OK: all tests green in Docker"
 
 volumes:

@@ -20,9 +20,11 @@ ad_hopper = { path = "../ad_hopper" }
 ad_dispatch = { path = "../ad_dispatch" }
 ad_orchestrator = { path = "../ad_orchestrator" }
 ad_circuit_breaker = { path = "../ad_circuit_breaker" }
+ad_events = { path = "../ad_events", features = ["redis"] }
 ad_gateway = { path = "../ad_gateway", features = ["livekit"] }
 clap = { workspace = true }
 tokio = { workspace = true }
+sqlx = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

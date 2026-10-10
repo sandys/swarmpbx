@@ -19,6 +19,64 @@ impl PgLeadRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Write back a terminal call outcome, idempotently. Inserts one
+    /// `call_outcomes` row keyed by (lead_id, attempt_at); on a replayed event
+    /// the insert is a no-op and the lead is NOT updated again. Returns `true`
+    /// when this call recorded a new outcome (so the caller can publish /
+    /// schedule retries exactly once).
+    ///
+    /// `next_status` is the lead status to set when the outcome is new
+    /// (e.g. `dispositioned` for answered, `queued` when a retry is due,
+    /// `done`/`dnc` when terminal).
+    pub async fn record_outcome(
+        &self,
+        campaign_id: CampaignId,
+        lead_id: LeadId,
+        outcome: &str,
+        answered: bool,
+        attempt_at: DateTime<Utc>,
+        next_status: LeadStatus,
+    ) -> Result<bool, RepoError> {
+        let mut tx = self.pool.begin().await.map_err(to_repo_err)?;
+
+        // Insert the log row; ON CONFLICT means a replay inserts nothing.
+        let inserted = sqlx::query(
+            "INSERT INTO call_outcomes (campaign_id, lead_id, outcome, answered, attempt_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (lead_id, attempt_at) DO NOTHING",
+        )
+        .bind(campaign_id.0)
+        .bind(lead_id.0)
+        .bind(outcome)
+        .bind(answered)
+        .bind(attempt_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(to_repo_err)?;
+
+        let is_new = inserted.rows_affected() == 1;
+        if is_new {
+            // Advance the lead exactly once for this attempt.
+            sqlx::query(
+                "UPDATE leads \
+                 SET called_count = called_count + 1, \
+                     last_local_call_time = $2, \
+                     status = $3, \
+                     updated_at = now() \
+                 WHERE id = $1",
+            )
+            .bind(lead_id.0)
+            .bind(attempt_at)
+            .bind(next_status.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(to_repo_err)?;
+        }
+
+        tx.commit().await.map_err(to_repo_err)?;
+        Ok(is_new)
+    }
 }
 
 fn to_repo_err(e: sqlx::Error) -> RepoError {

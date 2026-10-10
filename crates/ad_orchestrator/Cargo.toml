@@ -10,6 +10,7 @@ ad_core = { path = "../ad_core" }
 ad_campaign = { path = "../ad_campaign" }
 ad_dispatch = { path = "../ad_dispatch" }
 ad_circuit_breaker = { path = "../ad_circuit_breaker" }
+ad_events = { path = "../ad_events" }
 chrono = { workspace = true }
 chrono-tz = "0.10"
 

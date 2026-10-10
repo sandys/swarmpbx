@@ -1,0 +1,25 @@
+[package]
+name = "ad_events"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# The real Redis transport (pub/sub + due-timer ZSET). Off by default so pure
+# consumers and the fast test tier build without Redis.
+redis = ["dep:redis", "dep:tokio", "dep:futures-util"]
+
+[dependencies]
+ad_core = { path = "../ad_core" }
+ad_circuit_breaker = { path = "../ad_circuit_breaker" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+redis = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

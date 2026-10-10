@@ -127,3 +127,63 @@ async fn unknown_status_in_db_fails_closed() {
         other => panic!("expected Storage error on unknown status, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn record_outcome_is_idempotent_on_replay() {
+    let Some(db) = db().await else {
+        return;
+    };
+    let campaign = make_campaign(&db).await;
+    let lead = db
+        .leads()
+        .create(nl(campaign, "+15550007777"))
+        .await
+        .unwrap();
+    assert_eq!(lead.called_count, 0);
+
+    let attempt = chrono::DateTime::from_timestamp(1_700_000_500, 0).unwrap();
+
+    // First record: new -> true, lead advances once.
+    let first = db
+        .leads()
+        .record_outcome(
+            campaign,
+            lead.id,
+            "no_answer",
+            false,
+            attempt,
+            ad_lead::LeadStatus::Queued,
+        )
+        .await
+        .unwrap();
+    assert!(first, "first record is new");
+
+    // Replay the SAME attempt (Redis is at-least-once): no-op -> false.
+    let replay = db
+        .leads()
+        .record_outcome(
+            campaign,
+            lead.id,
+            "no_answer",
+            false,
+            attempt,
+            ad_lead::LeadStatus::Queued,
+        )
+        .await
+        .unwrap();
+    assert!(!replay, "replay of same attempt is a no-op");
+
+    // called_count advanced exactly once, status set, last call time stamped.
+    let after = db.leads().get(lead.id).await.unwrap();
+    assert_eq!(after.called_count, 1, "no double count on replay");
+    assert_eq!(after.status, ad_lead::LeadStatus::Queued);
+    assert_eq!(after.last_local_call_time, Some(attempt));
+
+    // Only one outcome row exists for this lead.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM call_outcomes WHERE lead_id = $1")
+        .bind(lead.id.0)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}

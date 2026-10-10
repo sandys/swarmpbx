@@ -524,7 +524,80 @@ VICIdial semantics so recycle/limit rules stay correct.
 - **Recycle**: re-admit leads of configured statuses after a cooldown
   (`recycle_config`; Alexor-Brain cooldown + VICIdial `lead_recycle`).
 - **Retry**: `retry_config` (max attempts, interval, per-status rules) → due-at
-  re-queue, carried by the durable job queue (`apalis`/`pgmq`, §0.8).
+  re-queue. The due-time schedule and the "retry due" signal use the Redis event
+  layer (§0.10.8a), not a Postgres job queue. (This supersedes the earlier
+  `apalis`/`pgmq` note.)
+
+### 0.10.8a Orchestrator event layer — Redis (BUILT + PROVEN)
+
+The orchestrator must not blind-poll. It must wake on real events: a batch
+finished, a retry became due, a circuit breaker tripped. The reference dialer
+`dograh` solves this with **Redis**, and we follow that proven shape (user
+decision, 2026-10-10). Built as the `ad_events` crate + an event-driven
+orchestrator; proven Docker-first against real Redis + Postgres
+(`e2e/run_events_e2e.sh`): six failed calls tripped the persistent circuit
+breaker and paused dialing (one `circuit_breaker_tripped`), and each failure
+scheduled a retry due-timer (`retry_needed` → `retry_scheduled`). The event-loop
+amplification bugs found by that e2e (self-feeding trip events, a retry-kick
+storm) are fixed; the final run shows exactly one trip event and six retries.
+
+**What Redis does (and does NOT do).**
+- Redis carries the **control signals** and the **time-ordered schedule**: batch
+  lifecycle events, retry-due timers, circuit-breaker trips, pacing wakeups.
+- Redis does NOT hold the durable truth. The `hopper` table + `SELECT ... FOR
+  UPDATE SKIP LOCKED` stays the system of record for "what to dial". Postgres
+  remains the durable store; Redis is the nervous system. If Redis is lost, no
+  lead is lost — the orchestrator rebuilds state from Postgres on reconnect.
+
+**Precedent (dograh, `_research/dograh/`).**
+- `campaign_event_publisher.py` publishes to a single Redis pub/sub channel
+  `CAMPAIGN_EVENTS`. Event types (`campaign_event_protocol.py`):
+  `batch_completed`, `batch_failed`, `call_completed`, `sync_*`,
+  `campaign_*`, `retry_needed`/`retry_scheduled`, `circuit_breaker_tripped`.
+- `campaign_orchestrator.py` subscribes, and in `_handle_event` schedules the
+  next batch on `batch_completed`, schedules a retry on `retry_needed`, and
+  stops on `campaign_completed`. The actual batch jobs run through `arq` (a
+  Redis-backed task queue + cron).
+
+**Our design (dograh shape + our leader election).**
+- **Transport**: Redis. Pub/sub for fire-and-forget signals; a Redis sorted-set
+  (score = due-epoch) or `arq`-style delayed jobs for time-ordered retries and
+  pacing wakeups. (Pick one Redis job crate during the slice; evaluate `apalis`
+  with its Redis backend first.)
+- **Publisher**: the dispatch path publishes `call_completed` with the outcome;
+  the batch path publishes `batch_completed`/`batch_failed`.
+- **Consumer**: the single leader-elected orchestrator (our advisory-lock
+  singleton, §8) subscribes and reacts. This is the one real improvement over
+  dograh: dograh prevents duplicate scheduling with an **in-memory** lock
+  (`_processing_locks`), which is exactly why dograh pins the orchestrator to
+  `replicas: 1`. Our orchestrator is the advisory-lock leader, so the subscriber
+  runs in exactly one process by construction; standbys do not subscribe. The
+  per-campaign dedup still applies inside the leader.
+- **Pacing**: the fixed 1 s tick (current placeholder) is replaced. The leader
+  wakes on events and on due-timers only. A per-call spacer (VICIdial
+  `per_call_delay`, derived from a target calls-per-second) still bounds the
+  launch rate inside a batch.
+- **Idempotency**: every handler is idempotent against the Postgres state (claim
+  by `SKIP LOCKED`, outcome write-back is a conditional UPDATE), so a duplicated
+  or replayed Redis event cannot double-dial. Redis at-least-once + Postgres
+  idempotency = correct.
+- **Failure**: a Redis blip must not kill the leader. The subscriber reconnects
+  with backoff and, on reconnect, does one reconciliation pass from Postgres
+  (claim any due work) so no event-gap stalls a campaign.
+
+**K8s impact.** Add a Redis dependency (managed/ElastiCache in prod, a chart
+dependency for dev). The orchestrator Deployment is unchanged (still the
+advisory-lock singleton); it gains `REDIS_URL`. Dispatch workers gain the
+publisher.
+
+**Crate impact.** New `ad_events` crate: the channel + typed event enum
+(mirrors `CampaignEventType`), a `Publisher` trait (Redis impl + in-memory fake
+for tests), and a `Consumer` the orchestrator loop drives. The existing
+`OrchestratorLoop` seam stays; its `CampaignScheduler.tick` becomes
+event-triggered instead of clock-triggered. The `CircuitBreaker` becomes real
+here: its state persists in Redis (or is rebuilt from recent Postgres call
+outcomes), so it survives across events and actually trips.
+
 
 ### 0.10.9 Time conditions (first-class)
 
