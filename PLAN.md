@@ -283,6 +283,31 @@ participant) for cases where we own the media leg, not just LiveKit's SIP
 origination. The campaign/compliance brain (§0.10) is unaffected — it sits above
 `ad_gateway`'s `CallInitiator` regardless of the WebRTC leg's implementation.
 
+**Option 2 — our own native WebRTC participant (BUILT + PROVEN).** We built the
+bridge ourselves (PLAN §0.9a option 2): a native Rust WebRTC participant in
+`ad_gateway` that joins a LiveKit room, publishes an outbound audio track, and
+subscribes to the agent's track — with NO dependency on `livekit/sip`. The seam
+is `RoomParticipant` + `RoomSession` + `MediaBridge` (pumps `AudioFrame` both
+ways: caller RTP → room track, agent track → caller RTP), with in-memory fakes
+for the fast tier and a real libwebrtc-backed `LiveKitParticipant` behind the
+`webrtc` feature. Two-way audio is proven end to end by `e2e/run_webrtc_e2e.sh`:
+our participant joined room `campaign-1`, published 800 tone frames (the agent
+received them: `frames_in` high, `subscribed_tracks=1`), and received 922 frames
+of the agent's audio back — all through OUR participant, no `livekit/sip`.
+
+Build notes (so the `webrtc` feature is reproducible): the livekit SDK pulls
+libwebrtc, whose hermetic libc++ requires **clang 21+** (Debian bookworm ships
+14) and the `glib-2.0` dev package. `Dockerfile.webrtc` installs LLVM 21 and sets
+`CC=clang-21 CXX=clang++-21`. The version skew (`livekit` 0.7 + `livekit-api`
+0.8 pulled two `livekit-protocol` copies, breaking `ConnectWhatsAppCallRequest`)
+is resolved by pairing `livekit = 0.9` with `livekit-api = 0.8` (one protocol).
+The feature is OFF by default, so the fast test tier is unaffected.
+
+Still open (option 1): wiring real rtpengine RTP into the participant (the probe
+uses a generated tone as the RTP source). The media networking (drachtio +
+rtpengine) is the §0.3.1 spike; connecting its RTP to `RtpSource`/`RtpSink` is
+the remaining media-plane step.
+
 **MVP wiring verdict (real agent subscriber, automated test).** The minimum
 viable product — *a real LiveKit agent wired into a room as a subscriber, then a
 SIP call driven into it* — is proven as a legitimate automated test

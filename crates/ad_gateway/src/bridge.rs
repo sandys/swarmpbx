@@ -146,36 +146,51 @@ impl MediaBridge {
             .take_inbound()
             .ok_or_else(|| BridgeError::Subscribe("inbound receiver already taken".into()))?;
 
-        let mut stats = BridgeStats::default();
+        // Pump both directions CONCURRENTLY so neither starves the other. The
+        // call ends when the SIP/RTP side ends (the caller hangs up). We signal
+        // the inbound pump to stop with a watch flag, then both futures finish.
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let outbound_frames = std::cell::Cell::new(0u64);
+        let inbound_frames = std::cell::Cell::new(0u64);
+        let session_ref = &session;
 
-        // Outbound: drain the RTP source into the room's published track.
-        // Inbound: drain the agent's subscribed track into the RTP sink.
-        // Both run until their source ends; we interleave with select.
-        let mut rtp_open = true;
-        let mut room_open = true;
-        while rtp_open || room_open {
-            tokio::select! {
-                maybe_rtp = rtp_in.recv(), if rtp_open => {
-                    match maybe_rtp {
-                        Some(frame) => {
-                            session.send_audio(frame).await?;
-                            stats.outbound_frames += 1;
-                        }
-                        None => rtp_open = false,
-                    }
-                }
-                maybe_room = inbound_rx.recv(), if room_open => {
-                    match maybe_room {
+        // Outbound: caller RTP -> room published track.
+        let outbound = async {
+            while let Some(frame) = rtp_in.recv().await {
+                session_ref.send_audio(frame).await?;
+                outbound_frames.set(outbound_frames.get() + 1);
+            }
+            // Caller hung up: tell the inbound pump to stop.
+            let _ = stop_tx.send(true);
+            Ok::<(), BridgeError>(())
+        };
+
+        // Inbound: agent subscribed track -> caller RTP, until stop is signalled.
+        let inbound = async {
+            loop {
+                tokio::select! {
+                    maybe = inbound_rx.recv() => match maybe {
                         Some(frame) => {
                             rtp_out.send(frame).await?;
-                            stats.inbound_frames += 1;
+                            inbound_frames.set(inbound_frames.get() + 1);
                         }
-                        None => room_open = false,
+                        None => break, // agent track ended
+                    },
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() { break; }
                     }
                 }
             }
-        }
+            Ok::<(), BridgeError>(())
+        };
 
+        let (o, i) = tokio::join!(outbound, inbound);
+        o?;
+        i?;
+        let stats = BridgeStats {
+            outbound_frames: outbound_frames.get(),
+            inbound_frames: inbound_frames.get(),
+        };
         session.close().await;
         Ok(stats)
     }

@@ -1,0 +1,31 @@
+# WebRTC-bridge e2e stack. Proves OUR native WebRTC participant carries two-way
+# audio into a LiveKit room with the agent subscriber. There is deliberately NO
+# livekit/sip service: our ad_gateway participant is the media leg.
+#
+# Host networking so WebRTC/ICE and the agent HTTP port work without NAT (WSL2),
+# matching the other e2e stacks.
+services:
+  redis:
+    image: redis:7-alpine
+    network_mode: host
+    command: ["redis-server", "--port", "6379"]
+
+  livekit:
+    image: livekit/livekit-server:latest
+    network_mode: host
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ../spike/livekit/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on: [redis]
+
+  agent:
+    build:
+      context: ../spike/livekit/agent
+    network_mode: host
+    environment:
+      LIVEKIT_URL: ws://127.0.0.1:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: devsecret_devsecret_devsecret_32b
+      AGENT_ROOM: campaign-1
+      AGENT_IDENTITY: webrtc-e2e-agent
+    depends_on: [livekit]

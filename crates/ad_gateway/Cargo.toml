@@ -26,3 +26,7 @@ futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[[example]]
+name = "webrtc_bridge_probe"
+required-features = ["webrtc"]

@@ -119,12 +119,16 @@ Built and proven (Docker-first tests + e2e):
   into a LiveKit room with a real agent subscriber.
 - the Redis event layer: event-driven orchestrator, a persistent circuit breaker
   that trips, idempotent outcome write-back, and retry due-timers.
+- the native WebRTC participant in `ad_gateway` (SIP↔WebRTC bridge, option 2 in
+  `PLAN.md` §0.9a). Two-way audio is proven by `e2e/run_webrtc_e2e.sh`: our
+  participant carries audio both ways into a LiveKit room with the agent, with no
+  `livekit/sip`. The real libwebrtc path is behind the `webrtc` feature
+  (`Dockerfile.webrtc`, clang 21).
 
 In progress:
 
-- the native WebRTC participant in `ad_gateway` (SIP↔WebRTC bridge, option 2 in
-  `PLAN.md` §0.9a). The bridge seam and in-memory tests are green; the real
-  libwebrtc-backed participant is behind the `webrtc` feature.
+- wiring real rtpengine RTP into the WebRTC participant (the e2e uses a generated
+  tone as the RTP source; connecting drachtio + rtpengine is the next media step).
 
 Not built yet:
 

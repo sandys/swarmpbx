@@ -77,7 +77,7 @@ impl RoomParticipant for LiveKitParticipant {
             AudioSourceOptions::default(),
             self.sample_rate,
             self.channels,
-            None,
+            1000,
         );
         let track = LocalAudioTrack::create_audio_track(
             "sip-outbound",

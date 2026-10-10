@@ -27,7 +27,7 @@ pub use bridge::{
 #[cfg(feature = "webrtc")]
 mod webrtc_participant;
 #[cfg(feature = "webrtc")]
-pub use webrtc_participant::LiveKitParticipant;
+pub use webrtc_participant::{mint_token, LiveKitParticipant};
 
 /// Config to reach LiveKit and the SIP trunk used for origination.
 #[derive(Debug, Clone)]
