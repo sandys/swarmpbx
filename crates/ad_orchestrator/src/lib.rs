@@ -15,6 +15,9 @@ use chrono_tz::Tz;
 use ad_campaign::CampaignState;
 use ad_circuit_breaker::{CircuitBreaker, Config as BreakerConfig};
 
+pub mod run_loop;
+pub use run_loop::{CampaignScheduler, Leadership, OrchestratorLoop, TickSummary};
+
 /// A business-hours schedule window: a timezone and per-weekday [start, end)
 /// in minutes since local midnight. Distinct from the compliance safe-hours
 /// gate (which is per-lead and fails closed); this is operator routing.

@@ -268,11 +268,20 @@ the path and surface the real failure modes cheaply. Owning the bridge ourselves
 (`ad_gateway`, options 1/2 above) is still the §0.9a goal — now de-risked by a
 working reference to conform to.
 
-**Remaining `ad_gateway` work (still open).** Our own SIP↔WebRTC bridge
-(rtpengine↔LiveKit WebRTC, or a Rust WebRTC participant) is not yet built; only
-LiveKit's own gateway is proven. The campaign/compliance brain (§0.10) is
-unaffected — it sits above `ad_gateway.initiate_call()` regardless of the WebRTC
-leg's implementation.
+**`ad_gateway` — built, first real origination path proven.** The `ad_gateway`
+crate exists and implements the real `CallInitiator` (`ad_dispatch` seam). Its
+production path originates a call by creating a LiveKit room and placing a SIP
+participant into it (`CreateSIPParticipant` via `livekit-api`), behind a
+`GatewayClient` trait (fake for unit tests; real client under the `livekit`
+feature). This is proven end to end by `e2e/run_e2e.sh`: our orchestrator wins
+leadership, claims the hopper, and `ad_gateway` originates an outbound SIP call
+that LiveKit SIP connects to a local UAS; the call lands in the room and the
+agent subscriber receives audio (`frames_in > 0`).
+
+Still open: the deeper bridge (rtpengine↔LiveKit WebRTC or a Rust WebRTC
+participant) for cases where we own the media leg, not just LiveKit's SIP
+origination. The campaign/compliance brain (§0.10) is unaffected — it sits above
+`ad_gateway`'s `CallInitiator` regardless of the WebRTC leg's implementation.
 
 **MVP wiring verdict (real agent subscriber, automated test).** The minimum
 viable product — *a real LiveKit agent wired into a room as a subscriber, then a
@@ -972,35 +981,48 @@ a cleanup pass terminates orphaned legs for non-running campaigns
 
 ## 8. Kubernetes-native deployment
 
-Helm chart `deploy/helm/agentdialer` (structure mirrors dograh's proven chart):
+Helm chart `deploy/helm/agentdialer` (built; `helm lint` + `helm template`
+pass). Structure mirrors dograh's proven chart.
+
+**Singleton mechanism (decided + proven).** The orchestrator is a singleton by
+**leader election over a Postgres advisory lock**, NOT a Kubernetes Service and
+NOT `replicas: 1`. A K8s Service is only a load-balancer VIP; it does not grant
+single-instance execution. `replicas: 1` with `Recreate` can still run two pods
+briefly during a rollout or a partition, which would double-dial. Instead:
+
+- Run the orchestrator as a Deployment with `replicas: 2` (availability).
+- Each replica calls `ad_db::leader::try_become_leader(pool, ORCHESTRATOR_KEY)`
+  (`pg_try_advisory_lock` on a held connection). Exactly one wins and runs the
+  scheduling loop; the rest stand by.
+- On leader loss (pod death → DB connection drop → lock release) a standby wins
+  within ~0.5 s. No split-brain, no custom lease.
+- There is deliberately **no Service** for the orchestrator; nothing calls it.
+
+This is proven end to end: `e2e/run_e2e.sh` elects a leader, claims the hopper,
+and originates a call through `ad_gateway` that lands in a LiveKit room with the
+agent receiving audio (`frames_in > 0`). The chart renders exactly one Service
+(api), zero orchestrator Services, and `hostNetwork: true` on the gateway pods.
 
 - **Deployments**
-  - `api` — axum, HPA (CPU + request-rate), PDB.
-  - `orchestrator` — **singleton** (replicas: 1, `Recreate` strategy, leader
-    lease). Not horizontally scaled by design.
-  - `dispatch` — N replicas, **HPA + KEDA** scaled on the fleet concurrency
-    metric / queued-runs backlog (Redis-based KEDA scaler). This is how we scale
-    "agent capacity-bound" dialing.
+  - `api` — axum, Service (ClusterIP) + HPA (CPU), `/health` probes.
+  - `orchestrator` — **singleton by advisory-lock leader election** (replicas 2+,
+    `Recreate`, no Service). Not horizontally scaled by design.
+  - `dispatch` — N replicas, HPA (optional; disabled by default). Stateless;
+    claims via `SKIP LOCKED`. This is how we scale "agent capacity-bound"
+    dialing.
+  - `gateway` — media pods: `hostNetwork: true`, a fixed RTP port range, a media
+    node selector. SIP/RTP carry IPs inside the packets, so these cannot sit
+    behind a ClusterIP Service (jambonz pattern, §0.5).
   - `ui` (later phase) — HPA + PDB.
-- **Jobs**: `migrate` (pre-install/upgrade hook).
+- **Jobs**: `migrate` (pre-install/upgrade hook, weight -5).
 - **Stateful deps**: Postgres (prefer managed/RDS; internal chart for dev),
-  Redis (slots+events+LISTEN/NOTIFY), object store (S3/MinIO).
-- **Gateway/Ingress/HTTPRoutes**: Gateway API, TLS.
-- **Config/Secrets**: ConfigMap + Secret; `values.yaml` with
-  `values.schema.json`; example values for single-node, k3s-prod, AWS/EKS.
-- **No coturn / no SIP-RTP in this chart.** We do not run media or SIP signaling
-  pods — LiveKit (its own Helm release) owns SIP/RTP. AgentDialer only speaks
-  **SIP control / origination API** to LiveKit. This is the deliberate
-  consequence of "SIP-only, no PSTN, agents live in LiveKit." (If a BYO static
-  SIP trunk egress needs an outbound SIP signaling sidecar, it is an optional
-  subchart, host-networked, added only when that provider is enabled.)
+  Redis (LiveKit SIP), object store (S3/MinIO) later.
+- **Config/Secrets**: `database.existingSecret` / `livekit.existingSecret`
+  (DATABASE_URL, LIVEKIT_API_KEY/SECRET). Inline values for dev only.
 
-Autoscaling signal: `GET /health/autoscale-metric` on `api` exposes fleet active
-calls + queued backlog (dograh precedent) for KEDA.
-
-Singletons rationale (from dograh scaling doc): orchestrator coordinates global
-scheduling state; duplicating it causes double-dispatch. Dispatch workers are
-stateless and idempotent (DB claims), so they scale freely.
+Singletons rationale (from dograh scaling doc): the orchestrator coordinates
+global scheduling state; duplicating it causes double-dispatch. Dispatch workers
+are stateless and idempotent (DB claims), so they scale freely.
 
 ---
 

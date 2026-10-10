@@ -4,6 +4,8 @@
 
 use clap::{Parser, Subcommand};
 
+mod orchestrator;
+
 #[derive(Parser)]
 #[command(
     name = "agentdialer",
@@ -39,7 +41,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Api => run_api(),
-        Command::Orchestrator => not_yet("orchestrator"),
+        Command::Orchestrator => orchestrator::run(),
         Command::Dispatch => not_yet("dispatch"),
         Command::Migrate => run_migrate(),
     }

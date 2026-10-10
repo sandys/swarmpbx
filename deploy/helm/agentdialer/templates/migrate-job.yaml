@@ -1,0 +1,31 @@
+{{- if .Values.migrate.enabled }}
+# Apply migrations before install/upgrade. A Helm hook Job that runs the
+# `migrate` role once and must succeed before the Deployments roll out.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "agentdialer.fullname" . }}-migrate
+  labels:
+    {{- include "agentdialer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "agentdialer.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: {{ include "agentdialer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate"]
+          env:
+            {{- include "agentdialer.dbEnv" . | nindent 12 }}
+{{- end }}

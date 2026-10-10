@@ -69,6 +69,20 @@ pub struct PgCampaignRepo {
     pool: PgPool,
 }
 
+impl PgCampaignRepo {
+    /// All campaigns currently in the `running` state, across all orgs. The
+    /// orchestrator iterates these each tick.
+    pub async fn list_running(&self) -> Result<Vec<Campaign>, RepoError> {
+        let sql =
+            format!("SELECT {SELECT_COLS} FROM campaigns WHERE state = 'running' ORDER BY id ASC");
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(to_repo_err)?;
+        rows.iter().map(row_to_campaign).collect()
+    }
+}
+
 fn to_repo_err(e: sqlx::Error) -> RepoError {
     RepoError::Storage(e.to_string())
 }

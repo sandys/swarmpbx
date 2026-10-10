@@ -1,0 +1,23 @@
+[package]
+name = "ad_gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The real LiveKit server-SDK client. Off by default so the crate (and the fast
+# test tier) build without the heavy SDK; the orchestrator binary enables it.
+default = []
+livekit = ["dep:livekit-api", "dep:tokio"]
+
+[dependencies]
+ad_core = { path = "../ad_core" }
+ad_lead = { path = "../ad_lead" }
+ad_dispatch = { path = "../ad_dispatch" }
+serde = { workspace = true }
+livekit-api = { version = "0.8", optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

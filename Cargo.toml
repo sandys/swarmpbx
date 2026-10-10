@@ -13,6 +13,7 @@ members = [
     "crates/ad_hopper",
     "crates/ad_circuit_breaker",
     "crates/ad_dispatch",
+    "crates/ad_gateway",
     "crates/ad_orchestrator",
     "crates/ad_db",
     "crates/ad_api",

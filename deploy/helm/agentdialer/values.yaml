@@ -1,0 +1,73 @@
+# AgentDialer values. One image, four roles (PLAN.md §5). The orchestrator is a
+# singleton via a Postgres advisory lock, NOT a Kubernetes Service.
+
+image:
+  repository: agentdialer
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Database. Set an existing secret with key DATABASE_URL, or an inline url.
+database:
+  existingSecret: ""        # name of a Secret with key DATABASE_URL
+  url: ""                   # or an inline url (dev only; prefer a Secret)
+
+# LiveKit + SIP trunk for the gateway (origination).
+livekit:
+  url: "ws://livekit:7880"
+  existingSecret: ""        # Secret with LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+  sipTrunkId: ""            # outbound SIP trunk id
+  roomPrefix: "campaign"
+
+# The API: a normal Deployment + Service + HPA.
+api:
+  replicas: 2
+  port: 8080
+  resources: {}
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# The orchestrator: a SINGLETON. Run >=2 replicas for availability; exactly one
+# wins the advisory lock and runs the scheduling loop, the rest stand by and
+# take over on leader loss. No Service — nothing calls it; it is a background
+# loop. Recreate + maxUnavailable keep churn low, but the lock is the real
+# guarantee against split-brain.
+orchestrator:
+  replicas: 2
+  tickMs: 1000
+  batchLimit: 20
+  maxConcurrent: 50
+  resources: {}
+
+# The dispatch workers: stateless, N replicas, claim via SKIP LOCKED. Scale
+# freely with the HPA. (The orchestrator loop can also drive dispatch; this role
+# is for horizontal fan-out.)
+dispatch:
+  enabled: false
+  replicas: 2
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 50
+    targetCPUUtilizationPercentage: 70
+  resources: {}
+
+# The gateway media pods (SIP<->WebRTC). hostNetwork + a fixed RTP port range,
+# because SIP/RTP carry IPs inside the packets and cannot sit behind a normal
+# ClusterIP Service (PLAN.md §0.5, the jambonz pattern). Pin to media nodes.
+gateway:
+  enabled: true
+  replicas: 2
+  hostNetwork: true
+  sipPort: 5060
+  rtpPortStart: 30000
+  rtpPortEnd: 40000
+  nodeSelector:
+    agentdialer.io/media: "true"
+  resources: {}
+
+# The migrate Job runs once before upgrade/install (a Helm hook).
+migrate:
+  enabled: true

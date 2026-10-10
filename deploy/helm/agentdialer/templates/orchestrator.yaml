@@ -1,0 +1,49 @@
+# The orchestrator is a SINGLETON by leader election, not by a Service.
+# Run >=2 replicas for availability. Each replica tries to win a Postgres
+# advisory lock (ad_db::leader). Exactly one wins and runs the scheduling loop;
+# the rest stand by. On leader loss (pod death -> DB connection drop -> lock
+# release) a standby wins within ~0.5s. There is deliberately NO Service object:
+# nothing calls the orchestrator; it is a background loop.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agentdialer.fullname" . }}-orchestrator
+  labels:
+    {{- include "agentdialer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  replicas: {{ .Values.orchestrator.replicas }}
+  # Recreate avoids extra leaderless churn on rollout; the advisory lock, not
+  # this strategy, prevents split-brain.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "agentdialer.name" . }}
+      app.kubernetes.io/component: orchestrator
+  template:
+    metadata:
+      labels:
+        {{- include "agentdialer.labels" . | nindent 8 }}
+        app.kubernetes.io/component: orchestrator
+    spec:
+      containers:
+        - name: orchestrator
+          image: {{ include "agentdialer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["orchestrator"]
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AD_TICK_MS
+              value: {{ .Values.orchestrator.tickMs | quote }}
+            - name: AD_BATCH_LIMIT
+              value: {{ .Values.orchestrator.batchLimit | quote }}
+            - name: AD_MAX_CONCURRENT
+              value: {{ .Values.orchestrator.maxConcurrent | quote }}
+            {{- include "agentdialer.dbEnv" . | nindent 12 }}
+            {{- include "agentdialer.livekitEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.orchestrator.resources | nindent 12 }}
