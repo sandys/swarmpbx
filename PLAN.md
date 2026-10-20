@@ -272,8 +272,8 @@ working reference to conform to.
 crate exists and implements the real `CallInitiator` (`ad_dispatch` seam). Its
 production path originates a call by creating a LiveKit room and placing a SIP
 participant into it (`CreateSIPParticipant` via `livekit-api`), behind a
-`GatewayClient` trait (fake for unit tests; real client under the `livekit`
-feature). This is proven end to end by `e2e/run_e2e.sh`: our orchestrator wins
+`GatewayClient` trait (fake for unit tests; real client `LiveKitGateway`).
+This is proven end to end by `e2e/run_e2e.sh`: our orchestrator wins
 leadership, claims the hopper, and `ad_gateway` originates an outbound SIP call
 that LiveKit SIP connects to a local UAS; the call lands in the room and the
 agent subscriber receives audio (`frames_in > 0`).
@@ -289,19 +289,28 @@ bridge ourselves (PLAN §0.9a option 2): a native Rust WebRTC participant in
 subscribes to the agent's track — with NO dependency on `livekit/sip`. The seam
 is `RoomParticipant` + `RoomSession` + `MediaBridge` (pumps `AudioFrame` both
 ways: caller RTP → room track, agent track → caller RTP), with in-memory fakes
-for the fast tier and a real libwebrtc-backed `LiveKitParticipant` behind the
-`webrtc` feature. Two-way audio is proven end to end by `e2e/run_webrtc_e2e.sh`:
+for unit tests and a real libwebrtc-backed `LiveKitParticipant` in the normal
+build. Two-way audio is proven end to end by `e2e/run_webrtc_e2e.sh`:
 our participant joined room `campaign-1`, published 800 tone frames (the agent
 received them: `frames_in` high, `subscribed_tracks=1`), and received 922 frames
 of the agent's audio back — all through OUR participant, no `livekit/sip`.
 
-Build notes (so the `webrtc` feature is reproducible): the livekit SDK pulls
-libwebrtc, whose hermetic libc++ requires **clang 21+** (Debian bookworm ships
-14) and the `glib-2.0` dev package. `Dockerfile.webrtc` installs LLVM 21 and sets
+Build notes: the livekit SDK pulls libwebrtc, whose hermetic libc++ requires
+**clang 21+** (Debian bookworm ships 14) and the `glib-2.0` dev package.
+`Dockerfile.test` and `Dockerfile` install LLVM 21 and set
 `CC=clang-21 CXX=clang++-21`. The version skew (`livekit` 0.7 + `livekit-api`
 0.8 pulled two `livekit-protocol` copies, breaking `ConnectWhatsAppCallRequest`)
 is resolved by pairing `livekit = 0.9` with `livekit-api = 0.8` (one protocol).
-The feature is OFF by default, so the fast test tier is unaffected.
+There is no feature gate. The bridge is part of the normal build: the Docker
+test tier compiles, lints, and tests it on every run, and CI runs
+`e2e/run_webrtc_e2e.sh` on every change. A feature that CI never compiled could
+break without any check going red; that is why the gate was removed.
+
+Still open (product wiring): the orchestrator still originates calls through
+`Gateway<LiveKitGateway>` (`CreateSIPParticipant`, which depends on
+`livekit/sip`). A `CallInitiator` that carries the call's audio through
+`LiveKitParticipant` + `MediaBridge` lands together with the rtpengine RTP
+wiring below. Until then the bridge is proven by the e2e, not used by the dialer.
 
 Still open (option 1): wiring real rtpengine RTP into the participant (the probe
 uses a generated tone as the RTP source). The media networking (drachtio +

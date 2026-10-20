@@ -1,7 +1,7 @@
-//! `webrtc_bridge_probe` — drives OUR native WebRTC participant end to end
-//! (feature `webrtc`). It joins a LiveKit room, publishes a generated tone as
-//! the outbound ("SIP-side") track via `MediaBridge`, and counts the agent's
-//! inbound audio frames. It prints JSON stats and exits non-zero on failure.
+//! `webrtc_bridge_probe` — drives OUR native WebRTC participant end to end. It
+//! joins a LiveKit room, publishes a generated tone as the outbound ("SIP-side")
+//! track via `MediaBridge`, and counts the agent's inbound audio frames. It
+//! prints JSON stats and exits non-zero on failure.
 //! There is NO `livekit/sip` here — this is our own media leg.
 //!
 //! Env:
@@ -9,7 +9,7 @@
 //!   AD_ROOM (default "campaign-1"), AD_IDENTITY (default "sip-bridge")
 //!   AD_SECONDS (default 6) — how long to pump audio.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +17,6 @@ use ad_gateway::bridge::{
     AudioFrame, BridgeError, MediaBridge, RoomConnection, RoomParticipant, RtpSink, RtpSource,
 };
 use ad_gateway::{mint_token, LiveKitParticipant};
-use tokio::sync::mpsc;
 
 /// An RTP source that generates a 440 Hz tone in 10 ms frames at 48 kHz mono,
 /// standing in for the caller audio arriving from rtpengine. Stops after a set
@@ -90,14 +89,6 @@ async fn main() {
     let sink = CountingSink {
         count: inbound_count.clone(),
     };
-
-    // A watchdog that ends the run if the bridge never stops on its own.
-    let done = Arc::new(AtomicBool::new(false));
-    let done2 = done.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(seconds as u64 + 4)).await;
-        done2.store(true, Ordering::SeqCst);
-    });
 
     let stats = MediaBridge::run(session, source, sink)
         .await

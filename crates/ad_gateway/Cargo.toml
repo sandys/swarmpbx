@@ -5,28 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-# The real LiveKit server-SDK client. Off by default so the crate (and the fast
-# test tier) build without the heavy SDK; the orchestrator binary enables it.
-default = []
-livekit = ["dep:livekit-api"]
-# Our own native WebRTC participant (the SIP<->WebRTC bridge, §0.9a option 2).
-# Pulls libwebrtc via the livekit SDK; heavy native build, so off by default.
-webrtc = ["dep:livekit", "dep:livekit-api", "dep:futures-util"]
-
+# The WebRTC bridge (libwebrtc via the livekit SDK) is part of the normal build.
+# It needs clang 21+ and glib-2.0; Dockerfile.test and Dockerfile provide them.
 [dependencies]
 ad_core = { path = "../ad_core" }
 ad_lead = { path = "../ad_lead" }
 ad_dispatch = { path = "../ad_dispatch" }
 serde = { workspace = true }
 tokio = { workspace = true }
-livekit = { version = "0.9", optional = true }
-livekit-api = { version = "0.8", optional = true }
-futures-util = { version = "0.3", optional = true }
+livekit = "0.9"
+livekit-api = "0.8"
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true }
-
-[[example]]
-name = "webrtc_bridge_probe"
-required-features = ["webrtc"]

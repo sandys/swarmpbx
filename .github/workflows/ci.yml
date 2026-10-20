@@ -19,3 +19,14 @@ jobs:
       - name: tear down
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
+
+  webrtc-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The audio proof for the SIP<->WebRTC bridge: our native WebRTC
+      # participant carries two-way audio into a LiveKit room with the agent,
+      # with no livekit/sip. The script builds the probe in the test image,
+      # starts the stack with host networking, asserts, and always tears down.
+      - name: run webrtc e2e
+        run: ./e2e/run_webrtc_e2e.sh

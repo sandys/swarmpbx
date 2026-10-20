@@ -100,6 +100,9 @@ stack, asserts behavior, and tears down.
 - `e2e/run_events_e2e.sh` — over real Redis + Postgres, failures trip the
   persistent circuit breaker (dialing pauses) and a retry is scheduled on the
   due-timer.
+- `e2e/run_webrtc_e2e.sh` — our native WebRTC participant carries audio both
+  ways into a LiveKit room with the agent, with no `livekit/sip`. CI runs this
+  on every change.
 - `spike/livekit/run_mvp_test.sh` — a real LiveKit agent wired into a room as a
   subscriber, then a SIP call driven into it (two-way audio proven).
 
@@ -122,13 +125,16 @@ Built and proven (Docker-first tests + e2e):
 - the native WebRTC participant in `ad_gateway` (SIP↔WebRTC bridge, option 2 in
   `PLAN.md` §0.9a). Two-way audio is proven by `e2e/run_webrtc_e2e.sh`: our
   participant carries audio both ways into a LiveKit room with the agent, with no
-  `livekit/sip`. The real libwebrtc path is behind the `webrtc` feature
-  (`Dockerfile.webrtc`, clang 21).
+  `livekit/sip`. The bridge is part of the normal build (no feature gate): the
+  Docker test tier compiles, lints, and tests it, and CI runs the audio e2e.
 
 In progress:
 
 - wiring real rtpengine RTP into the WebRTC participant (the e2e uses a generated
   tone as the RTP source; connecting drachtio + rtpengine is the next media step).
+- the orchestrator still originates calls through `CreateSIPParticipant`
+  (`livekit/sip`). A `CallInitiator` over our bridge lands with the rtpengine
+  wiring. Until then the bridge is proven by the e2e, not used by the dialer.
 
 Not built yet:
 

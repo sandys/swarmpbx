@@ -1,7 +1,7 @@
-//! The real native WebRTC participant (feature `webrtc`, PLAN.md §0.9a option
-//! 2). It joins a LiveKit room via the Rust SDK, publishes an outbound audio
-//! track fed by `send_audio`, and forwards the agent's subscribed track into an
-//! inbound channel. This is OUR SIP↔WebRTC media leg — no `livekit/sip`.
+//! The real native WebRTC participant (PLAN.md §0.9a option 2). It joins a
+//! LiveKit room via the Rust SDK, publishes an outbound audio track fed by
+//! `send_audio`, and forwards the agent's subscribed track into an inbound
+//! channel. This is OUR SIP↔WebRTC media leg — no `livekit/sip`.
 
 use futures_util::StreamExt;
 use livekit::options::TrackPublishOptions;

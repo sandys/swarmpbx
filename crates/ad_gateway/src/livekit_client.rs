@@ -1,6 +1,10 @@
-//! Real LiveKit `GatewayClient` (feature `livekit`). Originates an outbound SIP
-//! call into a LiveKit room via `SIPClient::create_sip_participant`. The media
-//! networking (SIP/RTP) runs in the LiveKit SIP pods; this is the control call.
+//! Real LiveKit `GatewayClient`. Originates an outbound SIP call into a LiveKit
+//! room via `SIPClient::create_sip_participant`. The media networking (SIP/RTP)
+//! runs in the LiveKit SIP pods; this is the control call.
+//!
+//! This path depends on `livekit/sip`. The orchestrator uses it until a
+//! `CallInitiator` over our own bridge (`LiveKitParticipant` + `MediaBridge`)
+//! lands with the rtpengine RTP wiring.
 
 use livekit_api::services::sip::{CreateSIPParticipantOptions, SIPClient};
 

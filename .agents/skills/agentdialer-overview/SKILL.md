@@ -31,7 +31,9 @@ map and tells you where to go next.
    - We own the SIP↔WebRTC bridge so LiveKit runs pure WebRTC rooms
      (`PLAN.md` §0.9a). `ad_gateway` owns it. The bridge seam (`RoomParticipant`,
      `MediaBridge`, `AudioFrame`) and its in-memory tests are built; the real
-     libwebrtc-backed participant is behind the `webrtc` feature.
+     libwebrtc-backed participant (`LiveKitParticipant`) is part of the normal
+     build. The orchestrator does not use it yet. It still dials through
+     `CreateSIPParticipant` (`livekit/sip`).
 
 2. The campaign brain (`PLAN.md` §0.10). This is the actual product:
    - campaigns, lists, the hopper (lead selection), pacing, dispositions,

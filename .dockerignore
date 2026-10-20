@@ -1,0 +1,6 @@
+# Build context for the runtime Dockerfile. Keep the context small: the host
+# target dir is many GB, and the research corpus is not part of the build.
+target/
+spike/target/
+_research/
+.git/

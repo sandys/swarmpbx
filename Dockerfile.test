@@ -1,22 +1,37 @@
 # Test runner image. Builds and runs the Rust test suite in a container so the
-# fast tier runs identically on a developer machine and in CI. No host Rust
+# test tier runs identically on a developer machine and in CI. No host Rust
 # toolchain is assumed.
+#
+# The WebRTC bridge (ad_gateway) links libwebrtc through the livekit SDK. The
+# libwebrtc hermetic libc++ needs clang 21 or later (Debian bookworm ships 14)
+# and the glib-2.0 development package. The test tier builds and lints the
+# bridge like all other code.
 #
 # clippy + rustfmt ship with the official rust image's default toolchain.
 FROM rust:1.90-slim-bookworm
 
-# System deps: pkg-config + libssl are commonly needed by transitive crates;
-# ca-certificates for crates.io over TLS. Keep this layer small and cached.
+# System deps: pkg-config + libssl for transitive crates, ca-certificates for
+# crates.io over TLS, glib for webrtc-sys, and the LLVM installer prerequisites.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates pkg-config libssl-dev libglib2.0-dev python3 \
+       wget gnupg lsb-release software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 
+# LLVM/clang 21 (required by the libwebrtc hermetic libc++).
+RUN wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+    && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh 21 \
+    && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
+
 RUN rustup component add rustfmt clippy
+
+ENV CC=clang-21 CXX=clang++-21
 
 WORKDIR /app
 
 # A persistent cargo registry/target cache is mounted at run time (see
 # docker-compose.test.yml), so we do not COPY sources into the image. The
-# working tree is bind-mounted. This keeps the image tiny and builds fast
+# working tree is bind-mounted. This keeps the image small and builds fast
 # across runs because the cache volume survives.
 ENV CARGO_TERM_COLOR=always

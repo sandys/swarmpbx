@@ -3,9 +3,9 @@
 //! outbound audio track fed from the SIP/RTP side, and subscribes to the agent's
 //! track to feed audio back to RTP. No dependency on `livekit/sip`.
 //!
-//! Everything here is defined over traits so the fast test tier runs with
-//! in-memory fakes. The real libwebrtc-backed participant is feature-gated
-//! (`webrtc`) and lives in `webrtc_participant.rs`.
+//! Everything here is defined over traits so unit tests run with in-memory
+//! fakes. The real libwebrtc-backed participant lives in `webrtc_participant.rs`
+//! and is part of the normal build.
 
 use std::future::Future;
 
@@ -147,28 +147,37 @@ impl MediaBridge {
             .ok_or_else(|| BridgeError::Subscribe("inbound receiver already taken".into()))?;
 
         // Pump both directions CONCURRENTLY so neither starves the other. The
-        // call ends when the SIP/RTP side ends (the caller hangs up). We signal
-        // the inbound pump to stop with a watch flag, then both futures finish.
+        // call ends when the SIP/RTP side ends (the caller hangs up). The
+        // outbound pump then signals the inbound pump through a watch channel.
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let outbound_frames = std::cell::Cell::new(0u64);
         let inbound_frames = std::cell::Cell::new(0u64);
         let session_ref = &session;
 
-        // Outbound: caller RTP -> room published track.
+        // Outbound: caller RTP -> room published track. It sends stop on every
+        // exit path: the caller hung up, or the publish failed. Without the
+        // signal on the error path the inbound pump would wait forever.
         let outbound = async {
-            while let Some(frame) = rtp_in.recv().await {
-                session_ref.send_audio(frame).await?;
-                outbound_frames.set(outbound_frames.get() + 1);
+            let result = async {
+                while let Some(frame) = rtp_in.recv().await {
+                    session_ref.send_audio(frame).await?;
+                    outbound_frames.set(outbound_frames.get() + 1);
+                }
+                Ok::<(), BridgeError>(())
             }
-            // Caller hung up: tell the inbound pump to stop.
+            .await;
             let _ = stop_tx.send(true);
-            Ok::<(), BridgeError>(())
+            result
         };
 
         // Inbound: agent subscribed track -> caller RTP, until stop is signalled.
+        // `biased` polls the track first: agent frames already buffered drain
+        // before the stop takes effect, so the end of a call is deterministic.
+        // The outbound pump sends stop on every exit path, so this loop ends.
         let inbound = async {
             loop {
                 tokio::select! {
+                    biased;
                     maybe = inbound_rx.recv() => match maybe {
                         Some(frame) => {
                             rtp_out.send(frame).await?;
@@ -176,9 +185,7 @@ impl MediaBridge {
                         }
                         None => break, // agent track ended
                     },
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() { break; }
-                    }
+                    _ = stop_rx.changed() => break,
                 }
             }
             Ok::<(), BridgeError>(())

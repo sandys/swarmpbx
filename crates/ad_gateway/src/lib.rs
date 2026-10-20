@@ -4,18 +4,15 @@
 //! agent subscribes. This is the concrete implementation behind the dispatch
 //! seam; the stub used in earlier slices is replaced by this.
 //!
-//! The LiveKit calls sit behind a `GatewayClient` trait so the crate and the
-//! fast test tier build without the SDK; the real client is feature-gated
-//! (`--features livekit`) and used by the orchestrator binary. The media
-//! networking itself (drachtio + rtpengine, or LiveKit SIP) runs as separate
-//! pods; `ad_gateway` is the control-plane originator.
+//! The LiveKit calls sit behind a `GatewayClient` trait so unit tests use a
+//! fake. The real clients (`LiveKitGateway`, `LiveKitParticipant`) are part of
+//! the normal build. The media networking (drachtio + rtpengine) runs as
+//! separate pods; `ad_gateway` is the control plane and owns the WebRTC leg.
 
 use ad_dispatch::{CallInitiator, CallOutcome};
 use ad_lead::Lead;
 
-#[cfg(feature = "livekit")]
 mod livekit_client;
-#[cfg(feature = "livekit")]
 pub use livekit_client::LiveKitGateway;
 
 pub mod bridge;
@@ -24,9 +21,7 @@ pub use bridge::{
     RoomSession, RtpSink, RtpSource,
 };
 
-#[cfg(feature = "webrtc")]
 mod webrtc_participant;
-#[cfg(feature = "webrtc")]
 pub use webrtc_participant::{mint_token, LiveKitParticipant};
 
 /// Config to reach LiveKit and the SIP trunk used for origination.

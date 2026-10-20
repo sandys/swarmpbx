@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# WebRTC-bridge e2e. Subject: OUR native WebRTC participant (ad_gateway, the
-# `webrtc` feature) carries two-way audio into a LiveKit room — NO livekit/sip.
+# WebRTC-bridge e2e. Subject: OUR native WebRTC participant (ad_gateway) carries
+# two-way audio into a LiveKit room — NO livekit/sip. CI runs this on every
+# change (see .github/workflows/ci.yml).
 #
 # Topology: LiveKit server + redis + the spike agent (joins room campaign-1,
 # subscribes + publishes a tone, reports /stats on :8088). Our probe joins the
@@ -41,11 +42,11 @@ agent_stat() { curl -s --max-time 2 http://127.0.0.1:8088/stats 2>/dev/null \
   | python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
 
 echo "== build the webrtc probe (cached libwebrtc) =="
-docker build -q -f ../Dockerfile.webrtc -t agentdialer:webrtc-build .. >/dev/null
+docker build -q -f ../Dockerfile.test -t agentdialer:test-build .. >/dev/null
 docker run --rm -v "$PWD/..":/app:ro -v adwebrtc_target:/cache/target -v adwebrtc_cargo:/cache/cargo \
   -e CARGO_TARGET_DIR=/cache/target -e CARGO_HOME=/cache/cargo \
-  agentdialer:webrtc-build \
-  cargo build -p ad_gateway --features webrtc --example webrtc_bridge_probe 2>&1 | tail -2
+  agentdialer:test-build \
+  cargo build -p ad_gateway --example webrtc_bridge_probe 2>&1 | tail -2
 echo "ok: probe built"
 
 echo "== start stack (livekit + redis + agent in room campaign-1) =="
@@ -66,7 +67,7 @@ docker run -d --name webrtc-probe --network host \
   -e LIVEKIT_URL=ws://127.0.0.1:7880 \
   -e LIVEKIT_API_KEY=$LK_API_KEY -e LIVEKIT_API_SECRET=$LK_API_SECRET \
   -e AD_ROOM=campaign-1 -e AD_IDENTITY=sip-bridge -e AD_SECONDS=8 \
-  agentdialer:webrtc-build \
+  agentdialer:test-build \
   /cache/target/debug/examples/webrtc_bridge_probe >/dev/null 2>&1
 
 echo "== assert: the agent received OUR audio (frames_in > 0, subscribed >= 1) =="

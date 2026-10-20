@@ -22,6 +22,22 @@ impl RoomSession for FakeSession {
     }
 }
 
+/// A session whose outbound publish fails. Its inbound channel stays open with
+/// no frames, so the bridge can only end through the outbound pump's exit.
+struct FailingSession {
+    inbound: Option<mpsc::Receiver<AudioFrame>>,
+}
+
+impl RoomSession for FailingSession {
+    async fn send_audio(&self, _frame: AudioFrame) -> Result<(), BridgeError> {
+        Err(BridgeError::Publish("track gone".into()))
+    }
+    fn take_inbound(&mut self) -> Option<mpsc::Receiver<AudioFrame>> {
+        self.inbound.take()
+    }
+    async fn close(self) {}
+}
+
 /// A channel-backed RTP source.
 struct ChanSource(mpsc::Receiver<AudioFrame>);
 impl RtpSource for ChanSource {
@@ -121,6 +137,38 @@ async fn bridge_ends_when_only_rtp_has_data_and_room_closes_immediately() {
     assert_eq!(stats.outbound_frames, 1);
     assert_eq!(stats.inbound_frames, 0, "no agent audio");
     assert!(*closed.lock().unwrap());
+}
+
+#[test]
+fn bridge_returns_publish_error_and_does_not_hang() {
+    // The bridge runs on its own thread and runtime, so a hang shows up here as
+    // a clean timeout instead of a stuck test binary.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            // The caller keeps sending: the outbound pump must end on the
+            // publish error, not because the RTP source ended.
+            let (rtp_tx, rtp_rx) = mpsc::channel(8);
+            rtp_tx.send(frame(1)).await.unwrap();
+            // The agent channel stays open with no frames: the inbound pump
+            // must end because the outbound pump ended, not on agent audio.
+            let (_room_tx, room_rx) = mpsc::channel::<AudioFrame>(1);
+            let session = FailingSession {
+                inbound: Some(room_rx),
+            };
+            let sink = ChanSink(Arc::new(Mutex::new(Vec::new())));
+            MediaBridge::run(session, ChanSource(rtp_rx), sink).await
+        });
+        let _ = done_tx.send(result);
+    });
+    let result = done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("bridge must end when the outbound pump fails");
+    assert!(matches!(result, Err(BridgeError::Publish(_))));
 }
 
 #[tokio::test(flavor = "current_thread")]
