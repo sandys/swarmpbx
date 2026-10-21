@@ -1,0 +1,19 @@
+[package]
+name = "ad_media"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# One call's RTP leg (PLAN.md §0.0, decision D-9). The vendored `rustrtc` does
+# SDP, RTP, RTCP, and latching; the vendored `audio-codec` does G.711.
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rustrtc = { path = "../../vendor/rustrtc" }
+audio-codec = { path = "../../vendor/audio-codec", default-features = false, features = ["std"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }

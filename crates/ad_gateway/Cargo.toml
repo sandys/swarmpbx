@@ -11,11 +11,18 @@ license.workspace = true
 ad_core = { path = "../ad_core" }
 ad_lead = { path = "../ad_lead" }
 ad_dispatch = { path = "../ad_dispatch" }
+ad_sip = { path = "../ad_sip" }
+ad_media = { path = "../ad_media" }
 serde = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 livekit = "0.9"
 livekit-api = "0.8"
+livekit-protocol = "0.8"
 futures-util = "0.3"
 
 [dev-dependencies]
+base64 = "0.21"
+sha2 = "0.10"
+url = "2"
 tokio = { workspace = true }

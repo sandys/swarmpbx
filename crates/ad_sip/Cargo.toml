@@ -1,0 +1,19 @@
+[package]
+name = "ad_sip"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The SIP user agent of a node (PLAN.md §0.0, decision D-9). The vendored
+# `rsipstack` does messages, transactions, dialogs, and digest auth; this crate
+# drives one outbound call.
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tokio-util = "0.7"
+rsipstack = { path = "../../vendor/rsipstack", default-features = false, features = ["platform-tokio", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

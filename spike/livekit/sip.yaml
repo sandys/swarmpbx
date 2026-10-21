@@ -10,9 +10,10 @@ sip_port: 5062
 # value here was ignored.
 # Size: livekit/sip takes one even port per call and keeps it about 30 s after
 # the BYE (measured, GAPS.md OPS-7). Ports in use = calls per second x (call
-# length + 30 s). The range must hold twice that number. 20000-20999 holds 500.
+# length + 30 s). The range must hold twice that number. 10000-19999 holds 5000,
+# enough for 50 calls per second of up to 20 s.
 # Keep it below the LiveKit RTC range (21000-21999, livekit.yaml).
-rtp_port: 20000-20999
+rtp_port: 10000-19999
 use_external_ip: false
 logging:
   level: info

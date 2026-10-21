@@ -1,58 +1,91 @@
-//! Real LiveKit `GatewayClient`. Originates an outbound SIP call into a LiveKit
-//! room via `SIPClient::create_sip_participant`. The media networking (SIP/RTP)
-//! runs in the LiveKit SIP pods; this is the control call.
-//!
-//! This path depends on `livekit/sip`. The orchestrator uses it until a
-//! `CallInitiator` over our own bridge (`LiveKitParticipant` + `MediaBridge`)
-//! lands with the rtpengine RTP wiring.
+//! Real LiveKit `GatewayClient`: the room operations of a call (create a
+//! room, list who is in it, close it) and the presence check of the
+//! reconcile. The call itself is ours (`sip_call`); LiveKit only runs the
+//! rooms.
 
-use livekit_api::services::sip::{CreateSIPParticipantOptions, SIPClient};
+use std::time::Duration;
 
-use crate::{GatewayClient, GatewayConfig, Origination};
+use livekit_api::services::room::{CreateRoomOptions, RoomClient};
+use livekit_api::services::{ServerError, ServerErrorCode, ServiceError};
+use livekit_protocol::participant_info::State;
+
+use crate::{GatewayClient, GatewayConfig};
+
+/// How long the callee may ring before we CANCEL.
+pub const RING_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a dial takes from the INVITE to the final response, with
+/// the CANCEL and its 487.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(40);
+/// An attempt room with no participant closes after this time.
+const ROOM_EMPTY_TIMEOUT_S: u32 = 120;
 
 pub struct LiveKitGateway {
-    client: SIPClient,
-    sip_trunk_id: String,
+    rooms: RoomClient,
 }
 
 impl LiveKitGateway {
     pub fn new(config: &GatewayConfig) -> Self {
-        let client =
-            SIPClient::with_api_key(&config.livekit_url, &config.api_key, &config.api_secret);
         Self {
-            client,
-            sip_trunk_id: config.sip_trunk_id.clone(),
+            rooms: RoomClient::with_api_key(
+                &config.livekit_url,
+                &config.api_key,
+                &config.api_secret,
+            ),
         }
     }
 }
 
 impl GatewayClient for LiveKitGateway {
-    async fn create_sip_participant(
-        &self,
-        room: &str,
-        phone_number: &str,
-    ) -> Result<Origination, String> {
-        let identity = format!("sip_{phone_number}");
-        let options = CreateSIPParticipantOptions {
-            participant_identity: identity.clone(),
-            // Block until the callee answers so the outcome reflects a real
-            // connection, mapping SIP error codes to a failure.
-            wait_until_answered: Some(true),
+    async fn participant_present(&self, room: &str, identity: &str) -> Result<bool, String> {
+        match self.rooms.get_participant(room, identity).await {
+            Ok(p) => Ok(p.state != State::Disconnected as i32),
+            Err(ServiceError::Twirp(ServerError::Twirp(code)))
+                if code.code == ServerErrorCode::NOT_FOUND =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn create_room(&self, room: &str) -> Result<(), String> {
+        let options = CreateRoomOptions {
+            // An attempt room that nobody joins closes by itself.
+            empty_timeout: ROOM_EMPTY_TIMEOUT_S,
             ..Default::default()
         };
-        self.client
-            .create_sip_participant(
-                self.sip_trunk_id.clone(),
-                phone_number.to_string(),
-                room.to_string(),
-                options,
-                None,
-            )
+        self.rooms
+            .create_room(room, options)
             .await
-            .map(|_info| Origination {
-                room: room.to_string(),
-                participant_identity: identity,
-            })
+            .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    async fn identities(&self, room: &str) -> Result<Vec<String>, String> {
+        match self.rooms.list_participants(room).await {
+            Ok(list) => Ok(list
+                .into_iter()
+                .filter(|p| p.state != State::Disconnected as i32)
+                .map(|p| p.identity)
+                .collect()),
+            Err(ServiceError::Twirp(ServerError::Twirp(code)))
+                if code.code == ServerErrorCode::NOT_FOUND =>
+            {
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn delete_room(&self, room: &str) -> Result<(), String> {
+        match self.rooms.delete_room(room).await {
+            Ok(()) => Ok(()),
+            Err(ServiceError::Twirp(ServerError::Twirp(code)))
+                if code.code == ServerErrorCode::NOT_FOUND =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 }

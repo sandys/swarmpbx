@@ -30,15 +30,9 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end }}
 {{- end -}}
 
-{{/* LiveKit env for the gateway-bearing roles. The API key and secret come
-from a Secret (preferred) or inline values (dev). Both are always set. */}}
-{{- define "agentdialer.livekitEnv" -}}
-- name: LIVEKIT_URL
-  value: {{ .Values.livekit.url | quote }}
-- name: AD_SIP_TRUNK_ID
-  value: {{ .Values.livekit.sipTrunkId | quote }}
-- name: AD_ROOM_PREFIX
-  value: {{ .Values.livekit.roomPrefix | quote }}
+{{/* The LiveKit API key and secret, from a Secret (preferred) or inline values
+(dev). The orchestrator needs them; the api uses them to verify webhooks. */}}
+{{- define "agentdialer.livekitKeysEnv" -}}
 {{- if .Values.livekit.existingSecret }}
 - name: LIVEKIT_API_KEY
   valueFrom:
@@ -56,4 +50,13 @@ from a Secret (preferred) or inline values (dev). Both are always set. */}}
 - name: LIVEKIT_API_SECRET
   value: {{ .Values.livekit.apiSecret | quote }}
 {{- end }}
+{{- end -}}
+
+{{/* LiveKit env: the rooms where the calls meet the agents. */}}
+{{- define "agentdialer.livekitEnv" -}}
+- name: LIVEKIT_URL
+  value: {{ .Values.livekit.url | quote }}
+- name: AD_ROOM_PREFIX
+  value: {{ .Values.livekit.roomPrefix | quote }}
+{{- include "agentdialer.livekitKeysEnv" . }}
 {{- end -}}

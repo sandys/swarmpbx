@@ -14,6 +14,10 @@ pub struct RetryPolicy {
     pub voicemail: Duration,
     pub failed: Duration,
     pub error: Duration,
+    /// The wait before a lead that the calling window held is checked again.
+    pub window_recheck: Duration,
+    /// The wait before a lead whose agent did not join is tried again.
+    pub agent_recheck: Duration,
     /// No retry once the lead has this many attempts.
     pub max_attempts: u32,
 }
@@ -27,6 +31,8 @@ impl Default for RetryPolicy {
             voicemail: Duration::minutes(60),
             failed: Duration::minutes(15),
             error: Duration::minutes(15),
+            window_recheck: Duration::minutes(15),
+            agent_recheck: Duration::minutes(1),
             max_attempts: 3,
         }
     }

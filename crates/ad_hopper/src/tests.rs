@@ -67,11 +67,22 @@ fn eligible_lead_inside_window_is_selected() {
 }
 
 #[test]
-fn done_and_dnc_status_excluded_by_status_gate() {
+fn only_new_and_queued_leads_pass_the_status_gate() {
     let input = SelectionInput {
         leads: vec![
             lead(1, LeadStatus::Done, 0, Some("America/New_York"), "+1a"),
             lead(2, LeadStatus::Dnc, 0, Some("America/New_York"), "+1b"),
+            // A dispositioned lead dials again only through a retry, recycle,
+            // or callback rule (GAPS.md LEAD-3).
+            lead(
+                3,
+                LeadStatus::Dispositioned,
+                1,
+                Some("America/New_York"),
+                "+1c",
+            ),
+            lead(4, LeadStatus::InCall, 0, Some("America/New_York"), "+1d"),
+            lead(5, LeadStatus::Blocked, 0, None, "+1e"),
         ],
         windows: &windows(),
         dnc: &DncSet::default(),
@@ -81,7 +92,7 @@ fn done_and_dnc_status_excluded_by_status_gate() {
     };
     let sel = select(&clock_inside(), input);
     assert!(sel.eligible.is_empty());
-    assert_eq!(sel.excluded.len(), 2);
+    assert_eq!(sel.excluded.len(), 5);
     assert!(sel
         .excluded
         .iter()

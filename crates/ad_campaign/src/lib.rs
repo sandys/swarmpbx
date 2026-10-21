@@ -110,8 +110,12 @@ pub struct Counters {
     pub failed_rows: u64,
 }
 
+/// The default `concurrency_cap`.
+pub const DEFAULT_CONCURRENCY_CAP: u32 = 10;
+
 /// The campaign aggregate. Fields grow as later slices land (schedule, pacing,
-/// retry, rulesets). This slice carries identity, lifecycle, and counters.
+/// retry, rulesets). It carries identity, lifecycle, counters, and the
+/// concurrency cap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Campaign {
     pub id: CampaignId,
@@ -119,6 +123,11 @@ pub struct Campaign {
     pub name: String,
     pub state: CampaignState,
     pub counters: Counters,
+    /// The most live call attempts at one time (GAPS.md DIAL-2).
+    pub concurrency_cap: u32,
+    /// The agent of the campaign as data (`runtime` names the adapter), or
+    /// `None` for no agent. `ad_agent::AgentSpec` reads it.
+    pub agent: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -132,6 +141,8 @@ impl Campaign {
             name,
             state: CampaignState::Draft,
             counters: Counters::default(),
+            concurrency_cap: DEFAULT_CONCURRENCY_CAP,
+            agent: None,
             created_at: now,
             updated_at: now,
         }

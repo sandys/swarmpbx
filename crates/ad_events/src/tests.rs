@@ -15,27 +15,34 @@ fn event_json_wire_shape_matches_tagged_contract() {
     assert!(json.contains("\"answered\":false"));
 }
 
-#[test]
-fn event_round_trips_through_json() {
-    let events = vec![
-        CampaignEvent::BatchCompleted {
-            campaign_id: 1,
-            processed_count: 10,
-            failed_count: 2,
-            batch_size: 10,
+fn every_variant(campaign_id: i64) -> Vec<CampaignEvent> {
+    vec![
+        CampaignEvent::CampaignRunning { campaign_id },
+        CampaignEvent::AttemptEnded {
+            campaign_id,
+            attempt_id: 11,
         },
-        CampaignEvent::RetryNeeded {
-            campaign_id: 1,
-            lead_id: 5,
-            reason: RetryReason::NoAnswer,
+        CampaignEvent::CallCompleted {
+            campaign_id,
+            lead_id: 1,
+            answered: true,
+        },
+        CampaignEvent::RetryScheduled {
+            campaign_id,
+            lead_id: 1,
+            due_epoch_ms: 0,
         },
         CampaignEvent::CircuitBreakerTripped {
-            campaign_id: 1,
-            failure_rate: 0.8,
+            campaign_id,
+            failure_rate: 0.5,
         },
-        CampaignEvent::CampaignCompleted { campaign_id: 1 },
-    ];
-    for e in events {
+        CampaignEvent::CampaignCompleted { campaign_id },
+    ]
+}
+
+#[test]
+fn event_round_trips_through_json() {
+    for e in every_variant(1) {
         let back = CampaignEvent::from_json(&e.to_json()).unwrap();
         assert_eq!(back, e);
     }
@@ -55,40 +62,7 @@ fn bad_json_is_a_decode_error_not_a_panic() {
 
 #[test]
 fn campaign_id_accessor_covers_every_variant() {
-    let all = [
-        CampaignEvent::BatchCompleted {
-            campaign_id: 3,
-            processed_count: 0,
-            failed_count: 0,
-            batch_size: 0,
-        },
-        CampaignEvent::BatchFailed {
-            campaign_id: 3,
-            error: "x".into(),
-            processed_count: 0,
-        },
-        CampaignEvent::CallCompleted {
-            campaign_id: 3,
-            lead_id: 1,
-            answered: true,
-        },
-        CampaignEvent::RetryNeeded {
-            campaign_id: 3,
-            lead_id: 1,
-            reason: RetryReason::Busy,
-        },
-        CampaignEvent::RetryScheduled {
-            campaign_id: 3,
-            lead_id: 1,
-            due_epoch_ms: 0,
-        },
-        CampaignEvent::CircuitBreakerTripped {
-            campaign_id: 3,
-            failure_rate: 0.5,
-        },
-        CampaignEvent::CampaignCompleted { campaign_id: 3 },
-    ];
-    for e in all {
+    for e in every_variant(3) {
         assert_eq!(e.campaign_id(), 3);
     }
 }
@@ -121,40 +95,7 @@ async fn in_memory_bus_is_fifo_publish_then_consume() {
 
 #[test]
 fn kind_matches_the_serde_type_tag_for_every_variant() {
-    let all = [
-        CampaignEvent::BatchCompleted {
-            campaign_id: 1,
-            processed_count: 0,
-            failed_count: 0,
-            batch_size: 0,
-        },
-        CampaignEvent::BatchFailed {
-            campaign_id: 1,
-            error: "x".into(),
-            processed_count: 0,
-        },
-        CampaignEvent::CallCompleted {
-            campaign_id: 1,
-            lead_id: 1,
-            answered: true,
-        },
-        CampaignEvent::RetryNeeded {
-            campaign_id: 1,
-            lead_id: 1,
-            reason: RetryReason::Busy,
-        },
-        CampaignEvent::RetryScheduled {
-            campaign_id: 1,
-            lead_id: 1,
-            due_epoch_ms: 0,
-        },
-        CampaignEvent::CircuitBreakerTripped {
-            campaign_id: 1,
-            failure_rate: 0.5,
-        },
-        CampaignEvent::CampaignCompleted { campaign_id: 1 },
-    ];
-    for e in all {
+    for e in every_variant(1) {
         let v: serde_json::Value = serde_json::from_str(&e.to_json()).unwrap();
         assert_eq!(v["type"], e.kind(), "kind() drifted from the serde tag");
     }

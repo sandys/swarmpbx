@@ -3,6 +3,8 @@
 # (§0.10) and the media control plane (§0) live here as separate crates.
 # See PLAN.md for the authoritative architecture.
 [workspace]
+# Vendored libraries are path dependencies, not members (vendor/VENDORED.md).
+exclude = ["vendor"]
 resolver = "2"
 members = [
     "crates/ad_core",
@@ -13,6 +15,11 @@ members = [
     "crates/ad_hopper",
     "crates/ad_circuit_breaker",
     "crates/ad_events",
+    "crates/ad_attempt",
+    "crates/ad_cluster",
+    "crates/ad_agent",
+    "crates/ad_media",
+    "crates/ad_sip",
     "crates/ad_dispatch",
     "crates/ad_gateway",
     "crates/ad_orchestrator",

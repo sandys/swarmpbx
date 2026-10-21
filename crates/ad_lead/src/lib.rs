@@ -19,16 +19,20 @@ use ad_core::{CampaignId, LeadId};
 pub enum LeadStatus {
     /// Never dialed.
     New,
-    /// Selected into the hopper / in flight.
+    /// Waiting for a dial. `next_eligible_at` holds the due time of a retry or
+    /// a hold; without it the lead is due now.
     Queued,
-    /// On a call now.
+    /// Has a live call attempt.
     InCall,
-    /// Dialed, awaiting re-admission by recycle rules.
+    /// Dialed. Only a recycle, retry, or callback rule makes it dialable again.
     Dispositioned,
     /// Terminal: do not call again (completed or suppressed).
     Done,
     /// On a do-not-call list.
     Dnc,
+    /// Cannot be dialed until its data changes (for example, it has no
+    /// timezone). The last attempt holds the reason.
+    Blocked,
 }
 
 impl LeadStatus {
@@ -40,6 +44,7 @@ impl LeadStatus {
             LeadStatus::Dispositioned => "dispositioned",
             LeadStatus::Done => "done",
             LeadStatus::Dnc => "dnc",
+            LeadStatus::Blocked => "blocked",
         }
     }
 
@@ -51,6 +56,7 @@ impl LeadStatus {
             "dispositioned" => LeadStatus::Dispositioned,
             "done" => LeadStatus::Done,
             "dnc" => LeadStatus::Dnc,
+            "blocked" => LeadStatus::Blocked,
             _ => return None,
         })
     }
@@ -88,6 +94,7 @@ mod tests {
             LeadStatus::Dispositioned,
             LeadStatus::Done,
             LeadStatus::Dnc,
+            LeadStatus::Blocked,
         ] {
             assert_eq!(LeadStatus::from_db_str(s.as_str()), Some(s));
         }

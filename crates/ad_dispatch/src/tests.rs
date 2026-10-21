@@ -12,15 +12,15 @@ use ad_core::time::FixedClock;
 use ad_core::{CampaignId, LeadId};
 use ad_lead::{Lead, LeadStatus};
 
-// --- stub initiator: records calls and returns a programmed outcome ---
+// --- stub initiator: records calls and returns a programmed placement ---
 struct StubInitiator {
     calls: Arc<AtomicUsize>,
-    outcome: CallOutcome,
+    placement: Placement,
 }
 impl CallInitiator for StubInitiator {
-    async fn initiate(&self, _lead: &Lead) -> CallOutcome {
+    async fn place(&self, _request: &DialRequest<'_>) -> Placement {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.outcome.clone()
+        self.placement.clone()
     }
 }
 
@@ -104,7 +104,7 @@ async fn answered_lead_calls_initiator_once() {
     let calls = Arc::new(AtomicUsize::new(0));
     let init = StubInitiator {
         calls: calls.clone(),
-        outcome: CallOutcome::Answered,
+        placement: Placement::Answered,
     };
     let cap = CountingCapacity {
         in_use: Arc::new(AtomicUsize::new(0)),
@@ -128,7 +128,7 @@ async fn compliance_regate_blocks_unknown_tz_and_does_not_initiate() {
     let calls = Arc::new(AtomicUsize::new(0));
     let init = StubInitiator {
         calls: calls.clone(),
-        outcome: CallOutcome::Answered,
+        placement: Placement::Answered,
     };
     let cap = CountingCapacity {
         in_use: Arc::new(AtomicUsize::new(0)),
@@ -152,7 +152,7 @@ async fn dnc_regate_blocks() {
     let calls = Arc::new(AtomicUsize::new(0));
     let init = StubInitiator {
         calls: calls.clone(),
-        outcome: CallOutcome::Answered,
+        placement: Placement::Answered,
     };
     let cap = CountingCapacity {
         in_use: Arc::new(AtomicUsize::new(0)),
@@ -176,7 +176,7 @@ async fn capacity_cap_reports_no_capacity_when_slots_full() {
     let calls = Arc::new(AtomicUsize::new(0));
     let init = StubInitiator {
         calls: calls.clone(),
-        outcome: CallOutcome::Answered,
+        placement: Placement::Answered,
     };
     // max=0 => never any capacity.
     let cap = CountingCapacity {
@@ -206,7 +206,7 @@ async fn batch_releases_slots_so_more_than_cap_can_dial_sequentially() {
     let calls = Arc::new(AtomicUsize::new(0));
     let init = StubInitiator {
         calls: calls.clone(),
-        outcome: CallOutcome::Answered,
+        placement: Placement::Answered,
     };
     let cap = CountingCapacity {
         in_use: Arc::new(AtomicUsize::new(0)),
@@ -234,4 +234,68 @@ fn outcome_failure_classification() {
     assert!(!CallOutcome::ComplianceDenied("x".into()).is_failure());
     assert!(CallOutcome::Answered.is_attempted());
     assert!(!CallOutcome::NoCapacity.is_attempted());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn placements_map_to_dispatch_outcomes() {
+    let (w, dnc) = (windows(), DncSet::default());
+    let clock = clock_inside();
+    let cap = CountingCapacity {
+        in_use: Arc::new(AtomicUsize::new(0)),
+        max: 10,
+    };
+    let cases = [
+        (
+            Placement::Rejected {
+                sip_code: Some(486),
+                detail: "busy".into(),
+            },
+            CallOutcome::NotAnswered("busy".into()),
+        ),
+        (
+            Placement::Rejected {
+                sip_code: Some(503),
+                detail: "down".into(),
+            },
+            CallOutcome::Failed("down".into()),
+        ),
+        (
+            Placement::NoResponse("timeout".into()),
+            CallOutcome::Failed("timeout".into()),
+        ),
+    ];
+    for (placement, want) in cases {
+        let init = StubInitiator {
+            calls: Arc::new(AtomicUsize::new(0)),
+            placement,
+        };
+        let d = dispatcher(&clock, &init, &cap, &w, &dnc);
+        let got = d
+            .dispatch_lead(&lead(1, Some("America/New_York"), "+1a"))
+            .await;
+        assert_eq!(got, want);
+    }
+}
+
+#[test]
+fn placements_become_attempt_events() {
+    let at = safe_hours::utc(2026, 6, 1, 15, 0);
+    assert_eq!(
+        Placement::Answered.into_event(at),
+        ad_attempt::AttemptEvent::Answered { at }
+    );
+    assert_eq!(
+        Placement::NotSent("refused".into()).into_event(at),
+        ad_attempt::AttemptEvent::NotSent {
+            at,
+            detail: "refused".into()
+        }
+    );
+    assert_eq!(
+        Placement::NoResponse("timeout".into()).into_event(at),
+        ad_attempt::AttemptEvent::NoResponse {
+            at,
+            detail: "timeout".into()
+        }
+    );
 }

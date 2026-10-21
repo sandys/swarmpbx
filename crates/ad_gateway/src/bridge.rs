@@ -150,8 +150,8 @@ impl MediaBridge {
         // call ends when the SIP/RTP side ends (the caller hangs up). The
         // outbound pump then signals the inbound pump through a watch channel.
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-        let outbound_frames = std::cell::Cell::new(0u64);
-        let inbound_frames = std::cell::Cell::new(0u64);
+        let outbound_frames = std::sync::atomic::AtomicU64::new(0);
+        let inbound_frames = std::sync::atomic::AtomicU64::new(0);
         let session_ref = &session;
 
         // Outbound: caller RTP -> room published track. It sends stop on every
@@ -161,7 +161,7 @@ impl MediaBridge {
             let result = async {
                 while let Some(frame) = rtp_in.recv().await {
                     session_ref.send_audio(frame).await?;
-                    outbound_frames.set(outbound_frames.get() + 1);
+                    outbound_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok::<(), BridgeError>(())
             }
@@ -181,7 +181,7 @@ impl MediaBridge {
                     maybe = inbound_rx.recv() => match maybe {
                         Some(frame) => {
                             rtp_out.send(frame).await?;
-                            inbound_frames.set(inbound_frames.get() + 1);
+                            inbound_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         None => break, // agent track ended
                     },
@@ -195,8 +195,8 @@ impl MediaBridge {
         o?;
         i?;
         let stats = BridgeStats {
-            outbound_frames: outbound_frames.get(),
-            inbound_frames: inbound_frames.get(),
+            outbound_frames: outbound_frames.into_inner(),
+            inbound_frames: inbound_frames.into_inner(),
         };
         session.close().await;
         Ok(stats)

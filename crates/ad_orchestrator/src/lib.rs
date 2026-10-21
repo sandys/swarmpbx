@@ -19,10 +19,13 @@ pub mod run_loop;
 pub use run_loop::{CampaignScheduler, Leadership, OrchestratorLoop, TickSummary};
 
 pub mod reactor;
-pub use reactor::{react, ReactorAction, ReactorInput};
+pub use reactor::{react, ReactorAction};
 
 pub mod retry;
 pub use retry::{retry_decision, RetryDecision, RetryPolicy};
+
+pub mod settle;
+pub use settle::{settle, Settlement};
 
 /// A business-hours schedule window: a timezone and per-weekday [start, end)
 /// in minutes since local midnight. Distinct from the compliance safe-hours

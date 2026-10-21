@@ -61,7 +61,16 @@ pub struct LiveKitSession {
     sample_rate: u32,
     channels: u32,
     inbound: Option<mpsc::Receiver<AudioFrame>>,
+    others_left: tokio::sync::watch::Receiver<bool>,
     _forward_task: tokio::task::JoinHandle<()>,
+}
+
+impl LiveKitSession {
+    /// Turns true when another participant leaves the room. A room holds one
+    /// call, so that participant is the agent.
+    pub fn others_left(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.others_left.clone()
+    }
 }
 
 impl RoomParticipant for LiveKitParticipant {
@@ -94,27 +103,42 @@ impl RoomParticipant for LiveKitParticipant {
             .await
             .map_err(|e| BridgeError::Publish(e.to_string()))?;
 
-        // Forward the first subscribed remote audio track (the agent) into a
-        // channel the bridge drains.
+        // Forward each subscribed remote audio track (the agent) into a
+        // channel the bridge drains, at our sample rate (libwebrtc resamples).
+        // Report a participant that leaves.
         let (in_tx, in_rx) = mpsc::channel::<AudioFrame>(256);
+        let (left_tx, others_left) = tokio::sync::watch::channel(false);
+        let (rate, channels) = (self.sample_rate, self.channels);
         let forward_task = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                if let RoomEvent::TrackSubscribed {
-                    track: RemoteTrack::Audio(audio),
-                    ..
-                } = event
-                {
-                    let mut stream = NativeAudioStream::new(audio.rtc_track(), 48000, 1);
-                    while let Some(frame) = stream.next().await {
-                        let pcm = AudioFrame::new(
-                            frame.data.to_vec(),
-                            frame.sample_rate,
-                            frame.num_channels,
-                        );
-                        if in_tx.send(pcm).await.is_err() {
-                            return; // bridge dropped the receiver
-                        }
+                match event {
+                    RoomEvent::TrackSubscribed {
+                        track: RemoteTrack::Audio(audio),
+                        ..
+                    } => {
+                        let in_tx = in_tx.clone();
+                        tokio::spawn(async move {
+                            let mut stream = NativeAudioStream::new(
+                                audio.rtc_track(),
+                                rate as i32,
+                                channels as i32,
+                            );
+                            while let Some(frame) = stream.next().await {
+                                let pcm = AudioFrame::new(
+                                    frame.data.to_vec(),
+                                    frame.sample_rate,
+                                    frame.num_channels,
+                                );
+                                if in_tx.send(pcm).await.is_err() {
+                                    return; // the bridge dropped the receiver
+                                }
+                            }
+                        });
                     }
+                    RoomEvent::ParticipantDisconnected(_) => {
+                        let _ = left_tx.send(true);
+                    }
+                    _ => {}
                 }
             }
         });
@@ -125,6 +149,7 @@ impl RoomParticipant for LiveKitParticipant {
             sample_rate: self.sample_rate,
             channels: self.channels,
             inbound: Some(in_rx),
+            others_left,
             _forward_task: forward_task,
         })
     }

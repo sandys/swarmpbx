@@ -46,11 +46,14 @@ async fn create_get_list_save_roundtrip() {
         .create(NewCampaign {
             org_id: org,
             name: "pg camp".into(),
+            concurrency_cap: 25,
+            agent: None,
         })
         .await
         .unwrap();
     assert_eq!(created.state, CampaignState::Draft);
     assert_eq!(created.org_id, org);
+    assert_eq!(created.concurrency_cap, 25);
 
     let got = repo.get(created.id).await.unwrap();
     assert_eq!(got, created);
@@ -109,18 +112,24 @@ async fn list_is_scoped_per_org() {
     repo.create(NewCampaign {
         org_id: org_a,
         name: "a1".into(),
+        concurrency_cap: 10,
+        agent: None,
     })
     .await
     .unwrap();
     repo.create(NewCampaign {
         org_id: org_a,
         name: "a2".into(),
+        concurrency_cap: 10,
+        agent: None,
     })
     .await
     .unwrap();
     repo.create(NewCampaign {
         org_id: org_b,
         name: "b1".into(),
+        concurrency_cap: 10,
+        agent: None,
     })
     .await
     .unwrap();

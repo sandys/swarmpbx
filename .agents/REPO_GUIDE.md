@@ -34,6 +34,12 @@ contract for anyone (human or agent) editing the code.
   tasks. See the Database section for the test workflow.
 - **Honest status.** `experimental` means experimental and is surfaced in APIs.
   Never overstate what works in commits/PRs/messages.
+- **Managed services.** Production runs on managed Kubernetes with a managed
+  Postgres (for example RDS). Treat Postgres and kine as services that you
+  reach only by URL. A role waits for them with backoff; it never depends on a
+  host check, a start order, or a health check of another container. Tests
+  check state through the database URL and the kine endpoint, never with a
+  shell in a container.
 
 ## Scratch files
 - Put all scratch work in a subdirectory of `_research/`. Use
@@ -65,8 +71,9 @@ CI runs the exact same compose. If you didn't run the tests, it isn't done.
 
 The data layer is `ad_db` (sqlx + Postgres). The dockerized test tier above
 starts Postgres as a compose service and points the integration tests at it via
-`DATABASE_URL`. Postgres is also the orchestrator event layer; there is no
-Redis. For an interactive local Postgres, use
+`DATABASE_URL`, and starts kine (the etcd API on the same database) for the
+cluster tests (`AD_TEST_ETCD_ENDPOINTS`). Postgres is also the orchestrator
+event layer; there is no Redis. For an interactive local Postgres and kine, use
 `docker-compose.yml`:
 ```
 docker compose up -d

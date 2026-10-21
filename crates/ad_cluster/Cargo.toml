@@ -1,0 +1,19 @@
+[package]
+name = "ad_cluster"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Cluster coordination over the etcd API that kine serves on Postgres
+# (PLAN.md §0.10.8b): node membership, the leader, and call assignments.
+[dependencies]
+etcd-client = "0.21"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

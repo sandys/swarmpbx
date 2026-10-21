@@ -34,6 +34,8 @@ async fn campaign(db: &Db) -> i64 {
         .create(NewCampaign {
             org_id: OrgId(org),
             name: "events-test".into(),
+            concurrency_cap: 10,
+            agent: None,
         })
         .await
         .unwrap()
@@ -183,11 +185,9 @@ async fn the_kind_column_and_the_list_match_the_published_events() {
     let log = db.events();
     let events = vec![
         completed(c, 1),
-        CampaignEvent::BatchCompleted {
+        CampaignEvent::AttemptEnded {
             campaign_id: c,
-            processed_count: 1,
-            failed_count: 0,
-            batch_size: 1,
+            attempt_id: 3,
         },
         CampaignEvent::CampaignCompleted { campaign_id: c },
     ];

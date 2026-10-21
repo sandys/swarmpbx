@@ -29,9 +29,10 @@ use ad_circuit_breaker::{CircuitBreaker, Config as BreakerConfig};
 use ad_compliance::dnc::DncSet;
 use ad_compliance::safe_hours::{CallWindowSet, DayWindow};
 use ad_core::CampaignId;
-use ad_dispatch::{CallInitiator, CallOutcome, Capacity, ComplianceData, Dispatcher};
+use ad_dispatch::{
+    CallInitiator, CallOutcome, Capacity, ComplianceData, DialRequest, Dispatcher, Placement,
+};
 use ad_hopper::{select, Order, SelectionInput};
-use ad_lead::Lead;
 use ad_orchestrator::{gate, GateBlock, GateDecision, Schedule};
 
 use crate::AppState;
@@ -44,10 +45,10 @@ pub fn routes() -> Router<AppState> {
 
 struct StubInitiator;
 impl CallInitiator for StubInitiator {
-    async fn initiate(&self, _lead: &Lead) -> CallOutcome {
+    async fn place(&self, _request: &DialRequest<'_>) -> Placement {
         // A stub: pretend every placed call is answered. The seam is what
         // matters; the real router returns real outcomes.
-        CallOutcome::Answered
+        Placement::Answered
     }
 }
 

@@ -78,28 +78,46 @@ impl PgEventLog {
     }
 }
 
-impl Publisher for PgEventLog {
-    async fn publish(&self, event: &CampaignEvent) -> Result<(), EventError> {
-        let payload = serde_json::to_value(event).map_err(|e| EventError::Decode(e.to_string()))?;
-        let mut t = self.pool.begin().await.map_err(tx)?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(PUBLISH_LOCK_KEY)
-            .execute(&mut *t)
-            .await
-            .map_err(tx)?;
+/// Write events inside the caller's transaction (an outbox). The events commit,
+/// or roll back, with the state change they announce.
+///
+/// Call this last in the transaction. It takes the publish lock, which the
+/// transaction holds until it ends. Taking it after the row locks keeps the
+/// lock order the same everywhere, and keeps the hold short.
+pub async fn publish_in(
+    conn: &mut sqlx::PgConnection,
+    events: &[CampaignEvent],
+) -> Result<(), sqlx::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(PUBLISH_LOCK_KEY)
+        .execute(&mut *conn)
+        .await?;
+    for event in events {
+        let payload = serde_json::to_value(event).map_err(|e| sqlx::Error::Encode(e.into()))?;
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO campaign_events (campaign_id, kind, payload) VALUES ($1, $2, $3) RETURNING id",
         )
         .bind(event.campaign_id())
         .bind(event.kind())
         .bind(payload)
-        .fetch_one(&mut *t)
-        .await
-        .map_err(tx)?;
+        .fetch_one(&mut *conn)
+        .await?;
         sqlx::query("SELECT pg_notify($1, $2)")
             .bind(CAMPAIGN_EVENTS_CHANNEL)
             .bind(id.to_string())
-            .execute(&mut *t)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+impl Publisher for PgEventLog {
+    async fn publish(&self, event: &CampaignEvent) -> Result<(), EventError> {
+        let mut t = self.pool.begin().await.map_err(tx)?;
+        publish_in(&mut t, std::slice::from_ref(event))
             .await
             .map_err(tx)?;
         t.commit().await.map_err(tx)?;

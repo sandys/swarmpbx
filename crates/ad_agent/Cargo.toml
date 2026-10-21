@@ -1,0 +1,20 @@
+[package]
+name = "ad_agent"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Agent runtime adapters (decision D-2): a LiveKit agent by explicit dispatch,
+# or a pipecat bot by a start request. Both join the attempt's LiveKit room.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+livekit-api = "0.8"
+livekit-protocol = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }

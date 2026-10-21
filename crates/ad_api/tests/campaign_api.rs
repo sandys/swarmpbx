@@ -50,6 +50,7 @@ async fn create_returns_201_and_draft_state() {
     assert_eq!(v["name"], "spring sale");
     assert_eq!(v["state"], "draft");
     assert_eq!(v["id"], 1);
+    assert_eq!(v["concurrency_cap"], 10, "the default cap");
 }
 
 #[tokio::test]
@@ -153,4 +154,60 @@ async fn transition_on_missing_campaign_is_404() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn create_takes_a_concurrency_cap_and_rejects_zero() {
+    let (status, v) = send(
+        app(),
+        "POST",
+        "/v1/campaigns",
+        Some(json!({ "org_id": 7, "name": "big", "concurrency_cap": 250 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["concurrency_cap"], 250);
+
+    let (status, v) = send(
+        app(),
+        "POST",
+        "/v1/campaigns",
+        Some(json!({ "org_id": 7, "name": "none", "concurrency_cap": 0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(v["error"].as_str().unwrap().contains("concurrency_cap"));
+}
+
+#[tokio::test]
+async fn create_takes_an_agent_and_rejects_a_bad_one() {
+    let agent = json!({"runtime": "pipecat", "start_url": "http://bots:7860/start"});
+    let (status, v) = send(
+        app(),
+        "POST",
+        "/v1/campaigns",
+        Some(json!({ "org_id": 7, "name": "bots", "agent": agent })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["agent"]["runtime"], "pipecat");
+
+    for bad in [
+        json!({"runtime": "livekit"}),
+        json!({"runtime": "unknown", "x": 1}),
+        json!({"runtime": "pipecat", "start_url": "not a url"}),
+    ] {
+        let (status, v) = send(
+            app(),
+            "POST",
+            "/v1/campaigns",
+            Some(json!({ "org_id": 7, "name": "bad", "agent": bad })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(
+            v["error"].as_str().unwrap().contains("invalid agent"),
+            "{v}"
+        );
+    }
 }

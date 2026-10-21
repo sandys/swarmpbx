@@ -15,93 +15,9 @@ pub struct PgLeadRepo {
     pool: PgPool,
 }
 
-/// A retry decision, persisted with the outcome that caused it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScheduledRetry {
-    /// The lead becomes eligible again at this time.
-    pub due_at: DateTime<Utc>,
-    /// The retry reason (`ad_events::RetryReason::as_str`).
-    pub reason: &'static str,
-}
-
-/// One terminal call attempt and what it does to the lead.
-#[derive(Debug, Clone, Copy)]
-pub struct OutcomeRecord<'a> {
-    pub campaign_id: CampaignId,
-    pub lead_id: LeadId,
-    /// The outcome discriminator (`answered`, `no_answer`, `failed`, ...).
-    pub outcome: &'a str,
-    pub answered: bool,
-    pub attempt_at: DateTime<Utc>,
-    /// The lead status to set (e.g. `dispositioned` for answered, `queued`
-    /// when a retry is due, `done`/`dnc` when terminal).
-    pub next_status: LeadStatus,
-    /// Sets the lead's `next_eligible_at` and `retry_reason`; `None` clears them.
-    pub retry: Option<ScheduledRetry>,
-}
-
 impl PgLeadRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
-    }
-
-    /// Write back a terminal call outcome, idempotently, in one transaction.
-    /// Inserts one `call_outcomes` row keyed by (lead_id, attempt_at); on a
-    /// replayed event the insert is a no-op and the lead is NOT updated again.
-    /// Returns `true` when this call recorded a new outcome (so the caller can
-    /// publish exactly once).
-    pub async fn record_outcome(&self, rec: &OutcomeRecord<'_>) -> Result<bool, RepoError> {
-        let OutcomeRecord {
-            campaign_id,
-            lead_id,
-            outcome,
-            answered,
-            attempt_at,
-            next_status,
-            retry,
-        } = *rec;
-        let mut tx = self.pool.begin().await.map_err(to_repo_err)?;
-
-        // Insert the log row; ON CONFLICT means a replay inserts nothing.
-        let inserted = sqlx::query(
-            "INSERT INTO call_outcomes (campaign_id, lead_id, outcome, answered, attempt_at) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (lead_id, attempt_at) DO NOTHING",
-        )
-        .bind(campaign_id.0)
-        .bind(lead_id.0)
-        .bind(outcome)
-        .bind(answered)
-        .bind(attempt_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(to_repo_err)?;
-
-        let is_new = inserted.rows_affected() == 1;
-        if is_new {
-            // Advance the lead exactly once for this attempt.
-            sqlx::query(
-                "UPDATE leads \
-                 SET called_count = called_count + 1, \
-                     last_local_call_time = $2, \
-                     status = $3, \
-                     next_eligible_at = $4, \
-                     retry_reason = $5, \
-                     updated_at = now() \
-                 WHERE id = $1",
-            )
-            .bind(lead_id.0)
-            .bind(attempt_at)
-            .bind(next_status.as_str())
-            .bind(retry.map(|r| r.due_at))
-            .bind(retry.map(|r| r.reason))
-            .execute(&mut *tx)
-            .await
-            .map_err(to_repo_err)?;
-        }
-
-        tx.commit().await.map_err(to_repo_err)?;
-        Ok(is_new)
     }
 }
 
@@ -109,10 +25,11 @@ fn to_repo_err(e: sqlx::Error) -> RepoError {
     RepoError::Storage(e.to_string())
 }
 
-const COLS: &str = "id, campaign_id, phone_number, timezone, state, postal_code, status, \
+pub(crate) const COLS: &str =
+    "id, campaign_id, phone_number, timezone, state, postal_code, status, \
      called_count, last_local_call_time, context, created_at, updated_at";
 
-fn row_to_lead(row: &PgRow) -> Result<Lead, RepoError> {
+pub(crate) fn row_to_lead(row: &PgRow) -> Result<Lead, RepoError> {
     let status_str: String = row.try_get("status").map_err(to_repo_err)?;
     let status = LeadStatus::from_db_str(&status_str)
         .ok_or_else(|| RepoError::Storage(format!("unknown lead status '{status_str}'")))?;

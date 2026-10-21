@@ -37,7 +37,14 @@ const fn opt(name: &'static str) -> EnvVar {
 }
 
 /// `agentdialer api`. Without `DATABASE_URL` the API uses an in-memory store.
-pub const API: &[EnvVar] = &[opt("AD_API_ADDR"), opt("DATABASE_URL"), opt("RUST_LOG")];
+/// The LiveKit key and secret verify LiveKit webhooks; set both or neither.
+pub const API: &[EnvVar] = &[
+    opt("AD_API_ADDR"),
+    opt("DATABASE_URL"),
+    opt("LIVEKIT_API_KEY"),
+    opt("LIVEKIT_API_SECRET"),
+    opt("RUST_LOG"),
+];
 
 /// `agentdialer migrate`.
 pub const MIGRATE: &[EnvVar] = &[req("DATABASE_URL"), opt("RUST_LOG")];
@@ -48,12 +55,22 @@ pub const ORCHESTRATOR: &[EnvVar] = &[
     req("LIVEKIT_URL"),
     req("LIVEKIT_API_KEY"),
     req("LIVEKIT_API_SECRET"),
-    req("AD_SIP_TRUNK_ID"),
+    req("AD_SIP_TRUNK"),
+    opt("AD_SIP_PROXY"),
+    opt("AD_SIP_BIND"),
+    opt("AD_SIP_ADVERTISE_IP"),
+    opt("AD_SIP_TRUNK_USER"),
+    opt("AD_SIP_TRUNK_PASSWORD"),
+    opt("AD_MEDIA_PUBLIC_IP"),
+    req("AD_ETCD_ENDPOINTS"),
     opt("AD_ROOM_PREFIX"),
     opt("AD_BATCH_LIMIT"),
     opt("AD_CALLS_PER_SEC"),
     opt("AD_RETRY_SWEEP_MS"),
     opt("AD_EVENT_SWEEP_MS"),
+    opt("AD_ATTEMPT_CHECK_MS"),
+    opt("AD_NODE_CAPACITY"),
+    opt("AD_CLUSTER_TTL_S"),
     opt("HOSTNAME"),
     opt("RUST_LOG"),
 ];
@@ -119,9 +136,73 @@ pub fn check_required(
     }
 }
 
+/// The validated configuration of the api role.
+pub fn api_config(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ad_api::ServeConfig, ConfigError> {
+    check_required("api", API, &lookup)?;
+    let key = value(&lookup, "LIVEKIT_API_KEY");
+    let secret = value(&lookup, "LIVEKIT_API_SECRET");
+    let livekit_keys = match (key, secret) {
+        (Some(k), Some(s)) => Some((k, s)),
+        (None, None) => None,
+        (k, _) => {
+            let (set, unset) = if k.is_some() {
+                ("LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+            } else {
+                ("LIVEKIT_API_SECRET", "LIVEKIT_API_KEY")
+            };
+            return Err(ConfigError {
+                role: "api",
+                missing: Vec::new(),
+                invalid: vec![format!(
+                    "{set} is set but {unset} is not (set both or neither)"
+                )],
+            });
+        }
+    };
+    Ok(ad_api::ServeConfig {
+        addr: value(&lookup, "AD_API_ADDR").unwrap_or_else(|| "0.0.0.0:8080".into()),
+        database_url: value(&lookup, "DATABASE_URL"),
+        livekit_keys,
+    })
+}
+
 /// Read the process environment.
 pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+/// The SIP side of the orchestrator: the node carries its calls (PLAN.md
+/// §0.0). `Debug` omits the trunk password.
+#[derive(Clone)]
+pub struct SipSettings {
+    /// The carrier's host and port: the Request-URI is `sip:<number>@<trunk>`.
+    pub trunk: String,
+    /// The SIP edge (Kamailio), `host:port`. Every INVITE goes to it.
+    pub proxy: Option<String>,
+    /// The local SIP socket.
+    pub bind: std::net::SocketAddr,
+    /// The address in Via, Contact, and the SDP (the pod IP). Unset: the
+    /// local address of the route to the proxy, or else to the trunk.
+    pub advertise_ip: Option<std::net::IpAddr>,
+    /// Digest credentials for the trunk.
+    pub auth: Option<(String, String)>,
+    /// The `public` media mode: the SDP names this address.
+    pub media_public_ip: Option<std::net::IpAddr>,
+}
+
+impl fmt::Debug for SipSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SipSettings")
+            .field("trunk", &self.trunk)
+            .field("proxy", &self.proxy)
+            .field("bind", &self.bind)
+            .field("advertise_ip", &self.advertise_ip)
+            .field("auth_user", &self.auth.as_ref().map(|(u, _)| u))
+            .field("media_public_ip", &self.media_public_ip)
+            .finish()
+    }
 }
 
 /// The validated configuration of the orchestrator role. `Debug` omits the
@@ -129,13 +210,24 @@ pub fn process_env(name: &str) -> Option<String> {
 pub struct OrchestratorConfig {
     pub database_url: String,
     pub gateway: GatewayConfig,
+    pub sip: SipSettings,
     pub batch_limit: i64,
     pub calls_per_sec: f64,
-    /// Interval of the sweep that re-admits leads whose retry is due.
+    /// Interval of the sweep that dials leads that became due (a retry, a
+    /// hold), settles ended attempts, and completes idle campaigns.
     pub retry_sweep_ms: u64,
     /// The event consumer reads the event table at least this often, also
     /// when a notification is lost.
     pub event_sweep_ms: u64,
+    /// Interval of the reconcile that checks live attempts against LiveKit.
+    /// It ends a call whose end event was lost.
+    pub attempt_check_ms: u64,
+    /// The kine (etcd API) endpoints.
+    pub etcd_endpoints: Vec<String>,
+    /// The most calls this node runs at one time.
+    pub node_capacity: u32,
+    /// The TTL of the node and leader keys in kine.
+    pub cluster_ttl_s: u64,
     pub worker: String,
 }
 
@@ -148,6 +240,50 @@ impl OrchestratorConfig {
         let calls_per_sec = positive(&lookup, "AD_CALLS_PER_SEC", 10.0f64, &mut invalid);
         let retry_sweep_ms = positive(&lookup, "AD_RETRY_SWEEP_MS", 1000u64, &mut invalid);
         let event_sweep_ms = positive(&lookup, "AD_EVENT_SWEEP_MS", 2000u64, &mut invalid);
+        let attempt_check_ms = positive(&lookup, "AD_ATTEMPT_CHECK_MS", 15000u64, &mut invalid);
+        let node_capacity = positive(&lookup, "AD_NODE_CAPACITY", 50u32, &mut invalid);
+        let cluster_ttl_s = positive(&lookup, "AD_CLUSTER_TTL_S", 10u64, &mut invalid);
+        let worker = value(&lookup, "HOSTNAME").unwrap_or_else(|| "orchestrator".into());
+        if !ad_cluster::keys::valid_node_name(&worker) {
+            invalid.push(format!(
+                "HOSTNAME={worker:?} (a node name: letters, digits, '-', '_', '.')"
+            ));
+        }
+        let bind = parsed(
+            &lookup,
+            "AD_SIP_BIND",
+            "an address like 0.0.0.0:5060",
+            &mut invalid,
+        )
+        .unwrap_or_else(|| ([0, 0, 0, 0], 5060).into());
+        let advertise_ip = parsed(
+            &lookup,
+            "AD_SIP_ADVERTISE_IP",
+            "an IP address",
+            &mut invalid,
+        );
+        let media_public_ip = parsed(&lookup, "AD_MEDIA_PUBLIC_IP", "an IP address", &mut invalid);
+        let auth = match (
+            value(&lookup, "AD_SIP_TRUNK_USER"),
+            value(&lookup, "AD_SIP_TRUNK_PASSWORD"),
+        ) {
+            (Some(u), Some(p)) => Some((u, p)),
+            (None, None) => None,
+            _ => {
+                invalid.push(
+                    "AD_SIP_TRUNK_USER and AD_SIP_TRUNK_PASSWORD (set both or neither)".into(),
+                );
+                None
+            }
+        };
+        for name in ["AD_SIP_TRUNK", "AD_SIP_PROXY"] {
+            if let Some(v) = value(&lookup, name) {
+                let uri = v.starts_with("sip:") || v.starts_with("sips:");
+                if uri || v.contains('@') || v.contains(char::is_whitespace) {
+                    invalid.push(format!("{name}={v:?} (expected host or host:port)"));
+                }
+            }
+        }
 
         if !missing.is_empty() || !invalid.is_empty() {
             return Err(ConfigError {
@@ -165,14 +301,29 @@ impl OrchestratorConfig {
                 livekit_url: get("LIVEKIT_URL"),
                 api_key: get("LIVEKIT_API_KEY"),
                 api_secret: get("LIVEKIT_API_SECRET"),
-                sip_trunk_id: get("AD_SIP_TRUNK_ID"),
                 room_prefix: value(&lookup, "AD_ROOM_PREFIX").unwrap_or_else(|| "campaign".into()),
+            },
+            sip: SipSettings {
+                trunk: get("AD_SIP_TRUNK"),
+                proxy: value(&lookup, "AD_SIP_PROXY"),
+                bind,
+                advertise_ip,
+                auth,
+                media_public_ip,
             },
             batch_limit,
             calls_per_sec,
             retry_sweep_ms,
             event_sweep_ms,
-            worker: value(&lookup, "HOSTNAME").unwrap_or_else(|| "orchestrator".into()),
+            attempt_check_ms,
+            etcd_endpoints: get("AD_ETCD_ENDPOINTS")
+                .split(',')
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty())
+                .collect(),
+            node_capacity,
+            cluster_ttl_s,
+            worker,
         })
     }
 
@@ -186,14 +337,35 @@ impl fmt::Debug for OrchestratorConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OrchestratorConfig")
             .field("livekit_url", &self.gateway.livekit_url)
-            .field("sip_trunk_id", &self.gateway.sip_trunk_id)
+            .field("sip", &self.sip)
             .field("room_prefix", &self.gateway.room_prefix)
             .field("batch_limit", &self.batch_limit)
             .field("calls_per_sec", &self.calls_per_sec)
             .field("retry_sweep_ms", &self.retry_sweep_ms)
             .field("event_sweep_ms", &self.event_sweep_ms)
+            .field("attempt_check_ms", &self.attempt_check_ms)
+            .field("etcd_endpoints", &self.etcd_endpoints)
+            .field("node_capacity", &self.node_capacity)
+            .field("cluster_ttl_s", &self.cluster_ttl_s)
             .field("worker", &self.worker)
             .finish_non_exhaustive()
+    }
+}
+
+/// Parse an optional value, or record why it is invalid.
+fn parsed<T: std::str::FromStr>(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    expected: &str,
+    invalid: &mut Vec<String>,
+) -> Option<T> {
+    let raw = value(lookup, name)?;
+    match raw.trim().parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            invalid.push(format!("{name}={raw:?} (expected {expected})"));
+            None
+        }
     }
 }
 

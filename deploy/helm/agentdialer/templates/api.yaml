@@ -29,6 +29,7 @@ spec:
             - name: AD_API_ADDR
               value: "0.0.0.0:{{ .Values.api.port }}"
             {{- include "agentdialer.dbEnv" . | nindent 12 }}
+            {{- include "agentdialer.livekitKeysEnv" . | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /health

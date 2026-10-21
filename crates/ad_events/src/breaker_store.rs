@@ -5,8 +5,8 @@
 //!
 //! A `BreakerStore` evaluates the breaker by replaying the recent window of
 //! outcomes into the pure logic. The pure engine stays the single source of the
-//! trip decision. In production the window is the `call_outcomes` table
-//! (`ad_db::PgBreakerStore`): writing the outcome row is the record, so the
+//! trip decision. In production the window is the ended call attempts
+//! (`ad_db::PgBreakerStore`): the attempt row is the record, so the
 //! trait only evaluates.
 
 use std::collections::HashMap;

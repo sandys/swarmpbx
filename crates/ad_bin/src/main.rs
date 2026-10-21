@@ -49,10 +49,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_api() -> anyhow::Result<()> {
-    config::check_required("api", config::API, config::process_env)?;
-    let addr = config::process_env("AD_API_ADDR").unwrap_or_else(|| "0.0.0.0:8080".into());
+    let serve = config::api_config(config::process_env)?;
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(ad_api::serve(&addr))
+    rt.block_on(ad_api::serve(serve))
 }
 
 fn run_migrate() -> anyhow::Result<()> {
@@ -60,7 +59,8 @@ fn run_migrate() -> anyhow::Result<()> {
     let url = config::process_env("DATABASE_URL").unwrap_or_default();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let db = ad_db::Db::connect(&url).await?;
+        // A Kubernetes Job retries a failed migrate too; this covers a slow start.
+        let db = ad_db::Db::connect_ready(&url, Some(std::time::Duration::from_secs(120))).await?;
         db.migrate().await?;
         tracing::info!("migrations applied");
         println!("agentdialer: migrations applied");

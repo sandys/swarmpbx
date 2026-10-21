@@ -11,12 +11,15 @@ ad_campaign = { path = "../ad_campaign" }
 ad_lead = { path = "../ad_lead" }
 ad_events = { path = "../ad_events" }
 ad_circuit_breaker = { path = "../ad_circuit_breaker" }
+ad_attempt = { path = "../ad_attempt" }
 sqlx = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tracing = { workspace = true }

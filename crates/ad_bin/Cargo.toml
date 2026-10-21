@@ -22,9 +22,14 @@ ad_orchestrator = { path = "../ad_orchestrator" }
 ad_circuit_breaker = { path = "../ad_circuit_breaker" }
 ad_events = { path = "../ad_events" }
 ad_gateway = { path = "../ad_gateway" }
+ad_sip = { path = "../ad_sip" }
+ad_attempt = { path = "../ad_attempt" }
+ad_agent = { path = "../ad_agent" }
+ad_cluster = { path = "../ad_cluster" }
 clap = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }

@@ -11,10 +11,11 @@
 FROM rust:1.90-slim-bookworm
 
 # System deps: pkg-config + libssl for transitive crates, ca-certificates for
-# crates.io over TLS, glib for webrtc-sys, and the LLVM installer prerequisites.
+# crates.io over TLS, glib for webrtc-sys, protoc for the etcd client (kine),
+# and the LLVM installer prerequisites.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates pkg-config libssl-dev libglib2.0-dev python3 \
+       ca-certificates pkg-config libssl-dev libglib2.0-dev python3 protobuf-compiler libprotobuf-dev \
        wget gnupg lsb-release software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 

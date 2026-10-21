@@ -6,12 +6,13 @@
 //! Both arms call the same `CampaignRepo` implementation.
 
 use ad_campaign::repo::{CampaignRepo, InMemoryCampaignRepo, NewCampaign, RepoError};
-use ad_campaign::Campaign;
+use ad_campaign::{Campaign, Transition, TransitionError};
 use ad_core::{CampaignId, LeadId, OrgId};
 use ad_db::PgCampaignRepo;
 use ad_db::PgLeadRepo;
 use ad_lead::repo::{InMemoryLeadRepo, LeadRepo, NewLead, RepoError as LeadRepoError};
 use ad_lead::Lead;
+use chrono::{DateTime, Utc};
 
 #[derive(Clone)]
 pub enum CampaignStore {
@@ -49,6 +50,26 @@ impl CampaignStore {
         match self {
             CampaignStore::InMemory(r) => r.save(campaign).await,
             CampaignStore::Pg(r) => r.save(campaign).await,
+        }
+    }
+
+    /// Apply a lifecycle transition. On Postgres this locks the row and writes
+    /// the `campaign_running` event with the state.
+    pub async fn transition(
+        &self,
+        id: CampaignId,
+        transition: Transition,
+        now: DateTime<Utc>,
+    ) -> Result<Result<Campaign, TransitionError>, RepoError> {
+        match self {
+            CampaignStore::InMemory(r) => {
+                let mut campaign = r.get(id).await?;
+                if let Err(e) = campaign.apply(transition, now) {
+                    return Ok(Err(e));
+                }
+                r.save(campaign).await.map(Ok)
+            }
+            CampaignStore::Pg(r) => r.transition(id, transition, now).await,
         }
     }
 }

@@ -1,0 +1,14 @@
+# LiveKit server of the cluster e2e. It runs only the rooms: the dialer nodes
+# carry the calls and join as participants, so there is no livekit/sip, no
+# Redis, and no webhook. It is on the cluster bridge network, with all WebRTC
+# media on one UDP port.
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: false
+  node_ip: 10.20.0.5
+keys:
+  devkey: devsecret_devsecret_devsecret_32b
+logging:
+  level: info

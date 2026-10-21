@@ -1,83 +1,50 @@
 use super::*;
-use ad_events::{CampaignEvent, RetryReason};
-
-fn input(breaker_open: bool) -> ReactorInput {
-    ReactorInput { breaker_open }
-}
 
 #[test]
-fn batch_completed_schedules_next_batch_when_breaker_closed() {
-    let e = CampaignEvent::BatchCompleted {
-        campaign_id: 7,
-        processed_count: 10,
-        failed_count: 1,
-        batch_size: 10,
-    };
+fn a_running_campaign_dispatches() {
     assert_eq!(
-        react(&e, &input(false)),
-        ReactorAction::ScheduleNextBatch { campaign_id: 7 }
+        react(&CampaignEvent::CampaignRunning { campaign_id: 4 }),
+        ReactorAction::Dispatch { campaign_id: 4 }
     );
 }
 
 #[test]
-fn batch_completed_pauses_when_breaker_open() {
-    let e = CampaignEvent::BatchCompleted {
-        campaign_id: 7,
-        processed_count: 10,
-        failed_count: 9,
-        batch_size: 10,
-    };
+fn an_ended_attempt_settles_then_dispatches() {
+    // A finished call frees capacity, so it must start new dials (GAPS.md
+    // ORCH-4).
     assert_eq!(
-        react(&e, &input(true)),
-        ReactorAction::PauseCampaign { campaign_id: 7 }
+        react(&CampaignEvent::AttemptEnded {
+            campaign_id: 4,
+            attempt_id: 9
+        }),
+        ReactorAction::SettleAndDispatch {
+            campaign_id: 4,
+            attempt_id: 9
+        }
     );
 }
 
 #[test]
-fn retry_events_are_informational() {
-    // The retry decision is persisted with the outcome (retry_decision), so the
-    // reactor must not schedule anything from these events.
-    let needed = CampaignEvent::RetryNeeded {
-        campaign_id: 7,
-        lead_id: 42,
-        reason: RetryReason::NoAnswer,
-    };
-    let scheduled = CampaignEvent::RetryScheduled {
-        campaign_id: 7,
-        lead_id: 42,
-        due_epoch_ms: 1,
-    };
-    assert_eq!(react(&needed, &input(false)), ReactorAction::Noop);
-    assert_eq!(react(&scheduled, &input(false)), ReactorAction::Noop);
-}
-
-#[test]
-fn circuit_breaker_tripped_pauses() {
-    let e = CampaignEvent::CircuitBreakerTripped {
-        campaign_id: 7,
-        failure_rate: 0.9,
-    };
-    assert_eq!(
-        react(&e, &input(false)),
-        ReactorAction::PauseCampaign { campaign_id: 7 }
-    );
-}
-
-#[test]
-fn campaign_completed_stops() {
-    let e = CampaignEvent::CampaignCompleted { campaign_id: 7 };
-    assert_eq!(
-        react(&e, &input(false)),
-        ReactorAction::StopCampaign { campaign_id: 7 }
-    );
-}
-
-#[test]
-fn call_completed_is_noop() {
-    let completed = CampaignEvent::CallCompleted {
-        campaign_id: 1,
-        lead_id: 1,
-        answered: true,
-    };
-    assert_eq!(react(&completed, &input(false)), ReactorAction::Noop);
+fn records_do_not_dispatch() {
+    for e in [
+        CampaignEvent::CallCompleted {
+            campaign_id: 1,
+            lead_id: 2,
+            answered: true,
+        },
+        CampaignEvent::RetryScheduled {
+            campaign_id: 1,
+            lead_id: 2,
+            due_epoch_ms: 0,
+        },
+        // The trip and the completion are already saved as the campaign state.
+        // Reacting to them again would dial a paused or completed campaign.
+        CampaignEvent::CircuitBreakerTripped {
+            campaign_id: 1,
+            failure_rate: 0.9,
+        },
+        CampaignEvent::CampaignCompleted { campaign_id: 1 },
+    ] {
+        assert_eq!(react(&e), ReactorAction::Noop, "{}", e.kind());
+    }
 }

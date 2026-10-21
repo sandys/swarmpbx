@@ -1,7 +1,8 @@
 //! The circuit-breaker window on Postgres (decision D-3). The window is the
-//! `call_outcomes` table: writing an outcome row is the record. Evaluation reads
-//! the window and replays it into the pure `ad_circuit_breaker` engine, which
-//! stays the single source of the trip decision.
+//! ended call attempts that placed a call. Evaluation reads the window and
+//! replays it into the pure `ad_circuit_breaker` engine, which stays the single
+//! source of the trip decision. A resume sets `campaigns.breaker_reset_at`, and
+//! the window starts after it.
 
 use ad_circuit_breaker::{CircuitBreaker, Config, Stats};
 use ad_events::{BreakerStore, EventError};
@@ -31,8 +32,11 @@ impl BreakerStore for PgBreakerStore {
         config: &Config,
     ) -> Result<(bool, Stats), EventError> {
         let rows = sqlx::query(
-            "SELECT attempt_at, outcome = 'failed' AS failed FROM call_outcomes \
-             WHERE campaign_id = $1 AND attempt_at >= $2 AND attempt_at <= $3",
+            "SELECT a.ended_at, a.failure FROM call_attempts a \
+             JOIN campaigns c ON c.id = a.campaign_id \
+             WHERE a.campaign_id = $1 AND a.dialed_at IS NOT NULL \
+               AND a.ended_at >= $2 AND a.ended_at <= $3 \
+               AND (c.breaker_reset_at IS NULL OR a.ended_at > c.breaker_reset_at)",
         )
         .bind(campaign_id)
         .bind(now - config.window)
@@ -42,8 +46,8 @@ impl BreakerStore for PgBreakerStore {
         .map_err(tx)?;
         let mut cb = CircuitBreaker::new();
         for row in rows {
-            let at: DateTime<Utc> = row.try_get("attempt_at").map_err(tx)?;
-            let failed: bool = row.try_get("failed").map_err(tx)?;
+            let at: DateTime<Utc> = row.try_get("ended_at").map_err(tx)?;
+            let failed: bool = row.try_get("failure").map_err(tx)?;
             cb.record(at, failed);
         }
         Ok(cb.is_open(now, config))

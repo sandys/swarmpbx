@@ -15,8 +15,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use ad_agent::AgentSpec;
 use ad_campaign::repo::{NewCampaign, RepoError};
-use ad_campaign::{Campaign, CampaignState, Counters, Transition};
+use ad_campaign::{Campaign, CampaignState, Counters, Transition, DEFAULT_CONCURRENCY_CAP};
 use ad_core::{CampaignId, OrgId};
 
 use crate::AppState;
@@ -34,6 +35,14 @@ pub fn routes() -> Router<AppState> {
 pub struct CreateRequest {
     pub org_id: i64,
     pub name: String,
+    /// The most live calls at one time. Default: 10.
+    #[serde(default)]
+    pub concurrency_cap: Option<u32>,
+    /// The agent of the campaign, for example
+    /// `{"runtime": "livekit", "agent_name": "sales"}` or
+    /// `{"runtime": "pipecat", "start_url": "http://bots:7860/start"}`.
+    #[serde(default)]
+    pub agent: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +52,8 @@ pub struct CampaignDto {
     pub name: String,
     pub state: CampaignState,
     pub counters: Counters,
+    pub concurrency_cap: u32,
+    pub agent: Option<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -55,6 +66,8 @@ impl From<Campaign> for CampaignDto {
             name: c.name,
             state: c.state,
             counters: c.counters,
+            concurrency_cap: c.concurrency_cap,
+            agent: c.agent,
             created_at: c.created_at.to_rfc3339(),
             updated_at: c.updated_at.to_rfc3339(),
         }
@@ -89,11 +102,23 @@ async fn create(
     if req.name.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "name must not be empty"));
     }
+    let concurrency_cap = req.concurrency_cap.unwrap_or(DEFAULT_CONCURRENCY_CAP);
+    if concurrency_cap == 0 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "concurrency_cap must be at least 1",
+        ));
+    }
+    if let Some(agent) = &req.agent {
+        AgentSpec::parse(agent).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
     let campaign = state
         .campaigns
         .create(NewCampaign {
             org_id: OrgId(req.org_id),
             name: req.name,
+            concurrency_cap,
+            agent: req.agent,
         })
         .await
         .map_err(repo_err)?;
@@ -129,18 +154,15 @@ async fn transition(
     Path(id): Path<i64>,
     Json(req): Json<TransitionRequest>,
 ) -> Result<Json<CampaignDto>, (StatusCode, Json<ErrorDto>)> {
-    let mut campaign = state
-        .campaigns
-        .get(CampaignId(id))
-        .await
-        .map_err(repo_err)?;
     let now = state.clock.now_utc();
     // An illegal transition is a 409 Conflict, not a 400: the request is
     // well-formed but conflicts with the campaign's current state.
-    campaign
-        .apply(req.transition, now)
+    let saved = state
+        .campaigns
+        .transition(CampaignId(id), req.transition, now)
+        .await
+        .map_err(repo_err)?
         .map_err(|e| err(StatusCode::CONFLICT, e.to_string()))?;
-    let saved = state.campaigns.save(campaign).await.map_err(repo_err)?;
     Ok(Json(saved.into()))
 }
 

@@ -24,7 +24,11 @@ fn all_required() -> Vec<(&'static str, &'static str)> {
         ("LIVEKIT_URL", "ws://livekit:7880"),
         ("LIVEKIT_API_KEY", "key"),
         ("LIVEKIT_API_SECRET", "secret"),
-        ("AD_SIP_TRUNK_ID", "ST_x"),
+        ("AD_SIP_TRUNK", "carrier.example:5060"),
+        (
+            "AD_ETCD_ENDPOINTS",
+            "http://kine-a:2379, http://kine-b:2379",
+        ),
     ]
 }
 
@@ -40,22 +44,23 @@ fn orchestrator_reports_every_missing_required_var_at_once() {
             "LIVEKIT_URL",
             "LIVEKIT_API_KEY",
             "LIVEKIT_API_SECRET",
-            "AD_SIP_TRUNK_ID",
+            "AD_SIP_TRUNK",
+            "AD_ETCD_ENDPOINTS",
         ]
     );
     let msg = err.to_string();
-    assert!(msg.contains("AD_SIP_TRUNK_ID"), "{msg}");
+    assert!(msg.contains("AD_SIP_TRUNK"), "{msg}");
     assert!(msg.contains("README.md"), "{msg}");
 }
 
 #[test]
 fn empty_or_blank_value_counts_as_missing() {
     let mut pairs = all_required();
-    pairs.retain(|(k, _)| *k != "LIVEKIT_URL" && *k != "AD_SIP_TRUNK_ID");
+    pairs.retain(|(k, _)| *k != "LIVEKIT_URL" && *k != "AD_SIP_TRUNK");
     pairs.push(("LIVEKIT_URL", ""));
-    pairs.push(("AD_SIP_TRUNK_ID", "   "));
+    pairs.push(("AD_SIP_TRUNK", "   "));
     let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
-    assert_eq!(err.missing, vec!["LIVEKIT_URL", "AD_SIP_TRUNK_ID"]);
+    assert_eq!(err.missing, vec!["LIVEKIT_URL", "AD_SIP_TRUNK"]);
 }
 
 #[test]
@@ -66,10 +71,24 @@ fn defaults_apply_when_optional_vars_are_unset() {
     assert_eq!(cfg.calls_per_sec, 10.0);
     assert_eq!(cfg.retry_sweep_ms, 1000);
     assert_eq!(cfg.event_sweep_ms, 2000);
+    assert_eq!(cfg.attempt_check_ms, 15000);
+    assert_eq!(cfg.node_capacity, 50);
+    assert_eq!(cfg.cluster_ttl_s, 10);
+    assert_eq!(
+        cfg.etcd_endpoints,
+        ["http://kine-a:2379", "http://kine-b:2379"]
+    );
     assert_eq!(cfg.worker, "orchestrator");
     assert_eq!(cfg.per_call_gap(), Duration::from_millis(100));
 }
 
+#[test]
+fn the_node_name_must_be_one_kine_key_segment() {
+    let mut pairs = all_required();
+    pairs.push(("HOSTNAME", "pod/with slash"));
+    let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
+    assert!(err.invalid[0].starts_with("HOSTNAME="), "{:?}", err.invalid);
+}
 #[test]
 fn invalid_numbers_are_rejected_not_ignored() {
     let mut pairs = all_required();
@@ -85,10 +104,75 @@ fn invalid_numbers_are_rejected_not_ignored() {
 }
 
 #[test]
+fn the_sip_settings_have_defaults_and_are_checked() {
+    let cfg = OrchestratorConfig::from_lookup(lookup_from(&all_required())).unwrap();
+    assert_eq!(cfg.sip.trunk, "carrier.example:5060");
+    assert_eq!(cfg.sip.bind, "0.0.0.0:5060".parse().unwrap());
+    assert_eq!(cfg.sip.proxy, None);
+    assert_eq!(cfg.sip.advertise_ip, None);
+    assert!(cfg.sip.auth.is_none());
+
+    let mut pairs = all_required();
+    pairs.retain(|(k, _)| *k != "AD_SIP_TRUNK");
+    pairs.push(("AD_SIP_TRUNK", "sip:carrier.example"));
+    pairs.push(("AD_SIP_PROXY", "kamailio:5060"));
+    pairs.push(("AD_SIP_BIND", "5060"));
+    pairs.push(("AD_SIP_ADVERTISE_IP", "pod-ip"));
+    pairs.push(("AD_SIP_TRUNK_USER", "alice"));
+    let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
+    let names: Vec<&str> = err
+        .invalid
+        .iter()
+        .map(|i| i.split(['=', ' ']).next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "AD_SIP_BIND",
+            "AD_SIP_ADVERTISE_IP",
+            "AD_SIP_TRUNK_USER",
+            "AD_SIP_TRUNK"
+        ],
+        "{:?}",
+        err.invalid
+    );
+
+    let mut pairs = all_required();
+    pairs.push(("AD_SIP_PROXY", "kamailio:5060"));
+    pairs.push(("AD_SIP_TRUNK_USER", "alice"));
+    pairs.push(("AD_SIP_TRUNK_PASSWORD", "s3cret"));
+    let cfg = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap();
+    assert_eq!(cfg.sip.proxy.as_deref(), Some("kamailio:5060"));
+    assert!(
+        !format!("{cfg:?}").contains("s3cret"),
+        "Debug hides the password"
+    );
+}
+#[test]
 fn migrate_requires_database_url_and_api_requires_nothing() {
     let err = check_required("migrate", MIGRATE, lookup_from(&[])).unwrap_err();
     assert_eq!(err.missing, vec!["DATABASE_URL"]);
     assert!(check_required("api", API, lookup_from(&[])).is_ok());
+}
+
+#[test]
+fn the_api_needs_both_livekit_keys_or_neither() {
+    let none = api_config(lookup_from(&[])).unwrap();
+    assert_eq!(none.livekit_keys, None);
+    assert_eq!(none.addr, "0.0.0.0:8080");
+
+    let both = api_config(lookup_from(&[
+        ("LIVEKIT_API_KEY", "key"),
+        ("LIVEKIT_API_SECRET", "secret"),
+        ("DATABASE_URL", "postgres://x"),
+    ]))
+    .unwrap();
+    assert_eq!(both.livekit_keys, Some(("key".into(), "secret".into())));
+    assert_eq!(both.database_url.as_deref(), Some("postgres://x"));
+
+    let half = api_config(lookup_from(&[("LIVEKIT_API_KEY", "key")])).unwrap_err();
+    assert_eq!(half.role, "api");
+    assert!(half.invalid[0].contains("LIVEKIT_API_SECRET"), "{half}");
 }
 
 // ---- drift: Helm chart, e2e scripts, README ----
@@ -268,6 +352,88 @@ fn e2e_scripts_pass_exactly_the_role_contract() {
     }
 }
 
+/// Every `agentdialer:e2e` service in the e2e compose files, as (file, service,
+/// role, env names). The files use one layout: a service at two spaces, its
+/// `command: ["<role>"]` and an `environment:` list of `- NAME=value` lines.
+fn e2e_compose_services() -> Vec<(String, String, String, BTreeSet<String>)> {
+    let mut out = Vec::new();
+    let dir = repo_root().join("e2e");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "yml"))
+        .collect();
+    files.sort();
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+        let mut service: Option<(String, bool, Option<String>, BTreeSet<String>)> = None;
+        let mut in_env = false;
+        let mut flush = |s: Option<(String, bool, Option<String>, BTreeSet<String>)>| {
+            if let Some((name, ours, Some(role), env)) = s {
+                if ours {
+                    out.push((file.clone(), name, role, env));
+                }
+            }
+        };
+        for line in text.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            if indent == 2 && t.ends_with(':') {
+                flush(service.take());
+                service = Some((
+                    t.trim_end_matches(':').to_string(),
+                    false,
+                    None,
+                    BTreeSet::new(),
+                ));
+                in_env = false;
+                continue;
+            }
+            if indent < 2 {
+                flush(service.take());
+                continue;
+            }
+            let Some((_, ours, role, env)) = service.as_mut() else {
+                continue;
+            };
+            if indent == 4 {
+                in_env = t == "environment:";
+                if t == "image: agentdialer:e2e" {
+                    *ours = true;
+                }
+                if let Some(cmd) = t.strip_prefix("command:") {
+                    *role = Some(cmd.trim().trim_matches(['[', ']', '"', ' ']).to_string());
+                }
+            } else if in_env && indent >= 6 {
+                if let Some(entry) = t.strip_prefix("- ") {
+                    env.insert(entry.split('=').next().unwrap_or("").to_string());
+                }
+            }
+        }
+        flush(service.take());
+    }
+    out
+}
+
+#[test]
+fn e2e_compose_services_pass_exactly_the_role_contract() {
+    let services = e2e_compose_services();
+    assert!(
+        services
+            .iter()
+            .filter(|(_, _, role, _)| role == "orchestrator")
+            .count()
+            >= 3,
+        "expected the cluster compose to run three orchestrator nodes: {services:?}"
+    );
+    for (file, service, role, env) in &services {
+        assert_env_matches_contract(&format!("{file} ({service})"), role, env);
+    }
+}
 #[test]
 fn readme_documents_every_role_variable() {
     let readme = read("README.md");

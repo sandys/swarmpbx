@@ -9,6 +9,7 @@ license.workspace = true
 ad_core = { path = "../ad_core" }
 ad_lead = { path = "../ad_lead" }
 ad_compliance = { path = "../ad_compliance" }
+ad_attempt = { path = "../ad_attempt" }
 chrono = { workspace = true }
 
 [dev-dependencies]

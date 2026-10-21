@@ -8,7 +8,7 @@ use std::fmt;
 pub mod ids;
 pub mod time;
 
-pub use ids::{CampaignId, LeadId, OrgId, RunId};
+pub use ids::{AttemptId, CampaignId, LeadId, OrgId};
 pub use time::Clock;
 
 /// A crate-agnostic error wrapper for boundaries that aggregate sub-errors.

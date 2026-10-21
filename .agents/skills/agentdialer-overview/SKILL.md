@@ -32,18 +32,29 @@ rtpengine). Do not implement a feature before you read how they do it.
 
 ## The two halves
 
-1. The media plane (`PLAN.md` §0). It is plumbing we reuse, not build:
-   - `drachtio` does SIP signaling (it wraps Sofia-SIP).
-   - `rtpengine` does RTP/SRTP media (it has a Linux kernel module).
-   - Our Rust code is a thin control plane over these engines.
-   - We do NOT write a SIP stack or a media engine from scratch.
-   - A spike proved this works (`PLAN.md` §0.3.1). The spike code is in `spike/`.
+1. The media plane (`PLAN.md` §0.0, decision D-9). agentdialer carries the
+   call itself:
+   - The node that runs a call is its SIP user agent and its RTP endpoint.
+     There is no Asterisk, FreeSWITCH, drachtio, rtpengine, or `livekit/sip`
+     under it.
+   - The SIP and media stacks are vendored libraries: `rsipstack` (SIP),
+     `rustrtc` (SDP, RTP), `audio-codec` (G.711, G.722), and copied parts of
+     `rustpbx`. Use a library that already does the job; write only the glue.
+   - Kamailio is the SIP edge. It routes each call's SIP to the node that owns
+     it (`Record-Route`). It does not carry audio.
+   - The RTP goes straight between the carrier and the node, one socket per
+     call, in `latching` or `public` mode.
+   - Caution: never use `hostNetwork` or a port range per call on Kubernetes.
+     Production is EKS with normal pods.
    - We own the SIP↔WebRTC bridge so LiveKit runs pure WebRTC rooms
-     (`PLAN.md` §0.9a). `ad_gateway` owns it. The bridge seam (`RoomParticipant`,
-     `MediaBridge`, `AudioFrame`) and its in-memory tests are built; the real
-     libwebrtc-backed participant (`LiveKitParticipant`) is part of the normal
-     build. The orchestrator does not use it yet. It still dials through
-     `CreateSIPParticipant` (`livekit/sip`).
+     (`PLAN.md` §0.9a). `ad_gateway` owns the room participant
+     (`LiveKitParticipant`) and the audio pump (`MediaBridge`).
+   - Status: built and proven in Docker Compose (`e2e/run_e2e.sh`,
+     `e2e/run_cluster_e2e.sh`). `ad_sip` is the SIP user agent, `ad_media`
+     the RTP leg, and `ad_gateway::SipCaller` joins them to the room. The
+     open items are in `PLAN.md` §0.0 ("Open").
+   - Caution: never run `cargo fmt --all`. It also formats path dependencies
+     and so rewrites the vendored crates in `vendor/`. Run `cargo fmt`.
 
 2. The campaign brain (`PLAN.md` §0.10). This is the actual product:
    - campaigns, lists, the hopper (lead selection), pacing, dispositions,
@@ -67,17 +78,30 @@ concern. Current crates (all built):
 - `ad_routing` — the routing rule engine. See the `routing-engine` skill.
 - `ad_hopper` — lead selection: status, call-count, DNC, safe-hours, routing.
 - `ad_circuit_breaker` — a pure rolling-window failure-rate breaker.
-- `ad_dispatch` — the dial loop. A `CallInitiator` seam + RAII capacity slots.
-- `ad_gateway` — the real `CallInitiator`. It originates calls into LiveKit
-  rooms, and owns the SIP↔WebRTC bridge (a native WebRTC participant, part of
-  the normal build).
+- `ad_dispatch` — the dial seam (`CallInitiator`, `Placement`) and the pacer.
+- `ad_sip` — the node's SIP user agent on the vendored `rsipstack`: one
+  outbound call through the SIP edge, the ring timeout, the end of the call.
+- `ad_media` — one call's RTP leg on the vendored `rustrtc` and
+  `audio-codec`: SDP, G.711, a 20 ms send clock that never stops, the media
+  timeout.
+- `ad_gateway` — the call path (`SipCaller`: `ad_sip` + `ad_media` + our
+  native WebRTC participant in the room), the room operations, and the
+  presence check of the reconcile.
+- `ad_attempt` — the call-attempt statechart (customer leg and agent region).
+  Pure. Read `PLAN.md` §0.10.7a.
+- `ad_agent` — the agent adapters: LiveKit (explicit dispatch) and pipecat (a
+  start request with a room token).
+- `ad_cluster` — cluster coordination over kine: nodes, the leader, call
+  assignment, and placement. Read `PLAN.md` §0.10.8b.
 - `ad_orchestrator` — the pure scheduling gate, the run loop, the event
-  reactor, and the pure retry decision (`retry.rs`).
+  reactor, the pure retry decision (`retry.rs`), and the pure settlement
+  (`settle.rs`).
 - `ad_events` — the event contract: typed events, the publisher and consumer
   traits, the breaker-store trait, and in-memory fakes.
-- `ad_db` — the Postgres data layer (sqlx), migrations, advisory-lock leader,
+- `ad_db` — the Postgres data layer (sqlx), migrations,
+  the call attempts (`attempts`: claim, saved statechart, settlement),
   and the event layer (`events`: the event table with LISTEN/NOTIFY; `breaker`:
-  the breaker window over `call_outcomes`).
+  the breaker window over the ended attempts).
 - `ad_api` — the HTTP API (axum). A `router()` factory makes the API testable
   in process. See the `vertical-slice` skill.
 - `ad_bin` — the single binary `agentdialer`. It runs roles by subcommand:
@@ -86,30 +110,58 @@ concern. Current crates (all built):
 
 ## How the orchestrator runs
 
-1. It waits for the Postgres advisory lock. Only the leader continues.
-2. It connects the event consumer (`LISTEN campaign_events`).
-3. It reconciles: it dispatches a batch for each running campaign.
-4. It consumes events. A `NOTIFY` wakes it. A sweep timer
-   (`AD_EVENT_SWEEP_MS`) reads the event table again if a notification is
-   lost.
-5. For each call, it writes the outcome and the retry (`next_eligible_at` on
-   the lead row) in one transaction.
-6. A retry sweep (`AD_RETRY_SWEEP_MS`) puts due leads back in the hopper and
-   publishes an event that schedules the next batch.
+The orchestrator runs as a cluster (`PLAN.md` §0.10.8b). Every replica is a
+node; the nodes coordinate through kine, the etcd API on Postgres.
+
+1. Each node waits for Postgres and kine (with backoff), then holds its key
+   `/agentdialer/nodes/{node}` by writing it again every third of the TTL.
+2. One node holds `/agentdialer/leader` and schedules. It consumes the
+   campaign events (`LISTEN campaign_events`), claims due leads straight from
+   `leads` within the campaign cap and the free capacity of the cluster, and
+   assigns each call to the node with the most free capacity
+   (`/agentdialer/calls/{node}/{attempt}`), paced by `AD_CALLS_PER_SEC`.
+3. Each node runs its calls: it starts the campaign's agent (`ad_agent`:
+   LiveKit dispatch or pipecat start request), waits until the agent is in
+   the room, and sends the INVITE through Kamailio (`ad_gateway::SipCaller`).
+   On the answer it joins the room and carries the audio. It saves each
+   result with its node and assignment generation (`apply_owned`). A node
+   that lost the call is fenced.
+4. The call ends on its node: the callee's BYE, the agent leaving the room,
+   or no RTP for 30 s. The node's check against LiveKit
+   (`AD_ATTEMPT_CHECK_MS`) ends a call whose node died.
+5. The transaction that ends an attempt writes `attempt_ended`. The leader
+   settles the lead (the pure `ad_orchestrator::settle`), closes the room,
+   removes the assignment, and dials into the freed capacity.
+6. The leader's sweep (`AD_RETRY_SWEEP_MS`) settles ended attempts, repairs
+   the assignments (moves the calls of a dead node), dials the leads whose
+   retry or hold became due, and completes idle campaigns.
+
+Every state change and its event commit in one transaction
+(`ad_db::events::publish_in`).
+
+Caution: kine is not etcd. Use only `ad_cluster::Kine`, which offers the
+transactions kine supports. Do not use lease KeepAlive, Election, plain Put,
+plain delete, or keys-only reads (`PLAN.md` §0.10.8b).
 
 ## Decisions in force
 
 `GAPS.md` §8 records each decision. These change how you build:
 
-- D-2 (decided, not built): the dialer places the call. The agent never dials.
-  Agents join through two adapters: LiveKit (a room plus agent dispatch) and
-  pipecat (a bot per call). A statechart per attempt drives both. Its state is
-  saved in Postgres (an event log plus a snapshot) and restored after a
-  restart.
+- D-2 (decided and built): the dialer places the call. The agent never
+  dials. Agents join through two adapters: LiveKit (a room plus agent
+  dispatch) and pipecat (a bot per call). The attempt statechart drives both,
+  and the dial waits until the agent is in the room.
 - D-3 (decided and built): Postgres is the event layer. Do not add Redis.
 - D-6 (decided, not built): each agent session opens one gRPC stream to the
   dialer for the outcome, the session events, and the logs. OpenTelemetry
   (OTLP) uses the same gRPC endpoint.
+- D-8 (decided and built): the orchestrator replicas form a cluster through
+  kine. Postgres and kine are managed services (for example RDS): reach them
+  only by URL, wait for them with backoff, and never depend on a host check or
+  a start order.
+- D-9 (decided and built): agentdialer carries the call with vendored SIP
+  and RTP libraries, behind Kamailio, with no host networking (`PLAN.md`
+  §0.0).
 
 ## The rules you must follow
 
@@ -154,11 +206,17 @@ the tier, the work is not done.
 - To change the dialer core, read `PLAN.md` §0.10 and the `routing-engine` skill.
 - To change compliance, read the `compliance-engine` skill.
 - To add an API endpoint, read the `vertical-slice` skill.
-- To work on the media plane or the SIP↔WebRTC bridge, read `PLAN.md` §0 and
-  §0.9a, the spike in `spike/`, and `crates/ad_gateway/src/bridge.rs`.
-- To change the orchestrator or the event layer, read `PLAN.md` §0.10.8a,
-  `crates/ad_bin/src/orchestrator.rs`, `crates/ad_events/`, and
-  `crates/ad_db/src/events.rs`.
+- To work on the call path (SIP, RTP, the bridge into the room), read
+  `PLAN.md` §0.0, `vendor/VENDORED.md`, `crates/ad_sip/`, `crates/ad_media/`,
+  and `crates/ad_gateway/src/sip_call.rs`. The research notes are in
+  `_research/scratch/media/` (the carrier lessons are in
+  `asterisk-freeswitch.md`). Test with `e2e/run_e2e.sh` (Kamailio, a NAT, a
+  SIPp carrier, both agent runtimes).
+- To change the orchestrator, the cluster, the call attempts, or the event
+  layer, read `PLAN.md` §0.10.7a, §0.10.8a, and §0.10.8b,
+  `crates/ad_bin/src/orchestrator/` (`mod.rs`, `calls.rs`, `leader.rs`),
+  `crates/ad_cluster/`, `crates/ad_attempt/`, `crates/ad_db/src/attempts.rs`,
+  `crates/ad_events/`, and `crates/ad_db/src/events.rs`.
 - To add or change an environment variable, read `crates/ad_bin/src/config.rs`.
 - The `e2e/` directory holds the automated end-to-end proofs. Run them with
   their scripts; each brings up a real stack and tears it down.

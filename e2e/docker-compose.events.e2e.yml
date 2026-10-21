@@ -1,14 +1,24 @@
-# Event-driven e2e stack: Postgres only. Postgres is the event layer (an event
-# table plus LISTEN/NOTIFY). The orchestrator (our image) is started by
-# run_events_e2e.sh with a failing gateway, so we test the event layer (breaker
-# trip, retry storage, re-admission) deterministically without the media
-# stack. Host networking so the orchestrator container reaches it on 127.0.0.1.
+# Postgres and kine for e2e/run_events_e2e.sh, on their own bridge network.
+# The script runs the api and the orchestrator on the same network.
+name: ad-events
+
+networks:
+  events: {}
+
 services:
   postgres:
     image: postgres:16-alpine
-    network_mode: host
     environment:
       POSTGRES_USER: ad
       POSTGRES_PASSWORD: ad
       POSTGRES_DB: ad
-    command: ["postgres", "-p", "5432"]
+    networks: [events]
+
+  # kine retries Postgres until it answers.
+  kine:
+    image: rancher/kine:v0.13.17
+    command:
+      - --endpoint=postgres://ad:ad@postgres:5432/ad?sslmode=disable
+      - --listen-address=0.0.0.0:2379
+      - --compact-interval=5m
+    networks: [events]

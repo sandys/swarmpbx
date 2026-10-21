@@ -1,5 +1,6 @@
-# AgentDialer values. One image, four roles (PLAN.md §5). The orchestrator is a
-# singleton via a Postgres advisory lock, NOT a Kubernetes Service.
+# AgentDialer values. One image, four roles (PLAN.md §5). The orchestrator
+# replicas are the cluster nodes, and each node carries its own calls (SIP and
+# RTP, PLAN.md §0.0) as a normal pod: no hostNetwork, no RTP port range.
 #
 # The environment each role needs is defined in crates/ad_bin/src/config.rs and
 # listed in README.md ("Configuration"). A test in ad_bin fails when a template
@@ -15,14 +16,20 @@ database:
   existingSecret: ""        # name of a Secret with key DATABASE_URL
   url: ""                   # or an inline url (dev only; prefer a Secret)
 
-# LiveKit + SIP trunk for the gateway (origination).
+# LiveKit runs the rooms where each call meets its agent. The nodes join the
+# rooms themselves; no livekit/sip and no webhook.
 livekit:
   url: "ws://livekit:7880"
   existingSecret: ""        # Secret with LIVEKIT_API_KEY, LIVEKIT_API_SECRET (preferred)
   apiKey: ""                # or inline values (dev only)
   apiSecret: ""
-  sipTrunkId: ""            # outbound SIP trunk id (the orchestrator requires it)
   roomPrefix: "campaign"
+
+# The calls. Each node sends its INVITEs through the SIP edge (Kamailio,
+# deployed separately) and puts its pod IP in Via, Contact, and the SDP.
+sip:
+  trunk: ""                 # AD_SIP_TRUNK: the carrier's host:port (required)
+  proxy: ""                 # AD_SIP_PROXY: the SIP edge's host:port, e.g. kamailio:5060
 
 # The API: a normal Deployment + Service + HPA.
 api:
@@ -35,17 +42,16 @@ api:
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
 
-# The orchestrator: a SINGLETON. Run >=2 replicas for availability; exactly one
-# wins the advisory lock and runs the scheduling loop, the rest stand by and
-# take over on leader loss. No Service — nothing calls it; it is a background
-# loop. Recreate + maxUnavailable keep churn low, but the lock is the real
-# guarantee against split-brain.
+# The orchestrator replicas are the cluster nodes. Every replica runs calls;
+# one also holds the leader key in kine and schedules. No Service: nothing
+# calls the orchestrator.
 orchestrator:
   replicas: 2
-  batchLimit: 20            # AD_BATCH_LIMIT: hopper rows claimed per batch
-  callsPerSec: 10           # AD_CALLS_PER_SEC: origination rate limit
-  retrySweepMs: 1000        # AD_RETRY_SWEEP_MS: interval of the due-retry sweep
+  batchLimit: 20            # AD_BATCH_LIMIT: leads claimed per claim (within the free capacity)
+  callsPerSec: 10           # AD_CALLS_PER_SEC: call starts per second (calls run at the same time)
+  retrySweepMs: 1000        # AD_RETRY_SWEEP_MS: interval of the sweep that dials due leads
   eventSweepMs: 2000        # AD_EVENT_SWEEP_MS: max wait before the event table is read again
+  attemptCheckMs: 15000     # AD_ATTEMPT_CHECK_MS: interval of the check of live calls against LiveKit
   resources: {}
 
 # The dispatch workers: stateless, N replicas, claim via SKIP LOCKED. Scale
@@ -61,20 +67,10 @@ dispatch:
     targetCPUUtilizationPercentage: 70
   resources: {}
 
-# The gateway media pods (SIP<->WebRTC). hostNetwork + a fixed RTP port range,
-# because SIP/RTP carry IPs inside the packets and cannot sit behind a normal
-# ClusterIP Service (PLAN.md §0.5, the jambonz pattern). Pin to media nodes.
-gateway:
-  enabled: true
-  replicas: 2
-  hostNetwork: true
-  sipPort: 5060
-  rtpPortStart: 30000
-  rtpPortEnd: 40000
-  nodeSelector:
-    agentdialer.io/media: "true"
-  resources: {}
-
 # The migrate Job runs once before upgrade/install (a Helm hook).
 migrate:
   enabled: true
+
+# The kine (etcd API) endpoints of the orchestrator nodes (AD_ETCD_ENDPOINTS).
+cluster:
+  etcdEndpoints: ""

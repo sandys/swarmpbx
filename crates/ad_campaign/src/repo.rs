@@ -25,6 +25,8 @@ pub enum RepoError {
 pub struct NewCampaign {
     pub org_id: OrgId,
     pub name: String,
+    pub concurrency_cap: u32,
+    pub agent: Option<serde_json::Value>,
 }
 
 /// The persistence boundary. Native `async fn` in trait (Rust >= 1.75).
@@ -78,7 +80,9 @@ impl CampaignRepo for InMemoryCampaignRepo {
             .map_err(|e| RepoError::Storage(e.to_string()))?;
         inner.next_id += 1;
         let id = CampaignId(inner.next_id);
-        let campaign = Campaign::new(id, new.org_id, new.name, now);
+        let mut campaign = Campaign::new(id, new.org_id, new.name, now);
+        campaign.concurrency_cap = new.concurrency_cap;
+        campaign.agent = new.agent;
         inner.by_id.insert(id.0, campaign.clone());
         Ok(campaign)
     }
@@ -135,6 +139,8 @@ mod tests {
             .create(NewCampaign {
                 org_id: OrgId(7),
                 name: "camp".into(),
+                concurrency_cap: 10,
+                agent: None,
             })
             .await
             .unwrap();

@@ -14,3 +14,10 @@ keys:
   devkey: devsecret_devsecret_devsecret_32b
 logging:
   level: info
+# LiveKit posts room and participant events to the agentdialer API, which ends
+# call attempts on them. The e2e stacks run the API on 127.0.0.1:18090. A stack
+# without the API only logs the failed posts.
+webhook:
+  api_key: devkey
+  urls:
+    - http://127.0.0.1:18090/v1/webhooks/livekit

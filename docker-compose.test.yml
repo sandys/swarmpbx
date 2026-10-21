@@ -4,10 +4,10 @@
 #       --exit-code-from tests
 #   docker compose -f docker-compose.test.yml down -v
 #
-# The `tests` service runs fmt + clippy + the full suite, including the Postgres
-# integration tests (data layer and event layer), against the `postgres`
-# service in this compose. Named volumes cache the cargo registry and the
-# target dir, so repeat runs are fast.
+# The `tests` service runs fmt + clippy + the full suite, including the
+# Postgres and kine integration tests (data layer, event layer, cluster),
+# against the `postgres` and `kine` services in this compose. Named volumes
+# cache the cargo registry and the target dir, so repeat runs are fast.
 services:
   postgres:
     image: postgres:16-alpine
@@ -21,6 +21,16 @@ services:
       timeout: 3s
       retries: 30
 
+  # kine serves the etcd API on Postgres, in its own table `kine` of the
+  # agentdialer database. The cluster tests in ad_cluster run against it.
+  kine:
+    image: rancher/kine:v0.13.17
+    command:
+      - --endpoint=postgres://agentdialer:agentdialer@postgres:5432/agentdialer?sslmode=disable
+      - --listen-address=0.0.0.0:2379
+      - --compact-interval=5m
+    # kine retries Postgres until it answers; nothing waits on a health check.
+
   tests:
     build:
       context: .
@@ -28,9 +38,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      kine:
+        condition: service_started
     environment:
       # Point the integration tests at the compose services by name.
       DATABASE_URL: postgres://agentdialer:agentdialer@postgres:5432/agentdialer
+      AD_TEST_ETCD_ENDPOINTS: http://kine:2379
       CARGO_HOME: /cache/cargo
       CARGO_TARGET_DIR: /cache/target
     volumes:
@@ -46,7 +59,9 @@ services:
       - -c
       - |
         echo "== fmt =="
-        cargo fmt --all -- --check
+        # Without --all: --all also formats path dependencies, and the
+        # vendored crates (vendor/) must stay exact copies.
+        cargo fmt -- --check
         echo "== clippy =="
         cargo clippy --all-targets -- -D warnings
         echo "== tests (incl. postgres integration) =="

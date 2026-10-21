@@ -1,0 +1,210 @@
+# The cluster e2e (PLAN.md §0.0, §0.10.8b): three agentdialer nodes carry the
+# calls themselves (SIP and RTP), behind Kamailio, with a LiveKit agent and a
+# pipecat bot. Every service is a normal container on one bridge network
+# (10.20.0.0/24): no host networking, as on EKS.
+#
+# The carrier is on the "internet": the address 203.0.113.20, held by the NAT
+# container, where SIPp runs in the NAT's network namespace. Traffic from the
+# cluster to the carrier is source-NATed to 203.0.113.2 with random ports
+# (SNAT --random-fully), as the AWS NAT gateway does; the carrier never sees a
+# node's address. A one-shot sidecar per node (and for Kamailio) adds the
+# route to 203.0.113.0/24 through the NAT, as a VPC route table does.
+#
+# (Docker drops routed traffic to a container IP of another bridge network,
+# so the carrier cannot be a container on a second network.)
+#
+# e2e/run_cluster_e2e.sh and e2e/run_e2e.sh drive this file. They set
+# E2E_CALLS.
+name: ad-cluster
+
+networks:
+  cluster:
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
+          # Dynamic addresses come from the upper half; the fixed ones (the
+          # NAT .2, LiveKit .5, Kamailio .10) stay below it.
+          ip_range: 10.20.0.128/25
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ad
+      POSTGRES_PASSWORD: ad
+      POSTGRES_DB: ad
+    networks: [cluster]
+
+  # kine retries Postgres until it answers.
+  kine:
+    image: rancher/kine:v0.13.17
+    command:
+      - --endpoint=postgres://ad:ad@postgres:5432/ad?sslmode=disable
+      - --listen-address=0.0.0.0:2379
+      - --compact-interval=5m
+    networks: [cluster]
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit-cluster.yaml:/etc/livekit.yaml:ro
+    networks:
+      cluster:
+        ipv4_address: 10.20.0.5
+
+  livekit-agent:
+    build:
+      context: agents/livekit
+    image: ad-e2e-livekit-agent
+    environment:
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: devsecret_devsecret_devsecret_32b
+      AGENT_NAME: e2e-livekit
+      STATS_PORT: "8088"
+    networks: [cluster]
+
+  pipecat-bot:
+    build:
+      context: agents/pipecat
+    image: ad-e2e-pipecat-bot
+    environment:
+      PORT: "8089"
+    networks: [cluster]
+
+  kamailio:
+    image: ghcr.io/kamailio/kamailio:5.8.4-bookworm
+    environment:
+      SHM_MEMORY: "64"
+      PKG_MEMORY: "8"
+    volumes:
+      - ./kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+    networks:
+      cluster:
+        ipv4_address: 10.20.0.10
+
+  # The NAT gateway, and the "internet" behind it. The addresses come first,
+  # so the carrier can bind as soon as it starts. It writes .out/nat.ready
+  # after the NAT rule; the carrier waits for that file.
+  nat:
+    image: alpine:3.20
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    command:
+      - sh
+      - -c
+      - >-
+        ip addr add 203.0.113.20/32 dev lo &&
+        ip addr add 203.0.113.2/32 dev lo &&
+        apk add -q iptables &&
+        iptables -t nat -A INPUT -s 10.20.0.0/24 -d 203.0.113.20 -j SNAT --to-source 203.0.113.2 --random-fully &&
+        touch /out/nat.ready && echo "nat: ready" && exec sleep infinity
+    networks:
+      cluster:
+        ipv4_address: 10.20.0.2
+    volumes:
+      - ./.out:/out
+
+  # The carrier at 203.0.113.20. It waits for the NAT rule, so no packet
+  # reaches it un-NATed.
+  carrier:
+    image: ctaloi/sipp:latest
+    network_mode: "service:nat"
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        until [ -e /out/nat.ready ]; do sleep 0.2; done;
+        exec sipp -sf /out/carrier_cluster.xml -i 203.0.113.20 -p 5080
+        -mi 203.0.113.20 -mp 6000 -rtp_echo -m "$${E2E_CALLS}" -timeout 900s
+        -trace_msg -message_file /out/cluster_sip_messages.log
+    environment:
+      E2E_CALLS: "${E2E_CALLS:-24}"
+    volumes:
+      - ./.out:/out
+
+  node-1:
+    image: agentdialer:e2e
+    command: ["orchestrator"]
+    environment:
+      - HOSTNAME=node-1
+      - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
+      - AD_SIP_TRUNK=203.0.113.20:5080
+      - AD_SIP_PROXY=kamailio:5060
+      - AD_ETCD_ENDPOINTS=http://kine:2379
+      - AD_ROOM_PREFIX=campaign
+      - AD_NODE_CAPACITY=2
+      - AD_CLUSTER_TTL_S=5
+      - AD_CALLS_PER_SEC=10
+      - AD_ATTEMPT_CHECK_MS=5000
+      - RUST_LOG=info
+    networks: [cluster]
+
+  node-2:
+    image: agentdialer:e2e
+    command: ["orchestrator"]
+    environment:
+      - HOSTNAME=node-2
+      - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
+      - AD_SIP_TRUNK=203.0.113.20:5080
+      - AD_SIP_PROXY=kamailio:5060
+      - AD_ETCD_ENDPOINTS=http://kine:2379
+      - AD_ROOM_PREFIX=campaign
+      - AD_NODE_CAPACITY=2
+      - AD_CLUSTER_TTL_S=5
+      - AD_CALLS_PER_SEC=10
+      - AD_ATTEMPT_CHECK_MS=5000
+      - RUST_LOG=info
+    networks: [cluster]
+
+  node-3:
+    image: agentdialer:e2e
+    command: ["orchestrator"]
+    environment:
+      - HOSTNAME=node-3
+      - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
+      - AD_SIP_TRUNK=203.0.113.20:5080
+      - AD_SIP_PROXY=kamailio:5060
+      - AD_ETCD_ENDPOINTS=http://kine:2379
+      - AD_ROOM_PREFIX=campaign
+      - AD_NODE_CAPACITY=2
+      - AD_CLUSTER_TTL_S=5
+      - AD_CALLS_PER_SEC=10
+      - AD_ATTEMPT_CHECK_MS=5000
+      - RUST_LOG=info
+    networks: [cluster]
+
+  # The route to the carrier through the NAT, in the network namespace of each
+  # node and of Kamailio
+  # (the VPC route table of this test).
+  node-1-route:
+    image: alpine:3.20
+    network_mode: "service:node-1"
+    cap_add: [NET_ADMIN]
+    command: ["ip", "route", "add", "203.0.113.0/24", "via", "10.20.0.2"]
+  node-2-route:
+    image: alpine:3.20
+    network_mode: "service:node-2"
+    cap_add: [NET_ADMIN]
+    command: ["ip", "route", "add", "203.0.113.0/24", "via", "10.20.0.2"]
+  node-3-route:
+    image: alpine:3.20
+    network_mode: "service:node-3"
+    cap_add: [NET_ADMIN]
+    command: ["ip", "route", "add", "203.0.113.0/24", "via", "10.20.0.2"]
+  kamailio-route:
+    image: alpine:3.20
+    network_mode: "service:kamailio"
+    cap_add: [NET_ADMIN]
+    command: ["ip", "route", "add", "203.0.113.0/24", "via", "10.20.0.2"]

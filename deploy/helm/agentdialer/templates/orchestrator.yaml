@@ -1,9 +1,8 @@
-# The orchestrator is a SINGLETON by leader election, not by a Service.
-# Run >=2 replicas for availability. Each replica tries to win a Postgres
-# advisory lock (ad_db::leader). Exactly one wins and runs the scheduling loop;
-# the rest stand by. On leader loss (pod death -> DB connection drop -> lock
-# release) a standby wins within ~0.5s. There is deliberately NO Service object:
-# nothing calls the orchestrator; it is a background loop.
+# The orchestrator replicas are the agentdialer cluster nodes (PLAN.md
+# §0.10.8b). Each replica holds its node key in kine and runs the calls that
+# the leader assigns to it; one replica also holds the leader key and
+# schedules. Scale the Deployment to add nodes. There is deliberately NO
+# Service object: nothing calls the orchestrator; it is a background loop.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,8 +12,8 @@ metadata:
     app.kubernetes.io/component: orchestrator
 spec:
   replicas: {{ .Values.orchestrator.replicas }}
-  # Recreate avoids extra leaderless churn on rollout; the advisory lock, not
-  # this strategy, prevents split-brain.
+  # Recreate keeps rollouts simple. A stopping node deletes its kine keys on
+  # SIGTERM, so the leader moves its calls at once.
   strategy:
     type: Recreate
   selector:
@@ -47,6 +46,22 @@ spec:
               value: {{ .Values.orchestrator.retrySweepMs | quote }}
             - name: AD_EVENT_SWEEP_MS
               value: {{ .Values.orchestrator.eventSweepMs | quote }}
+            - name: AD_ETCD_ENDPOINTS
+              value: {{ .Values.cluster.etcdEndpoints | quote }}
+            # The node carries its calls (PLAN.md §0.0): its SIP user agent
+            # sends through the SIP edge and advertises the pod IP.
+            - name: AD_SIP_TRUNK
+              value: {{ .Values.sip.trunk | quote }}
+            {{- if .Values.sip.proxy }}
+            - name: AD_SIP_PROXY
+              value: {{ .Values.sip.proxy | quote }}
+            {{- end }}
+            - name: AD_SIP_ADVERTISE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AD_ATTEMPT_CHECK_MS
+              value: {{ .Values.orchestrator.attemptCheckMs | quote }}
             {{- include "agentdialer.dbEnv" . | nindent 12 }}
             {{- include "agentdialer.livekitEnv" . | nindent 12 }}
           resources:

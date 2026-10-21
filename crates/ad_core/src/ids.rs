@@ -28,7 +28,7 @@ macro_rules! id_type {
 id_type!(OrgId);
 id_type!(CampaignId);
 id_type!(LeadId);
-id_type!(RunId);
+id_type!(AttemptId);
 
 #[cfg(test)]
 mod tests {

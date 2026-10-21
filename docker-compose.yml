@@ -1,9 +1,11 @@
-# Local development stack: Postgres. Postgres is also the orchestrator event
-# layer (an event table plus LISTEN/NOTIFY), so no other store is necessary.
+# Local development stack: Postgres and kine. Postgres is also the orchestrator event
+# layer (an event table plus LISTEN/NOTIFY). kine serves the etcd API on the same
+# database (table `kine`) for the cluster nodes.
 # Start with: docker compose up -d
 # Stop with:  docker compose down
 #
 #   DATABASE_URL=postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer
+#   AD_ETCD_ENDPOINTS=http://127.0.0.1:2379
 #
 # Port 5433 (not 5432) avoids a clash with a host service.
 # README.md ("Configuration") lists every variable.
@@ -23,3 +25,13 @@ services:
       retries: 30
     # Ephemeral storage: a named volume is unnecessary for dev/test and keeps
     # test runs reproducible. Add a volume later if you want persistence.
+
+  # kine: the etcd API on Postgres. It retries Postgres until it answers.
+  kine:
+    image: rancher/kine:v0.13.17
+    command:
+      - --endpoint=postgres://agentdialer:agentdialer@postgres:5432/agentdialer?sslmode=disable
+      - --listen-address=0.0.0.0:2379
+      - --compact-interval=5m
+    ports:
+      - "127.0.0.1:2379:2379"

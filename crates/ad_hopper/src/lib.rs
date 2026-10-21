@@ -67,10 +67,7 @@ pub struct Selection {
 
 /// Statuses the hopper will consider for dialing.
 fn is_dialable_status(s: LeadStatus) -> bool {
-    matches!(
-        s,
-        LeadStatus::New | LeadStatus::Queued | LeadStatus::Dispositioned
-    )
+    matches!(s, LeadStatus::New | LeadStatus::Queued)
 }
 
 /// Build the routing context from a lead so rules can test its fields.

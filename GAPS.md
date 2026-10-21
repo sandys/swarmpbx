@@ -85,15 +85,15 @@ Each gap uses this form:
 | COMP-2 | A lead without an explicit IANA timezone never dials. There is no derivation. |
 | COMP-6 | No consent record exists. AI voice calls need consent (verify). |
 | COMP-7 | An opt-out in the call cannot reach the DNC list. |
-| DIAL-1 | The gateway reports "answered" when LiveKit accepts the SIP participant. |
-| DIAL-2 | Capacity is not held for the length of the call. |
-| DIAL-3 | The orchestrator dials one call at a time and waits for each answer. |
-| DIAL-4 | A timeout after the INVITE is sent can cause a second dial. |
-| LEAD-1 | Nothing fills the hopper. Leads loaded through the API never dial. |
+| DIAL-1 | The gateway reported every call end as "answered". Partly fixed 2026-10-21: SIP codes map to classes and the webhook ends the call; the agent outcome is open. |
+| DIAL-2 | Capacity was not held for the length of the call. Fixed 2026-10-21: a live call attempt is the unit of capacity. |
+| DIAL-3 | The orchestrator dialed one call at a time. Fixed 2026-10-21: calls run in parallel, paced by `AD_CALLS_PER_SEC`. |
+| DIAL-4 | A timeout after the INVITE could cause a second dial. Fixed 2026-10-21: the attempt becomes `uncertain` and is reconciled first. |
+| LEAD-1 | Nothing filled the hopper. Fixed 2026-10-21: the claim reads the due leads directly. |
 | LEAD-2 | Retries lived only in Redis. Fixed 2026-10-20: the due time is on the lead row. |
-| LEAD-3 | Claims never release. A dispositioned lead can re-dial at once. |
-| ORCH-1 | Campaign state never becomes paused or completed in Postgres. |
-| AGNT-1 | No agent is dispatched into the per-lead rooms. |
+| LEAD-3 | Claims never released. Fixed 2026-10-21: the call attempt is the claim, and settlement updates the lead once. |
+| ORCH-1 | Campaign state never became paused or completed. Fixed 2026-10-21: both are saved with their events. |
+| AGNT-1 | No agent was dispatched. Fixed 2026-10-21: a LiveKit agent or a pipecat bot joins each attempt room before the dial. |
 | AGNT-2 | There is no outcome contract from the agent to the dialer. |
 | API-1 | The API has no authentication and no tenant isolation. |
 | OPS-1 | The orchestrator cannot start from Helm or `e2e/run_e2e.sh` (no `REDIS_URL`). Fixed 2026-10-20. |
@@ -219,11 +219,13 @@ Each gap uses this form:
 - **Reference:** dograh `services/telephony/status_processor.py` takes the outcome from a terminal provider status. Alexor-Brain `app.py` `/api/livekit/webhook` (line 1423) uses `room_finished`. The LiveKit sample `outbound-caller-python/agent.py` reads `sip_status_code` from `TwirpError`.
 - **Gap:** Busy and no-answer never occur in production. Every non-answer counts as a breaker failure. No real disposition reaches the lead.
 - **Do:** Separate placement from outcome. `initiate` returns "placed" or "rejected with a SIP code". The outcome arrives from a terminal event: the LiveKit webhook, the SIP final response, and the agent outcome (AGNT-2). Map SIP codes to a typed taxonomy (BETTER-7).
+- **Status (2026-10-21), partial:** placement and outcome are separate. The gateway waits for the answer in a task of its own and returns a `Placement`: answered, rejected (with the SIP code from the LiveKit error metadata), not sent, or no response. `ad_attempt::classify_sip` maps the code to busy, no answer, declined, invalid number, or failed. The end of the call comes from the LiveKit webhook (`POST /v1/webhooks/livekit` on the api role). A reconcile against LiveKit is the backstop. Open: the agent outcome (AGNT-2). A completed call has no disposition yet.
 
 #### DIAL-2 Capacity is not held for the call — P0
 - **Now:** The orchestrator skips `ad_dispatch::Dispatcher`. `Dispatcher` releases its slot when `initiate` returns. `ad_db::leader::in_call_count` is never called.
 - **Reference:** dograh binds a slot to the run and releases it on the terminal status (`call_concurrency/service.py`, 20-minute stale cutoff, org cap and campaign cap). VICIdial dials `goal − live calls` (`bin/AST_VDauto_dial.pl` lines 1213, 1434). Alexor-Brain waits while live calls ≥ cap.
 - **Do:** Make a live attempt the slot. Count attempts in dialing, ringing, or connected state per campaign and per org. Acquire before the dial. Release on the terminal transition. Recover stale attempts.
+- **Status (2026-10-21):** fixed. A live call attempt is the unit of capacity. The claim locks the campaign row, counts the live attempts, and claims no more than `campaigns.concurrency_cap` (API field `concurrency_cap`, default 10). The capacity frees only when the attempt ends. `crates/ad_db/tests/pg_attempts.rs` proves the cap and that parallel claims are disjoint. Open: an org cap and a trunk cap (DIAL-7).
 
 #### DIAL-3 Serial dialing — P0
 - **Now:** `dispatch_batch` awaits each `initiate` with `wait_until_answered: true`, then sleeps `per_call_gap`. One unanswered call blocks the batch for the full ring time.
@@ -231,11 +233,14 @@ Each gap uses this form:
 - **Do:** Launch attempts at the same time, bounded by free capacity. Pace launches with a token bucket per campaign and per trunk. Never block the scheduler on ring time.
 - **Measured (SIPp benchmark, 2026-10-20, all in Docker):** the dial rate does not follow `AD_CALLS_PER_SEC`. With a 300 ms ring, 30 calls at a configured 10/s ran at 1.29 attempts/s, and 100 calls at 50/s ran at 1.08 attempts/s. With a 3 s ring the rate fell to 0.34/s: each call waits for its answer. Answered setup took 328–386 ms (p50 333 ms). Each failed setup stalled the loop for 5.7–8.1 s. Peak live calls: 11. Harness: `_research/scratch/sip-bench/`.
 - **Measured again after OPS-6, OPS-7, and D-3 (2026-10-20):** every call of the three tiers was answered (140 of 140). The failed-setup stalls are gone. The rate is still serial: 2.12 attempts/s at a configured 10/s, and 2.71 attempts/s at a configured 50/s. Each attempt waits for its answer (about 310 ms) and then for the spacer. With a 3 s ring the rate stays at 0.34/s.
+- **Status (2026-10-21):** fixed. Each dial runs in a task of its own, so the scheduler never waits for a ring. A `Pacer` (`ad_dispatch`) spaces the call starts at `AD_CALLS_PER_SEC`. Open: the pacer is one per orchestrator, not one per campaign or per trunk.
+- **Measured after the fix (SIPp benchmark, 2026-10-21, all in Docker):** the dial rate follows `AD_CALLS_PER_SEC`. 30 calls at a configured 10/s ran at 10.0 attempts/s (before: 2.12). 100 calls at 50/s ran at 50.0 attempts/s (before: 2.71), with 84 live calls at the peak. With a 3 s ring, 10 calls at 50/s ran at 50.0 attempts/s (before: 0.34): the ring no longer stops the dialing. With `concurrency_cap` 5, 40 calls never had more than 5 live, and the rate fell to 1.6 attempts/s, as the cap requires. All 180 calls completed. The LiveKit webhook ended every call, and every campaign completed in Postgres.
 
 #### DIAL-4 An uncertain initiation can dial twice — P0
 - **Now:** Every error becomes `Failed`, and `Failed` schedules a retry.
 - **Reference:** dograh `_finish_interrupted_dispatch` marks a timeout or a lost connection after the request was sent as "uncertain". It never requeues the row, keeps the slot, and reconciles later.
 - **Do:** Classify errors as "rejected" (a SIP final response arrived) or "uncertain" (no response). For an uncertain attempt, hold the slot and reconcile from the provider before any retry.
+- **Status (2026-10-21):** fixed. A connect error before the request leaves is a setup error: no call exists. Any other transport error is "no response": the attempt becomes `uncertain` and keeps its capacity. The reconcile (`AD_ATTEMPT_CHECK_MS`) then asks LiveKit whether the call is in its room. If it is, the attempt connects. If it is not, the attempt ends as `uncertain`, and only then can a retry follow. The dial start is saved before the request leaves, so a stopped dialer leaves a `dialing` attempt, and the reconcile decides it after the longest dial time.
 
 #### DIAL-5 No call timers — P1
 - **Reference:** VICIdial `dial_timeout` (default 60 seconds).
@@ -256,6 +261,7 @@ Each gap uses this form:
 - **Do:** On a trip, set the campaign to `paused` with the reason and evidence. Reset on operator resume. Document the comparison. Keep the campaign breaker separate from the trunk breaker (DIAL-7).
 - **Also:** When the orchestrator cannot read the breaker (a database error), it treats the breaker as closed and keeps dialing. Since 2026-10-20 it logs this as a warning. Decide whether this path must fail closed.
 - **Seen in the SIPp benchmark (2026-10-20):** 19 calls that never sent an INVITE (a local media error) counted as call failures and tripped the breaker. Our own misconfiguration paused the campaign. BETTER-7 separates these classes.
+- **Status (2026-10-21), partial:** a trip pauses the campaign in Postgres, with one `circuit_breaker_tripped` event in the same transaction. A resume through the API sets `campaigns.breaker_reset_at`, and the window counts only attempts that ended after it. `e2e/run_events_e2e.sh` proves both. The breaker counts only attempts that started a dial; `failed`, `setup_error`, and `uncertain` are failures, and busy and no answer are normal results. Open: the comparison, a trunk breaker, and the read-error path.
 
 ### 5.3 Lead lifecycle and selection (LEAD)
 
@@ -263,6 +269,7 @@ Each gap uses this form:
 - **Now:** Only tests call `PgHopperRepo::insert_leads`. The e2e scripts seed the hopper with SQL. Leads from `POST /v1/campaigns/:id/leads` never dial.
 - **Reference:** VICIdial fills `vicidial_hopper` every minute from cron (`bin/AST_VDhopper.pl`). dograh syncs the source into `queued_runs`.
 - **Do:** Replace the fill step with an eligibility index (BETTER-3). Each lead carries `next_eligible_at`, and the claim reads it directly.
+- **Status (2026-10-21):** fixed with BETTER-3. The claim reads the due leads straight from `leads` (`status` new or queued, `next_eligible_at` empty or past). Migration 0006 drops the `hopper` table. Leads that `POST /v1/campaigns/:id/leads` loads now dial.
 
 #### LEAD-2 Retries are not durable — P0 (fixed)
 - **Now:** Retries live only in the Redis sorted set `ad:timers:{campaign}`. A Redis loss leaves leads in `queued` with a claimed hopper row. This breaks the rule in `PLAN.md` §0.10.8a.
@@ -275,6 +282,7 @@ Each gap uses this form:
 - **Reference:** VICIdial deletes the hopper row at dial (`bin/AST_VDauto_dial.pl` line 2084) and uses `called_since_last_reset` with recycle rules. dograh moves rows through queued, processing, processed, failed, and recovers claims after 360 seconds.
 - **Do:** Give each attempt explicit states. Release the claim at the terminal state. Give each claim a lease with expiry and recovery. Make a dispositioned lead eligible only through a recycle, retry, or callback rule.
 - **Also (found 2026-10-20):** A `no_capacity` or `compliance_denied` result at dispatch sets the lead to `dispositioned`, and its hopper row stays claimed. A lead that was never dialed leaves the queue. The code comment says the lead stays claimable; it does not. Fix this with the attempt states.
+- **Status (2026-10-21):** fixed. The claim creates a call attempt and sets the lead to `in_call`. When the attempt ends, the settlement (the pure `ad_orchestrator::settle`) updates the lead once, keyed by `call_attempts.settled_at`: a retry (queued with a due time), `dispositioned`, `done`, `dnc`, or `blocked` (no timezone). A dispositioned lead is not dialable (`ad_hopper`). A gate denial no longer drops the lead: outside the window it waits 15 minutes, a DNC hit sets `dnc`, an unknown timezone sets `blocked`, and the attempt row keeps the reason. A pending attempt without a dial task is released after 60 s. Open: recycle and callback rules (LEAD-4, LEAD-5), and the next window opening as the due time (BETTER-3).
 
 #### LEAD-4 Recycle rules — P1
 - **Reference:** VICIdial `vicidial_lead_recycle` (status, `attempt_delay` default 1800 s, `attempt_maximum` default 2). It counts the delay in calling time: it subtracts the overnight closed gap (`bin/AST_VDhopper.pl` ~lines 2126–2215).
@@ -336,6 +344,7 @@ Each gap uses this form:
 - **Now:** A breaker trip and a completion only write a log line. The orchestrator publishes `campaign_completed` when one claim returns empty, even when calls are live or retries are pending.
 - **Reference:** dograh `complete_campaign_if_idle` sets `completed` only when sync is done, no queued or processing rows remain, and no call is active.
 - **Do:** Make completion a database predicate: no work due now or later, no live attempt, sync done. Set the state in the same transaction. Make the breaker pause durable (DIAL-8).
+- **Status (2026-10-21):** fixed. `complete_if_idle` sets `completed` only when no lead waits for a dial now or later and every attempt has ended and settled. The `campaign_completed` event commits with the state. `e2e/run_e2e.sh` proves it after a real call. The breaker pause is durable (DIAL-8).
 
 #### ORCH-2 Events can be lost — P1
 - **Now:** Events are published after the commit, and errors are ignored (`.ok()`). Redis pub/sub delivers at most once. Reconciliation runs only on reconnect.
@@ -345,6 +354,7 @@ Each gap uses this form:
   - The event row and the state change it announces commit in two transactions. If the process stops between them, the event is lost. Retries recover through the retry sweep, but a lost `batch_completed` stalls the campaign until the next reconnect or restart. Put the event insert into the outcome transaction, and add a periodic reconcile.
   - The publisher takes one advisory lock for the cluster, so event inserts are serialized. This is fine at dialer rates, but it is a ceiling.
   - `campaign_events` grows without a limit. Add retention (OBS-5).
+- **Update (2026-10-21):** the attempt end, the settlement, the completion, the breaker pause, and the API campaign transitions now write their events in the same transaction as the state (`ad_db::events::publish_in`, an outbox). The sweep (`AD_RETRY_SWEEP_MS`) settles ended attempts and dispatches every running campaign, so a lost event delays work by one sweep. Still open: the publish lock ceiling, and retention of `campaign_events` and `attempt_events` (OBS-5).
 
 #### ORCH-3 Two orchestration models — P1
 - **Now:** `run_loop.rs` and `gate()` are used only by tests and the API. The binary uses the reactor. `Schedule` fails open, but `PLAN.md` §7.1 says the schedule window fails closed. Production never applies a business schedule.
@@ -354,10 +364,13 @@ Each gap uses this form:
 - **Now:** The reactor treats `call_completed` as no-op. Only `batch_completed` starts the next batch.
 - **Reference:** dograh schedules the next batch on `CallCompletedEvent`.
 - **Do:** Treat freed capacity as a trigger for new launches.
+- **Status (2026-10-21):** fixed. `attempt_ended` settles the lead and dispatches into the freed capacity. In `e2e/run_events_e2e.sh` (capacity 1, a 5 s sweep), five dials follow each other in about 150 ms through NOTIFY.
 
 #### ORCH-5 No leader fencing — P1
 - **Now:** The leader holds the advisory lock on one pooled connection and never checks it. If that connection drops, Postgres releases the lock, a standby takes it, and the old leader keeps dialing.
 - **Do:** Check the lock connection on a short interval and stop dialing at once when it fails. Add a fencing token (leader epoch) to the attempt writes so a stale leader cannot commit.
+- **Also (2026-10-21):** dials now run in parallel tasks. A deposed leader keeps its running tasks until it stops, and they can still save results. The attempt row lock keeps each attempt consistent, but a deposed leader can still start new dials until it notices.
+- **Status (2026-10-21):** fixed with decision D-8 (`PLAN.md` §0.10.8b). The leader is a key in kine with a TTL; there is no advisory lock. A node that loses the key stops scheduling at once. Each attempt row carries the node and an assignment generation, and a node writes an event only while the row names it with its generation (`apply_owned`), so a node or a leader that lost a call cannot dial it or change it. `e2e/run_cluster_e2e.sh` kills a node and then the leader and checks that every lead is dialed exactly once.
 
 ### 5.6 Agent integration (AGNT)
 
@@ -365,6 +378,8 @@ Each gap uses this form:
 - **Now:** Rooms are `{prefix}-{lead_id}`. `e2e/run_e2e.sh` passes because a test agent waits in `campaign-1` and the test lead has id 1. In production no agent joins these rooms.
 - **Reference:** Alexor-Brain `services/call_service.py` calls `create_dispatch(agent_name, metadata)` and then `CreateSIPParticipant` in room `call-{call_id}`. The LiveKit sample starts the agent session before it dials.
 - **Do:** For each attempt, create room `attempt-{id}`, dispatch the named agent with metadata (lead context, campaign, attempt id, variant, disclosures), and confirm the agent joined. Then originate the call.
+- **Also (2026-10-21):** rooms are still `{prefix}-{lead_id}`. Each call attempt stores its `room` and `participant_identity` (`sip-attempt-{id}`), so a room per attempt is one change in the claim.
+- **Status (2026-10-21):** fixed for both runtimes (`ad_agent`, decision D-2). Each attempt has its own room (`{prefix}-{attempt id}`). A `livekit` campaign agent is dispatched by name with the call facts as job metadata; a `pipecat` agent gets a start request with a room token. The dial waits until the agent is in the room; an agent that does not join in `join_timeout_s` ends the attempt as `not_dialed: no_agent`, and the lead comes back after a minute. `e2e/run_e2e.sh` runs one call with a real LiveKit agent and one with a real pipecat bot.
 
 #### AGNT-2 No outcome contract — P0
 - **Reference:** dograh answer actions (`START_OPENING`, `RELEASE`, `LEAVE_MESSAGE`, `DROP`, `SCREEN_THEN_REARM`, `WAIT_FOR_SCREENING`), machine subtypes, and post-call disposition extraction. The LiveKit sample tools `end_call`, `transfer_call`, `detected_answering_machine`.
@@ -372,6 +387,7 @@ Each gap uses this form:
 
 #### AGNT-3 No agent-capacity signal — P1
 - **Do:** Use agent capacity as a pacing input: worker availability from LiveKit or a configured pool cap. Fail fast when no worker accepts a dispatch.
+- **Status (2026-10-21), partial:** a start that the runtime refuses, or an agent that does not join in time, ends the attempt without a dial and does not count as a call. Open: a capacity signal before the claim, and a breaker on agent failures.
 
 #### AGNT-4 Hangup, transfer, and orphan cleanup — P1
 - **Reference:** `delete_room` for hangup and `transfer_sip_participant` for transfer (LiveKit sample). Alexor-Brain `_cleanup_paused_campaigns` ends live calls of a stopped campaign.
@@ -390,14 +406,17 @@ Each gap uses this form:
 
 ### 5.7 Media plane (MEDIA)
 
-#### MEDIA-1 Production still depends on `livekit/sip` — P1
+#### MEDIA-1 Production still depends on `livekit/sip` — FIXED 2026-10-21 (D-9)
 - **Now:** The orchestrator dials through `CreateSIPParticipant`. `PLAN.md` §0.9a says we own the SIP↔WebRTC boundary.
 - **Do:** Add a `CallInitiator` over drachtio, rtpengine, and our bridge. Keep `LiveKitGateway` only as a fallback until the new path passes the same e2e tests.
+- **Update (2026-10-21, D-9):** the new path is not drachtio + rtpengine. The node carries SIP and RTP with vendored `rsipstack` and `rustrtc`, behind Kamailio, with no host networking (`PLAN.md` §0.0, slices 1–6).
+- **Status (2026-10-21):** fixed. The node's call task dials through `ad_sip` (via Kamailio), carries the audio with `ad_media`, and bridges it into the room with our participant; `CreateSIPParticipant` and `livekit/sip` are gone from the code and from the e2e tests. `e2e/run_e2e.sh` (one node, both runtimes) and `e2e/run_cluster_e2e.sh` (three nodes, 24 calls) pass through a NAT that stands in for the AWS NAT gateway. Open (`PLAN.md` §0.0): the `rustrtc` latching patch (RTP bleed), 407 auth and a resent 200 against SIPp, session timers, the trunk OPTIONS check, the `public` media mode, DTMF, and removal of the LiveKit webhook code.
 
-#### MEDIA-2 drachtio client is a spike — P1
+#### MEDIA-2 drachtio client is a spike — CLOSED by D-9 (2026-10-21)
 - **Now:** `spike/ad_sip_ctl` authenticates and sends a raw INVITE. It never sends ACK, BYE, or CANCEL. It does not handle provisional responses, digest auth, keepalive, reconnect, or CDR events.
 - **Reference:** `drachtio-srf/lib/drachtio-agent.js` (frame tokens, ACK with the dialog id, PRACK, `route|invite`, `cdr:*`) and `srf.js` `createUAC` (1xx, 3xx, final response, digest via `digest-client.js`, missing Contact).
 - **Do:** Build `ad_sip_ctl` with these flows and conformance tests against a real drachtio container.
+- **Status (2026-10-21):** closed. D-9 drops drachtio. The SIP flows listed here (ACK, BYE, CANCEL, 1xx, digest auth, keep-alive) come from vendored `rsipstack` and our call driver in `ad_sip` instead.
 
 #### MEDIA-3 rtpengine client is a spike — P1
 - **Now:** `spike/ad_rtpengine_ctl` sends ping, offer, answer, and delete with no flags.
@@ -440,6 +459,7 @@ Each gap uses this form:
 #### OBS-1 The attempt record is too thin — P1
 - **Now:** `call_outcomes` stores outcome, answered, and attempt time.
 - **Do:** Store per attempt: SIP code and reason, trunk, caller ID, ring, answer, and end times, answer class, disposition, agent and variant, room, recording reference, and the decision record (BETTER-2).
+- **Status (2026-10-21), partial:** `call_attempts` stores the SIP code and detail, the dial, answer, and end times, the room, the participant identity, and the worker. `attempt_events` keeps every state change in order. Open: trunk, caller ID, answer class, disposition, agent, variant, recording, and the decision record (BETTER-2).
 
 #### OBS-2 No reports — P1
 - **Do:** Add real-time campaign stats, per list, status, and disposition, funnels, an abandonment report per jurisdiction, a carrier report (answer rate, average duration, post-dial delay, SIP code mix), and per-variant results.
@@ -503,9 +523,23 @@ Each gap uses this form:
 - **Cause:** at about 6 attempts per second, ports in use = attempts per second × (call length + 30 s), which is more than 51.
 - **Status:** fixed for the e2e stacks: `spike/livekit/sip.yaml` now has `rtp_port: 20000-20999` (500 even ports), below the LiveKit RTC range 21000–21999. The file states the sizing rule.
 - **Confirmed (2026-10-20):** with the wider range, tier 2 answered 100 of 100 calls, and up to 93 RTP ports were bound at the same time (the old limit was 51).
+- **Update (2026-10-21):** with parallel dials (DIAL-3) at up to 50 calls per second, up to 140 RTP ports were bound at the same time (this count includes the ports of the previous tier that had not closed yet). The e2e range is now `rtp_port: 10000-19999` (5000 even ports). The same run had up to 1602 sockets in the LiveKit RTC range (21000-21999) at 84 live calls, and livekit/sip had about 21 UDP sockets per live call. Size the RTC range with the same care. No call failed.
 - **Do:** Apply the rule to production: ports in use = calls per second × (average call length + 30 s), and the range holds twice that number. At 50 cps and 3-minute calls this is about 10,500 ports in use, so one livekit/sip node is not enough. This also applies to the rtpengine port range of our gateway (MEDIA-1). Measure the linger time on the production version.
 - **Also:** the Helm chart default gateway RTP range (`gateway.rtpPortStart` 30000 to `rtpPortEnd` 40000) overlaps the host ephemeral range 32768–60999. This is the cause class of OPS-6. Move the range before production.
 
+
+#### OPS-8 Cluster coordination limits — P1 (new 2026-10-21)
+- **Now:** the nodes coordinate through kine (decision D-8, `PLAN.md` §0.10.8b).
+- **Limits found:**
+  - kine v0.13.17 is not etcd: no lease KeepAlive (keys stay alive by rewrite), no Election or Lock, a racy plain Put, no `keys_only` reads, and a delete that cannot say whether the key existed. `ad_cluster` uses only the supported transactions, and the tests run against kine itself.
+  - One kine replica is a single point of failure. Several kine replicas can share one Postgres, but a write through one replica reaches the watchers of another up to 1 s later.
+  - kine adds a row per key write (node and leader rewrites every third of the TTL) to its `kine` table in the app database. Compaction is on (`--compact-interval`), but the table load on a managed Postgres is not measured yet.
+  - The leader paces all call starts (`AD_CALLS_PER_SEC`); there is no rate per campaign or per trunk (DIAL-7).
+  - A node finds the agent in the room by asking LiveKit every 250 ms until it joins. At high call rates a room event would cost less: join the room before the dial, or ask LiveKit less often.
+  - A node carries the media of its calls (D-9), so a node that dies drops its live calls. They end without a second dial, but the consumer hears the call drop. Kamailio's dialog module could send BYE to the carrier for them.
+  - Measured in the cluster e2e (2026-10-21, 8 cores for the whole stack): a node used about half a core with two calls, and about the same with four. Most of that cost does not grow with the calls; profile it before a capacity plan. The Python test agents, one process per runtime, ran out of CPU above about six calls at once.
+  - A failover takes up to the TTL plus a third of it (default 10 s + 3.3 s) before the calls of a dead node move. Calls that were connected keep running in LiveKit during that time.
+- **Do:** run kine with two or more replicas against the managed Postgres and measure the failover; measure the kine table load; replace the readiness poll with a push signal on the node that owns the call (no webhook).
 ---
 
 ## 6. Where AgentDialer can be better than the references
@@ -524,10 +558,12 @@ cron. A fresh Rust dialer for agents can do better.
 #### BETTER-3 An eligibility index instead of a hopper
 - **Weakness:** VICIdial fills a staging table from cron every minute. dograh keeps a queue table plus in-memory locks.
 - **Build:** Store `next_eligible_at` on each lead number. It is the latest of: retry due, recycle delay, callback time, next opening of the lead's calling window, and frequency-limit expiry. The claim is `WHERE campaign = $1 AND next_eligible_at <= now() ORDER BY priority ... FOR UPDATE SKIP LOCKED`. The pure engine re-gates each claimed lead. Retries, recycles, callbacks, and window openings become one mechanism. No cron, no Redis timers.
+- **Status (2026-10-21), partial:** built for retries and window holds: `leads.next_eligible_at` and a claim with `SKIP LOCKED`, and the pure engine re-gates each claimed lead. Open: callbacks, recycle, frequency limits, and the next window opening.
 
 #### BETTER-4 One durable attempt state machine with an outbox
 - **Weakness:** dograh relies on in-memory locks and `replicas: 1`. VICIdial spreads state over MyISAM tables and many daemons.
 - **Build:** An attempt row with typed states and idempotent transitions keyed by attempt id. Each transition writes its event to an outbox in the same transaction. A relay publishes the outbox. Handlers are idempotent against Postgres.
+- **Status (2026-10-21), partial:** built for the customer leg: the `ad_attempt` statechart, the `call_attempts` snapshot and the `attempt_events` log in one transaction, and `attempt_ended` in the same transaction. Open: the agent region (decision D-2) and a leader epoch on writes (ORCH-5).
 
 #### BETTER-5 A typed agent-to-dialer protocol
 - **Weakness:** VICIdial relies on a human click. dograh extracts the disposition with an LLM after the call.
@@ -540,6 +576,7 @@ cron. A fresh Rust dialer for agents can do better.
 #### BETTER-7 SIP intelligence
 - **Weakness:** dograh maps a small set of normalized statuses (completed, failed, busy, no-answer, canceled, error). VICIdial maps a fixed status list.
 - **Build:** Map every SIP final code (and Q.850 cause when present) to a typed class with a default policy. For example: 486 retries later, 404 and 484 suppress the number, 503 feeds the trunk breaker, 603 lowers the priority. Operators can override the policy per campaign.
+- **Status (2026-10-21), partial:** `ad_attempt::classify_sip` maps the common final codes to classes with a default policy: busy and no answer retry, an invalid number is done, a decline is dispositioned, and other codes are failures. Open: Q.850 causes, per-campaign overrides, and a trunk breaker for 503.
 
 #### BETTER-8 Deterministic simulation tests
 - **Weakness:** We did not find a reference that can test a full campaign without a real switch.
@@ -567,10 +604,16 @@ cron. A fresh Rust dialer for agents can do better.
 Each step is one vertical slice: logic, API, and tests together, green in the
 Docker test tier.
 
+Steps 3 and 4 run before step 2 (agreed 2026-10-20). The compliance data sits
+on the lead and attempt tables that steps 3 and 4 change, and nothing dials
+real numbers yet. Do not dial real numbers before step 2 is done.
+
 1. **Make the existing path honest and runnable.** OPS-1, OPS-2, OPS-3, API-3. Correct the README status.
 2. **Make dialing legal.** COMP-1, COMP-2, COMP-6, COMP-7, COMP-9, BETTER-2.
 3. **Make the attempt real.** DIAL-1, DIAL-2, DIAL-3, DIAL-4, AGNT-1, AGNT-2, BETTER-4. The gateway stops returning "answered". Capacity is held for the call.
+   **Progress (2026-10-21):** DIAL-2, DIAL-3, and DIAL-4 are done. DIAL-1 and BETTER-4 are partial. AGNT-1 and AGNT-2 are open: the agent adapters (D-2) and the session stream (D-6).
 4. **Make scheduling durable.** LEAD-1, LEAD-3, ORCH-1, ORCH-2, ORCH-4, ORCH-5, BETTER-3. Postgres holds all state; there is no Redis (D-3). LEAD-2 is done.
+   **Progress (2026-10-21):** LEAD-1, LEAD-3, ORCH-1, and ORCH-4 are done. ORCH-2 and BETTER-3 are partial. ORCH-5 is open.
 5. **Secure the API.** API-1, API-2.
 6. **Complete the campaign brain.** LEAD-4 to LEAD-10, COMP-3, COMP-4, COMP-5, COMP-8, COMP-10, DIAL-5 to DIAL-8, AGNT-4, AGNT-5.
 7. **Wire the routing engine.** D-1, then ROUT-1 to ROUT-4.
@@ -584,12 +627,14 @@ Docker test tier.
 | ID | Question | Recommendation |
 |---|---|---|
 | D-1 | Match FreeSWITCH dialplan semantics exactly, or keep the group model and correct `PLAN.md`? | Match FreeSWITCH. Operators will port FusionPBX rules, and `PLAN.md` §0.10.13 tests against the FusionPBX examples. |
-| D-2 | Does the dialer or the agent originate the call? | The dialer. It owns the compliance gate at the moment of the dial and the attempt state. The agent never dials. **Decided 2026-10-20:** agents join through two adapters, one for LiveKit (a room plus agent dispatch) and one for pipecat (a bot per call). A statechart per attempt drives both. Its state is saved in Postgres (an event log plus a snapshot) and restored after a restart. Not built yet. |
+| D-2 | Does the dialer or the agent originate the call? | The dialer. It owns the compliance gate at the moment of the dial and the attempt state. The agent never dials. **Decided 2026-10-20:** agents join through two adapters, one for LiveKit (a room plus agent dispatch) and one for pipecat (a bot per call). A statechart per attempt drives both. Its state is saved in Postgres (an event log plus a snapshot) and restored after a restart. **Built 2026-10-21:** both regions of the statechart (`ad_attempt`) and both adapters (`ad_agent`), proven with a real LiveKit agent and a real pipecat bot (`PLAN.md` §0.10.7a, §0.10.8b). |
 | D-3 | What is the role of Redis? | **Decided and built 2026-10-20:** none. Postgres is the event layer: an event table with `LISTEN/NOTIFY` and a sweep, retries on the lead row, and the breaker window over `call_outcomes` (`PLAN.md` §0.10.8a). Redis is removed from the product. The media e2e stacks keep Redis only for LiveKit. |
 | D-4 | `apalis` or `pgmq` for the durable queue (`PLAN.md` §0.8)? | Neither. Use the eligibility index (BETTER-3). |
 | D-5 | Legal: AI-voice consent level, the 2-second rule for AI agents, the state laws in scope, recording disclosures, UK and India rules. | Get a counsel review before we claim compliance. Keep jurisdictions `experimental` until then. |
 | D-6 | Outcome transport: signed webhook or LiveKit participant attributes and data? | **Decided 2026-10-20:** neither. Each agent session opens one gRPC stream to the dialer. It carries the outcome, the session events, and the logs. OpenTelemetry (OTLP) uses the same gRPC endpoint, so there is no second connection. Open: OTLP as its own service on that endpoint (recommended), or OTLP messages inside the session stream. Not built yet. |
-| D-7 | When do we remove `livekit/sip`? | After the drachtio and rtpengine path passes the same e2e tests (MEDIA-1). |
+| D-7 | When do we remove `livekit/sip`? | **Superseded by D-9 (2026-10-21):** remove it when the node carries the call through Kamailio and passes the same e2e tests. Old answer: After the drachtio and rtpengine path passes the same e2e tests (MEDIA-1). |
+| D-8 | How do the dialer nodes share the calls when Kubernetes runs several? | **Decided and built 2026-10-21:** through kine, the etcd API on Postgres. Each orchestrator replica is a node with a key in kine; one node holds the leader key and assigns each call to a node with free capacity; Postgres fences a node that lost a call (`PLAN.md` §0.10.8b). Postgres and kine are managed services (for example RDS): the product reaches them only by URL and waits for them with backoff, with no host checks. |
+| D-9 | Who carries the call (SIP and RTP)? | **Decided and built 2026-10-21 (proven in Docker Compose, see MEDIA-1):** agentdialer itself, inside the node process, with vendored libraries (`rsipstack`, `rustrtc`, `audio-codec`, parts of `rustpbx`). No Asterisk, FreeSWITCH, drachtio, rtpengine, or `livekit/sip` under it. Kamailio is the SIP edge (signaling load balancer, `Record-Route`). RTP goes straight between the carrier and the node, one socket per call, in `latching` or `public` (Elastic IP per pod) mode. No host networking (`PLAN.md` §0.0). Supersedes D-7. |
 
 ---
 

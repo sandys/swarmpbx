@@ -11,6 +11,7 @@ mod dispatch;
 mod hopper;
 mod lead;
 mod store;
+mod webhook;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use serde::Serialize;
 use ad_core::time::{Clock, SystemClock};
 
 pub use store::{CampaignStore, LeadStore};
+pub use webhook::Webhooks;
 
 /// Shared application state. The `Clock` is injected so time-dependent
 /// endpoints (compliance) stay deterministic under test. The stores are the
@@ -29,6 +31,8 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub campaigns: CampaignStore,
     pub leads: LeadStore,
+    /// The LiveKit webhook endpoint answers 503 without it.
+    pub webhooks: Option<Webhooks>,
 }
 
 impl AppState {
@@ -39,6 +43,7 @@ impl AppState {
             clock,
             campaigns: CampaignStore::in_memory(),
             leads: LeadStore::in_memory(),
+            webhooks: None,
         }
     }
 
@@ -48,6 +53,7 @@ impl AppState {
             clock,
             campaigns,
             leads,
+            webhooks: None,
         }
     }
 }
@@ -75,29 +81,65 @@ pub fn router(state: AppState) -> Router {
         .merge(lead::routes())
         .merge(hopper::routes())
         .merge(dispatch::routes())
+        .merge(webhook::routes())
         .with_state(state)
 }
 
-/// Production entrypoint: bind and serve. Uses Postgres when `DATABASE_URL` is
-/// set (and runs migrations first), else an in-memory store.
-pub async fn serve(addr: &str) -> anyhow::Result<()> {
+/// The settings of `serve`. The binary reads them from the environment
+/// (`ad_bin` `config.rs`).
+pub struct ServeConfig {
+    pub addr: String,
+    /// Postgres. Without it the API uses in-memory stores.
+    pub database_url: Option<String>,
+    /// The LiveKit API key and secret that verify webhooks.
+    pub livekit_keys: Option<(String, String)>,
+}
+
+impl std::fmt::Debug for ServeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeConfig")
+            .field("addr", &self.addr)
+            .field("postgres", &self.database_url.is_some())
+            .field("webhooks", &self.livekit_keys.is_some())
+            .finish()
+    }
+}
+
+/// Production entrypoint: bind and serve. Uses Postgres when a database URL is
+/// set (and runs migrations first), else an in-memory store. The LiveKit
+/// webhook endpoint needs both Postgres and the LiveKit keys.
+pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let (campaigns, leads) = match std::env::var("DATABASE_URL") {
-        Ok(url) if !url.is_empty() => {
-            let db = ad_db::Db::connect(&url).await?;
+    let state = match &config.database_url {
+        Some(url) => {
+            let db = ad_db::Db::connect_ready(url, None).await?;
             db.migrate().await?;
             tracing::info!("stores: postgres (migrations applied)");
-            (CampaignStore::Pg(db.campaigns()), LeadStore::Pg(db.leads()))
+            let mut state = AppState::with_stores(
+                clock,
+                CampaignStore::Pg(db.campaigns()),
+                LeadStore::Pg(db.leads()),
+            );
+            if let Some((key, secret)) = &config.livekit_keys {
+                state.webhooks = Some(Webhooks {
+                    verifier: ad_gateway::WebhookVerifier::new(key, secret),
+                    attempts: db.attempts(),
+                });
+            }
+            state
         }
-        _ => {
+        None => {
             tracing::warn!("stores: in-memory (DATABASE_URL unset; data is not durable)");
-            (CampaignStore::in_memory(), LeadStore::in_memory())
+            AppState::new(clock)
         }
     };
+    if state.webhooks.is_none() {
+        tracing::warn!("LiveKit webhooks are off: they need DATABASE_URL and the LiveKit keys");
+    }
 
-    let app = router(AppState::with_stores(clock, campaigns, leads));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "api listening");
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind(&config.addr).await?;
+    tracing::info!(addr = %config.addr, "api listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

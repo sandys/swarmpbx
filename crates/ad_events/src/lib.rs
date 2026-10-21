@@ -46,52 +46,38 @@ impl RetryReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CampaignEvent {
-    /// A batch finished. The orchestrator schedules the next batch.
-    BatchCompleted {
-        campaign_id: i64,
-        processed_count: u32,
-        failed_count: u32,
-        batch_size: u32,
-    },
-    /// A batch failed as a whole (not individual call failures).
-    BatchFailed {
-        campaign_id: i64,
-        error: String,
-        processed_count: u32,
-    },
-    /// One call reached a terminal state and its outcome is persisted.
+    /// The campaign entered the running state (start or resume).
+    CampaignRunning { campaign_id: i64 },
+    /// A call attempt ended and its outcome is saved. The orchestrator updates
+    /// the lead and dials into the freed capacity.
+    AttemptEnded { campaign_id: i64, attempt_id: i64 },
+    /// The lead is updated from an ended attempt that started a dial. The
+    /// attempt counts in `called_count`.
     CallCompleted {
         campaign_id: i64,
         lead_id: i64,
-        /// `true` when the call connected (answered).
+        /// `true` when the callee answered.
         answered: bool,
     },
-    /// A terminal call needs a retry. Informational: the decision is already
-    /// persisted on the lead (`next_eligible_at`) when this is published.
-    RetryNeeded {
-        campaign_id: i64,
-        lead_id: i64,
-        reason: RetryReason,
-    },
-    /// A retry is scheduled. Informational, like `RetryNeeded`.
+    /// A retry is scheduled. Informational: the due time is on the lead
+    /// (`next_eligible_at`).
     RetryScheduled {
         campaign_id: i64,
         lead_id: i64,
         due_epoch_ms: i64,
     },
-    /// The failure rate crossed the threshold; dialing pauses for the campaign.
+    /// The failure rate crossed the threshold, and the campaign is paused.
     CircuitBreakerTripped { campaign_id: i64, failure_rate: f64 },
-    /// No more work; the campaign is done.
+    /// No work is left, and the campaign is completed.
     CampaignCompleted { campaign_id: i64 },
 }
 
 impl CampaignEvent {
     pub fn campaign_id(&self) -> i64 {
         match self {
-            CampaignEvent::BatchCompleted { campaign_id, .. }
-            | CampaignEvent::BatchFailed { campaign_id, .. }
+            CampaignEvent::CampaignRunning { campaign_id }
+            | CampaignEvent::AttemptEnded { campaign_id, .. }
             | CampaignEvent::CallCompleted { campaign_id, .. }
-            | CampaignEvent::RetryNeeded { campaign_id, .. }
             | CampaignEvent::RetryScheduled { campaign_id, .. }
             | CampaignEvent::CircuitBreakerTripped { campaign_id, .. }
             | CampaignEvent::CampaignCompleted { campaign_id } => *campaign_id,
@@ -101,10 +87,9 @@ impl CampaignEvent {
     /// The event type: the serde tag, stored in the event table's `kind` column.
     pub fn kind(&self) -> &'static str {
         match self {
-            CampaignEvent::BatchCompleted { .. } => "batch_completed",
-            CampaignEvent::BatchFailed { .. } => "batch_failed",
+            CampaignEvent::CampaignRunning { .. } => "campaign_running",
+            CampaignEvent::AttemptEnded { .. } => "attempt_ended",
             CampaignEvent::CallCompleted { .. } => "call_completed",
-            CampaignEvent::RetryNeeded { .. } => "retry_needed",
             CampaignEvent::RetryScheduled { .. } => "retry_scheduled",
             CampaignEvent::CircuitBreakerTripped { .. } => "circuit_breaker_tripped",
             CampaignEvent::CampaignCompleted { .. } => "campaign_completed",

@@ -1,26 +1,82 @@
-//! Dispatch — the inner dial loop (PLAN.md §7, §0.10). For each claimed lead the
-//! dispatcher: re-gates on compliance (the clock moved since hopper fill),
-//! acquires a concurrency slot, initiates the call through the `CallInitiator`
-//! seam, records the outcome, and releases the slot.
+//! Dispatch — the dial seam and launch pacing (PLAN.md §7, §0.10).
 //!
 //! `CallInitiator` is the seam to the media plane: a stub in tests, the real
-//! SIP↔WebRTC router (`ad_gateway`) in production. The dispatch *logic* is the
-//! subject here and is fully testable without any telephony.
+//! gateway (`ad_gateway`) in production. It places one call and reports a
+//! `Placement`, which becomes an `ad_attempt` event.
+//!
+//! `Dispatcher` is the older loop that the experimental
+//! `dispatch/run-batch` API uses: it re-gates on compliance, takes a
+//! concurrency slot, and places the call. The orchestrator does not use it.
 
+use ad_attempt::{classify_sip, AttemptEvent, Outcome};
 use ad_compliance::dnc::DncSet;
 use ad_compliance::safe_hours::{self, CallWindowSet, LeadLocation};
 use ad_compliance::Decision;
 use ad_core::time::Clock;
 use ad_lead::Lead;
+use chrono::{DateTime, Utc};
 
-/// The outcome of a single dispatch attempt.
+mod pacer;
+pub use pacer::Pacer;
+
+/// One dial request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialRequest<'a> {
+    /// The room that the answered call joins.
+    pub room: &'a str,
+    /// The identity of the customer leg in the room.
+    pub participant_identity: &'a str,
+    pub phone_number: &'a str,
+}
+
+/// The result of one dial request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// The callee answered.
+    Answered,
+    /// The provider returned a final result that is not an answer.
+    Rejected {
+        sip_code: Option<u16>,
+        detail: String,
+    },
+    /// The request did not reach the provider. No call exists.
+    NotSent(String),
+    /// The request went out, but no result came back. A call may exist.
+    NoResponse(String),
+}
+
+impl Placement {
+    /// The attempt event for this result.
+    pub fn into_event(self, at: DateTime<Utc>) -> AttemptEvent {
+        match self {
+            Placement::Answered => AttemptEvent::Answered { at },
+            Placement::Rejected { sip_code, detail } => AttemptEvent::Rejected {
+                at,
+                sip_code,
+                detail,
+            },
+            Placement::NotSent(detail) => AttemptEvent::NotSent { at, detail },
+            Placement::NoResponse(detail) => AttemptEvent::NoResponse { at, detail },
+        }
+    }
+}
+
+/// The seam to the media plane.
+pub trait CallInitiator: Send + Sync {
+    fn place(
+        &self,
+        request: &DialRequest<'_>,
+    ) -> impl std::future::Future<Output = Placement> + Send;
+}
+
+/// The result of `Dispatcher::dispatch_lead`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallOutcome {
     /// The call connected (answered).
     Answered,
-    /// Placed but not answered (no-answer / busy / voicemail).
+    /// Placed but not answered (busy or no answer).
     NotAnswered(String),
-    /// Could not place the call (initiator error).
+    /// The call failed.
     Failed(String),
     /// Not attempted: compliance denied at dispatch time.
     ComplianceDenied(String),
@@ -40,12 +96,22 @@ impl CallOutcome {
             CallOutcome::Answered | CallOutcome::NotAnswered(_) | CallOutcome::Failed(_)
         )
     }
-}
 
-/// The seam to the media plane. Implemented by a stub in tests and by the real
-/// router (`ad_gateway.initiate_call`) in production.
-pub trait CallInitiator: Send + Sync {
-    fn initiate(&self, lead: &Lead) -> impl std::future::Future<Output = CallOutcome> + Send;
+    fn from_placement(p: Placement) -> Self {
+        match p {
+            Placement::Answered => CallOutcome::Answered,
+            Placement::Rejected {
+                sip_code: Some(code),
+                detail,
+            } => match classify_sip(code, detail.clone()) {
+                Outcome::Busy { .. } | Outcome::NoAnswer { .. } => CallOutcome::NotAnswered(detail),
+                _ => CallOutcome::Failed(detail),
+            },
+            Placement::Rejected { detail, .. }
+            | Placement::NotSent(detail)
+            | Placement::NoResponse(detail) => CallOutcome::Failed(detail),
+        }
+    }
 }
 
 /// A concurrency-capacity source. `acquire` returns a slot guard if capacity is
@@ -91,9 +157,19 @@ impl<'a, I: CallInitiator, C: Capacity> Dispatcher<'a, I, C> {
             None => return CallOutcome::NoCapacity,
         };
 
-        // 3) Initiate the call via the seam, record the outcome. The slot is
-        //    held for the duration and released when `_slot` drops here.
-        self.initiator.initiate(lead).await
+        // 3) Place the call via the seam. The slot is held for the duration and
+        //    released when `_slot` drops here.
+        let room = format!("dispatch-{}", lead.id.0);
+        let identity = format!("sip-lead-{}", lead.id.0);
+        let placement = self
+            .initiator
+            .place(&DialRequest {
+                room: &room,
+                participant_identity: &identity,
+                phone_number: &lead.phone_number,
+            })
+            .await;
+        CallOutcome::from_placement(placement)
     }
 
     /// Dispatch a batch, returning (lead_id, outcome) in order. Stops acquiring
