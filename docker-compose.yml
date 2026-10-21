@@ -1,12 +1,12 @@
-# Local development stack: Postgres + Redis.
+# Local development stack: Postgres. Postgres is also the orchestrator event
+# layer (an event table plus LISTEN/NOTIFY), so no other store is necessary.
 # Start with: docker compose up -d
 # Stop with:  docker compose down
 #
 #   DATABASE_URL=postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer
-#   REDIS_URL=redis://127.0.0.1:6380
 #
-# Ports 5433 and 6380 (not 5432 and 6379) avoid a clash with a host service.
-# The orchestrator needs both; README.md ("Configuration") lists every variable.
+# Port 5433 (not 5432) avoids a clash with a host service.
+# README.md ("Configuration") lists every variable.
 services:
   postgres:
     image: postgres:16-alpine
@@ -23,13 +23,3 @@ services:
       retries: 30
     # Ephemeral storage: a named volume is unnecessary for dev/test and keeps
     # test runs reproducible. Add a volume later if you want persistence.
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "127.0.0.1:6380:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 30

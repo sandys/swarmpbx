@@ -30,3 +30,21 @@ jobs:
       # starts the stack with host networking, asserts, and always tears down.
       - name: run webrtc e2e
         run: ./e2e/run_webrtc_e2e.sh
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The orchestrator wins leadership, claims the hopper, and originates a
+      # real call into a LiveKit room; a SIPp UAS answers; the agent receives
+      # audio. The script always tears down.
+      - name: run orchestrator call e2e
+        run: ./e2e/run_e2e.sh
+
+  events-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Failures trip the persistent circuit breaker and schedule retries.
+      - name: run events e2e
+        run: ./e2e/run_events_e2e.sh

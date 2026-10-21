@@ -119,21 +119,56 @@ async fn in_memory_bus_is_fifo_publish_then_consume() {
     assert!(consumer.next_event().await.unwrap().is_none(), "drained");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn due_timers_pop_only_leads_at_or_before_now_for_the_campaign() {
-    let t = InMemoryTimers::new();
-    t.schedule(1, 100, 1_000).await.unwrap(); // campaign 1, lead 100, due 1000
-    t.schedule(1, 101, 5_000).await.unwrap(); // not yet due at now=2000
-    t.schedule(2, 200, 1_000).await.unwrap(); // other campaign
+#[test]
+fn kind_matches_the_serde_type_tag_for_every_variant() {
+    let all = [
+        CampaignEvent::BatchCompleted {
+            campaign_id: 1,
+            processed_count: 0,
+            failed_count: 0,
+            batch_size: 0,
+        },
+        CampaignEvent::BatchFailed {
+            campaign_id: 1,
+            error: "x".into(),
+            processed_count: 0,
+        },
+        CampaignEvent::CallCompleted {
+            campaign_id: 1,
+            lead_id: 1,
+            answered: true,
+        },
+        CampaignEvent::RetryNeeded {
+            campaign_id: 1,
+            lead_id: 1,
+            reason: RetryReason::Busy,
+        },
+        CampaignEvent::RetryScheduled {
+            campaign_id: 1,
+            lead_id: 1,
+            due_epoch_ms: 0,
+        },
+        CampaignEvent::CircuitBreakerTripped {
+            campaign_id: 1,
+            failure_rate: 0.5,
+        },
+        CampaignEvent::CampaignCompleted { campaign_id: 1 },
+    ];
+    for e in all {
+        let v: serde_json::Value = serde_json::from_str(&e.to_json()).unwrap();
+        assert_eq!(v["type"], e.kind(), "kind() drifted from the serde tag");
+    }
+}
 
-    let due = t.pop_due(1, 2_000).await.unwrap();
-    assert_eq!(due, vec![100], "only campaign-1 leads due by now");
-
-    // Popped entries are removed; the not-yet-due one survives.
-    let again = t.pop_due(1, 2_000).await.unwrap();
-    assert!(again.is_empty(), "already popped");
-
-    // The future one becomes due later.
-    let later = t.pop_due(1, 6_000).await.unwrap();
-    assert_eq!(later, vec![101]);
+#[test]
+fn retry_reason_storage_string_matches_serde() {
+    for r in [
+        RetryReason::Busy,
+        RetryReason::NoAnswer,
+        RetryReason::Voicemail,
+        RetryReason::Failed,
+        RetryReason::Error,
+    ] {
+        assert_eq!(serde_json::to_value(r).unwrap(), r.as_str());
+    }
 }

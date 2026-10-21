@@ -90,7 +90,7 @@ Each gap uses this form:
 | DIAL-3 | The orchestrator dials one call at a time and waits for each answer. |
 | DIAL-4 | A timeout after the INVITE is sent can cause a second dial. |
 | LEAD-1 | Nothing fills the hopper. Leads loaded through the API never dial. |
-| LEAD-2 | Retries live only in Redis. |
+| LEAD-2 | Retries lived only in Redis. Fixed 2026-10-20: the due time is on the lead row. |
 | LEAD-3 | Claims never release. A dispositioned lead can re-dial at once. |
 | ORCH-1 | Campaign state never becomes paused or completed in Postgres. |
 | AGNT-1 | No agent is dispatched into the per-lead rooms. |
@@ -110,7 +110,7 @@ Each gap uses this form:
 | Hopper / lead selection | Yes | Yes | Engine only, no fill | LEAD-1 |
 | Lead ordering options | Many | Random | Two | LEAD-7 |
 | Recycle by disposition | Yes | — | Missing | LEAD-4 |
-| Retries by reason | Partial | Yes | Redis only | LEAD-2 |
+| Retries by reason | Partial | Yes | Durable on the lead row; one global policy | LEAD-2 |
 | Scheduled callbacks | Yes | — | Missing | LEAD-5 |
 | Alternate numbers | Yes | — | Missing | LEAD-8 |
 | Lead filters | Yes (raw SQL) | — | Missing | LEAD-9 |
@@ -230,6 +230,7 @@ Each gap uses this form:
 - **Reference:** dograh runs up to 10 setups in parallel with a 240-second batch deadline and a per-campaign token bucket (`campaign_call_dispatcher.py`). Alexor-Brain dials with `wait_until_answered=False`.
 - **Do:** Launch attempts at the same time, bounded by free capacity. Pace launches with a token bucket per campaign and per trunk. Never block the scheduler on ring time.
 - **Measured (SIPp benchmark, 2026-10-20, all in Docker):** the dial rate does not follow `AD_CALLS_PER_SEC`. With a 300 ms ring, 30 calls at a configured 10/s ran at 1.29 attempts/s, and 100 calls at 50/s ran at 1.08 attempts/s. With a 3 s ring the rate fell to 0.34/s: each call waits for its answer. Answered setup took 328–386 ms (p50 333 ms). Each failed setup stalled the loop for 5.7–8.1 s. Peak live calls: 11. Harness: `_research/scratch/sip-bench/`.
+- **Measured again after OPS-6, OPS-7, and D-3 (2026-10-20):** every call of the three tiers was answered (140 of 140). The failed-setup stalls are gone. The rate is still serial: 2.12 attempts/s at a configured 10/s, and 2.71 attempts/s at a configured 50/s. Each attempt waits for its answer (about 310 ms) and then for the spacer. With a 3 s ring the rate stays at 0.34/s.
 
 #### DIAL-4 An uncertain initiation can dial twice — P0
 - **Now:** Every error becomes `Failed`, and `Failed` schedules a retry.
@@ -253,7 +254,7 @@ Each gap uses this form:
 - **Now:** A trip only blocks dialing until the window passes. The campaign then resumes by itself. The trip compares with `>`.
 - **Reference:** dograh sets the campaign to `paused`, logs the failing run ids, and resets the breaker on resume (`circuit_breaker.py`). It compares with `>=`.
 - **Do:** On a trip, set the campaign to `paused` with the reason and evidence. Reset on operator resume. Document the comparison. Keep the campaign breaker separate from the trunk breaker (DIAL-7).
-- **Also:** When the orchestrator cannot read the breaker (a Redis error), it treats the breaker as closed and keeps dialing. Since 2026-10-20 it logs this as a warning. Decide whether this path must fail closed.
+- **Also:** When the orchestrator cannot read the breaker (a database error), it treats the breaker as closed and keeps dialing. Since 2026-10-20 it logs this as a warning. Decide whether this path must fail closed.
 - **Seen in the SIPp benchmark (2026-10-20):** 19 calls that never sent an INVITE (a local media error) counted as call failures and tripped the breaker. Our own misconfiguration paused the campaign. BETTER-7 separates these classes.
 
 ### 5.3 Lead lifecycle and selection (LEAD)
@@ -263,15 +264,17 @@ Each gap uses this form:
 - **Reference:** VICIdial fills `vicidial_hopper` every minute from cron (`bin/AST_VDhopper.pl`). dograh syncs the source into `queued_runs`.
 - **Do:** Replace the fill step with an eligibility index (BETTER-3). Each lead carries `next_eligible_at`, and the claim reads it directly.
 
-#### LEAD-2 Retries are not durable — P0
+#### LEAD-2 Retries are not durable — P0 (fixed)
 - **Now:** Retries live only in the Redis sorted set `ad:timers:{campaign}`. A Redis loss leaves leads in `queued` with a claimed hopper row. This breaks the rule in `PLAN.md` §0.10.8a.
 - **Reference:** dograh writes a new `queued_runs` row with `scheduled_for`, `retry_count`, and `parent_queued_run_id`. It persists the decision before the run turns terminal (`db/campaign_client.py` `record_campaign_retry_decision`).
 - **Do:** Store the retry due time in Postgres. Redis may wake the orchestrator, but it must never hold the only copy.
+- **Status (2026-10-20):** fixed with decision D-3. The pure `retry_decision` gives a due time or "exhausted". `record_outcome` writes `leads.next_eligible_at` and `retry_reason` in the same transaction as the `call_outcomes` row. A sweep (`readmit_due`) clears the due time and makes the hopper row claimable in one statement. `e2e/run_events_e2e.sh` proves that a due retry is re-admitted and dialed again. Still open: one global policy (no per-campaign `retry_config`), and the retry does not check the safe-hours window of the due time (LEAD-4).
 
 #### LEAD-3 Claims never release — P0
 - **Now:** `hopper.claimed_by` stays set after the outcome. `in_call_count` would grow without limit. `ad_hopper` treats `Dispositioned` as dialable at once, so the hopper preview lists a lead as eligible again right after its call. No rule controls when it may dial again.
 - **Reference:** VICIdial deletes the hopper row at dial (`bin/AST_VDauto_dial.pl` line 2084) and uses `called_since_last_reset` with recycle rules. dograh moves rows through queued, processing, processed, failed, and recovers claims after 360 seconds.
 - **Do:** Give each attempt explicit states. Release the claim at the terminal state. Give each claim a lease with expiry and recovery. Make a dispositioned lead eligible only through a recycle, retry, or callback rule.
+- **Also (found 2026-10-20):** A `no_capacity` or `compliance_denied` result at dispatch sets the lead to `dispositioned`, and its hopper row stays claimed. A lead that was never dialed leaves the queue. The code comment says the lead stays claimable; it does not. Fix this with the attempt states.
 
 #### LEAD-4 Recycle rules — P1
 - **Reference:** VICIdial `vicidial_lead_recycle` (status, `attempt_delay` default 1800 s, `attempt_maximum` default 2). It counts the delay in calling time: it subtracts the overnight closed gap (`bin/AST_VDhopper.pl` ~lines 2126–2215).
@@ -338,6 +341,10 @@ Each gap uses this form:
 - **Now:** Events are published after the commit, and errors are ignored (`.ok()`). Redis pub/sub delivers at most once. Reconciliation runs only on reconnect.
 - **Reference:** dograh runs a 60-second sweep that recovers claims and orphaned work. Alexor-Brain polls every 180 seconds as a backstop.
 - **Do:** Write events to an outbox table in the same transaction and relay them. Run a periodic sweep for stale claims, stuck attempts, orphaned work, and completion.
+- **Status (2026-10-20), partial:** Decision D-3 moved the events to Postgres. Each event is a row in `campaign_events`, and the publisher sends `NOTIFY` in the same transaction. The consumer reads rows after its cursor on each notification and on a sweep (`AD_EVENT_SWEEP_MS`), so a lost notification only delays an event. Publish errors are logged. Still open:
+  - The event row and the state change it announces commit in two transactions. If the process stops between them, the event is lost. Retries recover through the retry sweep, but a lost `batch_completed` stalls the campaign until the next reconnect or restart. Put the event insert into the outcome transaction, and add a periodic reconcile.
+  - The publisher takes one advisory lock for the cluster, so event inserts are serialized. This is fine at dialer rates, but it is a ceiling.
+  - `campaign_events` grows without a limit. Add retention (OBS-5).
 
 #### ORCH-3 Two orchestration models — P1
 - **Now:** `run_loop.rs` and `gate()` are used only by tests and the API. The binary uses the reactor. `Schedule` fails open, but `PLAN.md` §7.1 says the schedule window fails closed. Production never applies a business schedule.
@@ -361,7 +368,7 @@ Each gap uses this form:
 
 #### AGNT-2 No outcome contract — P0
 - **Reference:** dograh answer actions (`START_OPENING`, `RELEASE`, `LEAVE_MESSAGE`, `DROP`, `SCREEN_THEN_REARM`, `WAIT_FOR_SCREENING`), machine subtypes, and post-call disposition extraction. The LiveKit sample tools `end_call`, `transfer_call`, `detected_answering_machine`.
-- **Do:** Define a versioned outcome schema: answer class, disposition code, callback time and zone, DNC request and scope, transfer request, summary, disclosures spoken. Carry it in a signed webhook or LiveKit participant attributes (decision D-6). Make it idempotent by attempt id. Validate it against the campaign catalog.
+- **Do:** Define a versioned outcome schema: answer class, disposition code, callback time and zone, DNC request and scope, transfer request, summary, disclosures spoken. Carry it on the gRPC session stream (decision D-6). Make it idempotent by attempt id. Validate it against the campaign catalog.
 
 #### AGNT-3 No agent-capacity signal — P1
 - **Do:** Use agent capacity as a pacing input: worker availability from LiveKit or a configured pool cap. Fail fast when no worker accepts a dispatch.
@@ -453,31 +460,51 @@ Each gap uses this form:
 - **Now:** `orchestrator.rs` line 394 exits when `REDIS_URL` is not set. The Helm chart does not set it. `e2e/run_e2e.sh` last changed in `3ac01d9`, before the Redis commit `58fe190`, and does not set it. We found this by reading. We did not run it.
 - **Do:** Set `REDIS_URL` in the chart and the script. Run `run_e2e.sh`. Correct the README status until it passes.
 - **Confirmed (2026-10-20):** an unmodified run of `run_e2e.sh` failed with `Error: REDIS_URL must be set`.
-- **Status (2026-10-20): fixed as a class.** `crates/ad_bin/src/config.rs` defines the variables of each role. Each role reports every missing, blank, or invalid variable at startup. The chart (`redis.url` / `redis.existingSecret`), `run_e2e.sh`, and `docker-compose.yml` now provide `REDIS_URL`. Tests in `ad_bin` fail when the Helm chart, an e2e script, or the README "Configuration" table drifts from the contract.
+- **Status (2026-10-20): fixed as a class.** `crates/ad_bin/src/config.rs` defines the variables of each role. Each role reports every missing, blank, or invalid variable at startup. The chart (`redis.url` / `redis.existingSecret`), `run_e2e.sh`, and `docker-compose.yml` now provide `REDIS_URL`. Tests in `ad_bin` fail when the Helm chart, an e2e script, or the README "Configuration" table drifts from the contract. Later the same day, decision D-3 removed `REDIS_URL` from the contract. The drift tests made the chart, the scripts, and the README follow in the same change.
 
 #### OPS-2 Chart drift — P1
 - **Now:** The gateway Deployment runs the `dispatch` role, which prints a message and exits. The chart sets `AD_TICK_MS` and `AD_MAX_CONCURRENT`, which nothing reads. The chart has no Redis.
 - **Do:** Align the chart with the binary. Add a test that renders the chart and checks every env var against what the binary reads.
 - **Status (2026-10-20), partial:** The orchestrator, API, and migrate templates now match the contract, and the drift test covers them. The chart wires the LiveKit key and secret in both modes. The gateway Deployment still runs the stub `dispatch` role.
 
-#### OPS-3 Two e2e suites are not in CI — P1
+#### OPS-3 Two e2e suites are not in CI — P1 (fixed)
 - **Now:** The CI workflow runs the test tier and the WebRTC e2e. `run_e2e.sh` and `run_events_e2e.sh` are manual, which is how OPS-1 went unseen.
 - **Do:** Run all e2e suites in CI.
+- **Status (2026-10-20):** fixed in `.github/workflows/ci.yml`: the jobs `e2e` and `events-e2e` run the two scripts. The scripts pass locally in Docker. The jobs have not yet run on GitHub, because the change is not pushed.
 
 #### OPS-4 The e2e LiveKit SIP config allowed one live call — P1 (fixed)
 - **Found by:** the SIPp benchmark (2026-10-20). 19 of 20 calls failed with `media failed: failed to listen on udp port` while the first call held its port.
 - **Cause:** `spike/livekit/sip.yaml` set `rtp_port: 20000` and `rtp_port_range_end: 20050`. livekit/sip reads `rtp_port` as a range `start-end` and has no `rtp_port_range_end` key, so the range was one port. `run_e2e.sh` places one call, so it never showed.
-- **Status:** fixed (`rtp_port: 20000-20100`).
+- **Status:** fixed (`rtp_port: 20000-20100`). OPS-7 later widened the range to 20000-20999.
 
 #### OPS-5 The e2e scripts used host tools — P1 (fixed)
 - **Now:** The scripts called host `curl` and `python3` and wrote logs to `/tmp`, against the Docker-first rule.
 - **Status (2026-10-20):** fixed. `e2e/lib.sh` runs HTTP polling and JSON parsing in a container. The scripts keep their logs in `e2e/.out/` (git-ignored). The host needs only bash and the Docker CLI.
 
-#### OPS-6 About 8% of benchmark calls fail to join their room — P1 (open)
+#### OPS-6 About 8% of benchmark calls fail to join their room — P1 (fixed)
 - **Found by:** the SIPp benchmark (2026-10-20): 2 of 30 and 8 of 100 calls failed before the INVITE, about every eleventh call.
 - **Evidence:** livekit/sip logs "waiting for connection establishment failed: could not connect after timeout"; livekit-server logs "cannot create sip participant: update room failed: could not connect after timeout". The WebRTC join from livekit/sip to the room times out.
 - **Suspected cause (not confirmed):** the e2e LiveKit server has 51 WebRTC ports (`spike/livekit/livekit.yaml`, 50000–50050), and every container shares the host network, so client sockets can take ports in that range.
 - **Do:** Widen the range outside the host ephemeral range, re-run the benchmark, and confirm. Production sizing follows from the result.
+- **Status (2026-10-20):** fixed and confirmed. The range is now 21000–21999, outside the host ephemeral range 32768–60999. In the benchmark re-run, no call failed to join its room:
+
+  | Tier 1 (30 calls at 10 cps) | Before | After |
+  |---|---|---|
+  | Answered | 28 of 30 | 30 of 30 |
+  | Attempts per second | 1.29 | 2.46 |
+  | Longest gap between attempts | 5149 ms | 495 ms |
+
+#### OPS-7 The e2e LiveKit SIP RTP range runs out at 50 cps — P1 (fixed in e2e; sizing rule open for production)
+- **Found by:** the same benchmark re-run (2026-10-20). After OPS-6, the loop is faster, and tier 2 (100 calls at 50 cps) placed about 6 attempts per second. 39 of the first 60 attempts failed with `media failed: failed to listen on udp port`.
+- **Measured (2026-10-20):** the benchmark now samples the UDP sockets in both LiveKit ranges every 0.5 s (`_research/scratch/sip-bench/udp_sampler.py`). It also reads the RTP ports that livekit/sip offers in its SDP.
+  - livekit/sip takes only even ports. It offered 61 ports in three tiers (distinct per tier), and none was odd. The range 20000–20100 has 51 even ports, and the socket count stopped at exactly 51.
+  - livekit/sip keeps each RTP port about 30 s after the BYE. Tier 2 started with the 30 ports of tier 1 still bound. They closed 13–42 s into tier 2.
+  - The room participant of livekit/sip opens about 28 UDP sockets per live call (tier 3: 3 live calls, peak 85), on ports outside the RTP range. They close at the end of the call. The earlier guess that these sockets take ports from `rtp_port` was wrong. Size the file-descriptor limit of livekit/sip for this.
+- **Cause:** at about 6 attempts per second, ports in use = attempts per second × (call length + 30 s), which is more than 51.
+- **Status:** fixed for the e2e stacks: `spike/livekit/sip.yaml` now has `rtp_port: 20000-20999` (500 even ports), below the LiveKit RTC range 21000–21999. The file states the sizing rule.
+- **Confirmed (2026-10-20):** with the wider range, tier 2 answered 100 of 100 calls, and up to 93 RTP ports were bound at the same time (the old limit was 51).
+- **Do:** Apply the rule to production: ports in use = calls per second × (average call length + 30 s), and the range holds twice that number. At 50 cps and 3-minute calls this is about 10,500 ports in use, so one livekit/sip node is not enough. This also applies to the rtpengine port range of our gateway (MEDIA-1). Measure the linger time on the production version.
+- **Also:** the Helm chart default gateway RTP range (`gateway.rtpPortStart` 30000 to `rtpPortEnd` 40000) overlaps the host ephemeral range 32768–60999. This is the cause class of OPS-6. Move the range before production.
 
 ---
 
@@ -543,7 +570,7 @@ Docker test tier.
 1. **Make the existing path honest and runnable.** OPS-1, OPS-2, OPS-3, API-3. Correct the README status.
 2. **Make dialing legal.** COMP-1, COMP-2, COMP-6, COMP-7, COMP-9, BETTER-2.
 3. **Make the attempt real.** DIAL-1, DIAL-2, DIAL-3, DIAL-4, AGNT-1, AGNT-2, BETTER-4. The gateway stops returning "answered". Capacity is held for the call.
-4. **Make scheduling durable.** LEAD-1, LEAD-2, LEAD-3, ORCH-1, ORCH-2, ORCH-4, ORCH-5, BETTER-3. Redis holds no only-copy state.
+4. **Make scheduling durable.** LEAD-1, LEAD-3, ORCH-1, ORCH-2, ORCH-4, ORCH-5, BETTER-3. Postgres holds all state; there is no Redis (D-3). LEAD-2 is done.
 5. **Secure the API.** API-1, API-2.
 6. **Complete the campaign brain.** LEAD-4 to LEAD-10, COMP-3, COMP-4, COMP-5, COMP-8, COMP-10, DIAL-5 to DIAL-8, AGNT-4, AGNT-5.
 7. **Wire the routing engine.** D-1, then ROUT-1 to ROUT-4.
@@ -557,11 +584,11 @@ Docker test tier.
 | ID | Question | Recommendation |
 |---|---|---|
 | D-1 | Match FreeSWITCH dialplan semantics exactly, or keep the group model and correct `PLAN.md`? | Match FreeSWITCH. Operators will port FusionPBX rules, and `PLAN.md` §0.10.13 tests against the FusionPBX examples. |
-| D-2 | Does the dialer or the agent originate the call? | The dialer. It owns the compliance gate at the moment of the dial and the attempt state. The agent never dials. |
-| D-3 | What is the role of Redis? | Postgres holds all durable state with an outbox. Redis only wakes the orchestrator. Consider `LISTEN/NOTIFY` to remove the dependency. |
+| D-2 | Does the dialer or the agent originate the call? | The dialer. It owns the compliance gate at the moment of the dial and the attempt state. The agent never dials. **Decided 2026-10-20:** agents join through two adapters, one for LiveKit (a room plus agent dispatch) and one for pipecat (a bot per call). A statechart per attempt drives both. Its state is saved in Postgres (an event log plus a snapshot) and restored after a restart. Not built yet. |
+| D-3 | What is the role of Redis? | **Decided and built 2026-10-20:** none. Postgres is the event layer: an event table with `LISTEN/NOTIFY` and a sweep, retries on the lead row, and the breaker window over `call_outcomes` (`PLAN.md` §0.10.8a). Redis is removed from the product. The media e2e stacks keep Redis only for LiveKit. |
 | D-4 | `apalis` or `pgmq` for the durable queue (`PLAN.md` §0.8)? | Neither. Use the eligibility index (BETTER-3). |
 | D-5 | Legal: AI-voice consent level, the 2-second rule for AI agents, the state laws in scope, recording disclosures, UK and India rules. | Get a counsel review before we claim compliance. Keep jurisdictions `experimental` until then. |
-| D-6 | Outcome transport: signed webhook or LiveKit participant attributes and data? | Both, with the webhook as the durable path. |
+| D-6 | Outcome transport: signed webhook or LiveKit participant attributes and data? | **Decided 2026-10-20:** neither. Each agent session opens one gRPC stream to the dialer. It carries the outcome, the session events, and the logs. OpenTelemetry (OTLP) uses the same gRPC endpoint, so there is no second connection. Open: OTLP as its own service on that endpoint (recommended), or OTLP messages inside the session stream. Not built yet. |
 | D-7 | When do we remove `livekit/sip`? | After the drachtio and rtpengine path passes the same e2e tests (MEDIA-1). |
 
 ---

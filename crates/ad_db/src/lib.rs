@@ -1,5 +1,6 @@
 //! Postgres data layer. Implements the repository traits defined by the domain
-//! crates (for now `ad_campaign::repo::CampaignRepo`), using sqlx.
+//! crates, and the orchestrator event layer (`events`: an event table plus
+//! LISTEN/NOTIFY, and `breaker`: the circuit-breaker window), using sqlx.
 //!
 //! Queries run at runtime (no compile-time macro checks), so the crate builds
 //! without a live database. Integration tests exercise it against a real
@@ -9,11 +10,15 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 
+pub mod breaker;
+pub mod events;
 pub mod hopper;
 pub mod leader;
 pub mod leads;
+pub use breaker::PgBreakerStore;
+pub use events::{PgEventConsumer, PgEventLog};
 pub use hopper::PgHopperRepo;
-pub use leads::PgLeadRepo;
+pub use leads::{OutcomeRecord, PgLeadRepo, ScheduledRetry};
 
 use ad_campaign::repo::{CampaignRepo, NewCampaign, RepoError};
 use ad_campaign::{Campaign, CampaignState, Counters};
@@ -56,6 +61,14 @@ impl Db {
 
     pub fn hopper(&self) -> PgHopperRepo {
         PgHopperRepo::new(self.pool.clone())
+    }
+
+    pub fn events(&self) -> PgEventLog {
+        PgEventLog::new(self.pool.clone())
+    }
+
+    pub fn breaker(&self) -> PgBreakerStore {
+        PgBreakerStore::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {

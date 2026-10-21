@@ -45,7 +45,6 @@ pub const MIGRATE: &[EnvVar] = &[req("DATABASE_URL"), opt("RUST_LOG")];
 /// `agentdialer orchestrator`.
 pub const ORCHESTRATOR: &[EnvVar] = &[
     req("DATABASE_URL"),
-    req("REDIS_URL"),
     req("LIVEKIT_URL"),
     req("LIVEKIT_API_KEY"),
     req("LIVEKIT_API_SECRET"),
@@ -53,7 +52,8 @@ pub const ORCHESTRATOR: &[EnvVar] = &[
     opt("AD_ROOM_PREFIX"),
     opt("AD_BATCH_LIMIT"),
     opt("AD_CALLS_PER_SEC"),
-    opt("AD_TIMER_POLL_MS"),
+    opt("AD_RETRY_SWEEP_MS"),
+    opt("AD_EVENT_SWEEP_MS"),
     opt("HOSTNAME"),
     opt("RUST_LOG"),
 ];
@@ -128,11 +128,14 @@ pub fn process_env(name: &str) -> Option<String> {
 /// database URL and the LiveKit secret.
 pub struct OrchestratorConfig {
     pub database_url: String,
-    pub redis_url: String,
     pub gateway: GatewayConfig,
     pub batch_limit: i64,
     pub calls_per_sec: f64,
-    pub timer_poll_ms: u64,
+    /// Interval of the sweep that re-admits leads whose retry is due.
+    pub retry_sweep_ms: u64,
+    /// The event consumer reads the event table at least this often, also
+    /// when a notification is lost.
+    pub event_sweep_ms: u64,
     pub worker: String,
 }
 
@@ -143,7 +146,8 @@ impl OrchestratorConfig {
 
         let batch_limit = positive(&lookup, "AD_BATCH_LIMIT", 20i64, &mut invalid);
         let calls_per_sec = positive(&lookup, "AD_CALLS_PER_SEC", 10.0f64, &mut invalid);
-        let timer_poll_ms = positive(&lookup, "AD_TIMER_POLL_MS", 1000u64, &mut invalid);
+        let retry_sweep_ms = positive(&lookup, "AD_RETRY_SWEEP_MS", 1000u64, &mut invalid);
+        let event_sweep_ms = positive(&lookup, "AD_EVENT_SWEEP_MS", 2000u64, &mut invalid);
 
         if !missing.is_empty() || !invalid.is_empty() {
             return Err(ConfigError {
@@ -157,7 +161,6 @@ impl OrchestratorConfig {
         let get = |name: &str| value(&lookup, name).unwrap_or_default();
         Ok(Self {
             database_url: get("DATABASE_URL"),
-            redis_url: get("REDIS_URL"),
             gateway: GatewayConfig {
                 livekit_url: get("LIVEKIT_URL"),
                 api_key: get("LIVEKIT_API_KEY"),
@@ -167,7 +170,8 @@ impl OrchestratorConfig {
             },
             batch_limit,
             calls_per_sec,
-            timer_poll_ms,
+            retry_sweep_ms,
+            event_sweep_ms,
             worker: value(&lookup, "HOSTNAME").unwrap_or_else(|| "orchestrator".into()),
         })
     }
@@ -186,7 +190,8 @@ impl fmt::Debug for OrchestratorConfig {
             .field("room_prefix", &self.gateway.room_prefix)
             .field("batch_limit", &self.batch_limit)
             .field("calls_per_sec", &self.calls_per_sec)
-            .field("timer_poll_ms", &self.timer_poll_ms)
+            .field("retry_sweep_ms", &self.retry_sweep_ms)
+            .field("event_sweep_ms", &self.event_sweep_ms)
             .field("worker", &self.worker)
             .finish_non_exhaustive()
     }

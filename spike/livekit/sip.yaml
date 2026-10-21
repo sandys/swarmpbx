@@ -8,7 +8,11 @@ sip_port: 5062
 # A range "start-end". A single number is a range of ONE port, so only one call
 # can carry media at a time. livekit/sip has no rtp_port_range_end key; the old
 # value here was ignored.
-rtp_port: 20000-20100
+# Size: livekit/sip takes one even port per call and keeps it about 30 s after
+# the BYE (measured, GAPS.md OPS-7). Ports in use = calls per second x (call
+# length + 30 s). The range must hold twice that number. 20000-20999 holds 500.
+# Keep it below the LiveKit RTC range (21000-21999, livekit.yaml).
+rtp_port: 20000-20999
 use_external_ip: false
 logging:
   level: info

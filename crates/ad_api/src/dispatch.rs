@@ -2,9 +2,13 @@
 //! call initiator (the real SIP↔WebRTC router lands behind the same
 //! `CallInitiator` seam later).
 //!
+//! EXPERIMENTAL: the initiator is a stub that answers every call, and the
+//! breaker is new on every request. The response says so in `experimental` and
+//! `initiator`. It places no real calls (GAPS.md API-3).
+//!
 //!   POST /v1/campaigns/:id/dispatch/run-batch
 //!     body: { uniform_window|windows, holidays?, dnc?, max_concurrent? }
-//!     -> { gate: "dispatch"|"hold:<reason>", outcomes: [{lead_id, outcome}] }
+//!     -> { experimental, initiator, gate, dispatched, outcomes: [{lead_id, outcome}] }
 //!
 //! This proves the orchestrator gate + hopper selection + dispatch loop work
 //! together on real leads: a non-running campaign is held; a running one dials
@@ -122,6 +126,10 @@ pub struct OutcomeDto {
 
 #[derive(Debug, Serialize)]
 pub struct RunBatchResponse {
+    /// Always true: this endpoint does not place real calls.
+    pub experimental: bool,
+    /// The call initiator in use: "stub" answers every call.
+    pub initiator: &'static str,
     pub gate: String,
     pub dispatched: usize,
     pub outcomes: Vec<OutcomeDto>,
@@ -270,6 +278,8 @@ async fn run_batch(
 
     let dispatched = results.iter().filter(|(_, o)| o.is_attempted()).count();
     Ok(Json(RunBatchResponse {
+        experimental: true,
+        initiator: "stub",
         gate: "dispatch".into(),
         dispatched,
         outcomes: results

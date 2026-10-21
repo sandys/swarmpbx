@@ -4,6 +4,7 @@
 #
 # Host networking so WebRTC/ICE and the agent HTTP port work without NAT (WSL2),
 # matching the other e2e stacks.
+# Redis here serves LiveKit (spike/livekit/livekit.yaml), not agentdialer.
 services:
   redis:
     image: redis:7-alpine

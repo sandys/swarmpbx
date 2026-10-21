@@ -193,7 +193,7 @@ coordination substrate** — `sqlx`; **`FOR UPDATE SKIP LOCKED`** for lead/run
 claiming (no custom slot manager); **`pg_try_advisory_lock`** for the singleton
 orchestrator leader (no custom lease); **`apalis` (apalis-sql)** or **`pgmq`**
 for the durable job/retry/callback queue; `tokio-cron-scheduler` for sweeps.
-Redis becomes **optional** (only for high-fanout pub/sub later). This keeps the
+agentdialer does not use Redis (decision D-3, §0.10.8a); only LiveKit does. This keeps the
 custom code confined to domain logic + the two tiny protocol clients.
 
 ### 0.9 Open questions this decision creates
@@ -558,80 +558,73 @@ VICIdial semantics so recycle/limit rules stay correct.
 - **Recycle**: re-admit leads of configured statuses after a cooldown
   (`recycle_config`; Alexor-Brain cooldown + VICIdial `lead_recycle`).
 - **Retry**: `retry_config` (max attempts, interval, per-status rules) → due-at
-  re-queue. The due-time schedule and the "retry due" signal use the Redis event
-  layer (§0.10.8a), not a Postgres job queue. (This supersedes the earlier
-  `apalis`/`pgmq` note.)
+  re-queue. The due time is a column on the lead (`next_eligible_at`), written with
+  the outcome; a sweep re-admits due leads (§0.10.8a). (This supersedes the earlier
+  `apalis`/`pgmq` note and the Redis due-timers.)
 
-### 0.10.8a Orchestrator event layer — Redis (BUILT + PROVEN)
+### 0.10.8a Orchestrator event layer — Postgres LISTEN/NOTIFY (BUILT + PROVEN)
 
 The orchestrator must not blind-poll. It must wake on real events: a batch
-finished, a retry became due, a circuit breaker tripped. The reference dialer
-`dograh` solves this with **Redis**, and we follow that proven shape (user
-decision, 2026-10-10). Built as the `ad_events` crate + an event-driven
-orchestrator; proven Docker-first against real Redis + Postgres
-(`e2e/run_events_e2e.sh`): six failed calls tripped the persistent circuit
-breaker and paused dialing (one `circuit_breaker_tripped`), and each failure
-scheduled a retry due-timer (`retry_needed` → `retry_scheduled`). The event-loop
-amplification bugs found by that e2e (self-feeding trip events, a retry-kick
-storm) are fixed; the final run shows exactly one trip event and six retries.
+finished, a retry became due, a circuit breaker tripped.
 
-**What Redis does (and does NOT do).**
-- Redis carries the **control signals** and the **time-ordered schedule**: batch
-  lifecycle events, retry-due timers, circuit-breaker trips, pacing wakeups.
-- Redis does NOT hold the durable truth. The `hopper` table + `SELECT ... FOR
-  UPDATE SKIP LOCKED` stays the system of record for "what to dial". Postgres
-  remains the durable store; Redis is the nervous system. If Redis is lost, no
-  lead is lost — the orchestrator rebuilds state from Postgres on reconnect.
+**Decision D-3 (2026-10-20): Postgres replaces Redis.** The first build
+(2026-10-10) followed dograh and used Redis pub/sub, a Redis due-timer ZSET, and
+a Redis breaker window. The user decided to move the event layer entirely to
+Postgres. Reasons: one store to run, back up, and reason about; events and the
+state change they announce can commit in one place; retries and the breaker
+window become rows that an operator can query. Redis is removed from the
+product (code, Helm chart, compose files, env contract). The media e2e stacks
+keep a Redis container only because LiveKit server and `livekit/sip` need it.
 
-**Precedent (dograh, `_research/dograh/`).**
-- `campaign_event_publisher.py` publishes to a single Redis pub/sub channel
-  `CAMPAIGN_EVENTS`. Event types (`campaign_event_protocol.py`):
-  `batch_completed`, `batch_failed`, `call_completed`, `sync_*`,
-  `campaign_*`, `retry_needed`/`retry_scheduled`, `circuit_breaker_tripped`.
-- `campaign_orchestrator.py` subscribes, and in `_handle_event` schedules the
-  next batch on `batch_completed`, schedules a retry on `retry_needed`, and
-  stops on `campaign_completed`. The actual batch jobs run through `arq` (a
-  Redis-backed task queue + cron).
+**Shape.**
+- **Event table**: `campaign_events (id BIGSERIAL, campaign_id, kind, payload
+  JSONB, created_at)`, migration `0005`. `kind` is the serde tag of
+  `ad_events::CampaignEvent`.
+- **Publish** (`ad_db::PgEventLog`): one transaction takes a transaction-level
+  advisory lock, inserts the row, and calls `pg_notify('campaign_events', id)`.
+  Postgres sends the notification only after the commit. The lock makes ids
+  commit in id order, so a reader that reads "id > cursor" never skips a row
+  that commits late.
+- **Consume** (`ad_db::PgEventConsumer`): `LISTEN campaign_events`, then read
+  rows with an id after the cursor. A task owns the `PgListener` and sends one
+  wake-up into a one-slot channel, so bursts coalesce and a timeout never
+  cancels a socket read. The consumer also reads on a sweep timer
+  (`AD_EVENT_SWEEP_MS`, default 2000 ms). A lost notification (reconnect, no
+  listener) delays an event by at most one sweep; it never loses it. Delivery
+  starts after the newest event at connect; the reconcile pass finds older
+  persisted work. A row that does not decode is reported once and skipped.
+- **Retries on the lead row**: the pure `ad_orchestrator::retry_decision`
+  (reason + attempts + policy + now) gives a due time or "exhausted". The
+  orchestrator writes it to `leads.next_eligible_at` / `retry_reason` in the
+  same transaction as the `call_outcomes` row (`PgLeadRepo::record_outcome`).
+  A sweep (`AD_RETRY_SWEEP_MS`, default 1000 ms) runs `readmit_due`: one
+  statement clears the due time and makes the hopper row claimable. A retry
+  survives a restart and never depends on an event. This follows dograh's
+  durable `queued_runs.scheduled_for`.
+- **Breaker window = `call_outcomes`** (`ad_db::PgBreakerStore`): writing the
+  outcome row is the record. Evaluation reads the window rows and replays them
+  into the pure `ad_circuit_breaker` engine, which stays the only source of the
+  trip decision.
+- **Reactor**: `react` maps `batch_completed` → next batch (or pause when the
+  breaker is open), `circuit_breaker_tripped` → pause, `campaign_completed` →
+  stop. `retry_needed` / `retry_scheduled` are informational.
+- **Consumer = the leader**: only the advisory-lock leader (§8) listens. This is
+  the improvement over dograh, which needs an in-memory lock and `replicas: 1`.
+- **Idempotency**: claims use `SKIP LOCKED`; outcome write-back is keyed by
+  `(lead_id, attempt_at)`; a repeated retry sweep finds nothing. A replayed
+  event cannot double-dial.
 
-**Our design (dograh shape + our leader election).**
-- **Transport**: Redis. Pub/sub for fire-and-forget signals; a Redis sorted-set
-  (score = due-epoch) or `arq`-style delayed jobs for time-ordered retries and
-  pacing wakeups. (Pick one Redis job crate during the slice; evaluate `apalis`
-  with its Redis backend first.)
-- **Publisher**: the dispatch path publishes `call_completed` with the outcome;
-  the batch path publishes `batch_completed`/`batch_failed`.
-- **Consumer**: the single leader-elected orchestrator (our advisory-lock
-  singleton, §8) subscribes and reacts. This is the one real improvement over
-  dograh: dograh prevents duplicate scheduling with an **in-memory** lock
-  (`_processing_locks`), which is exactly why dograh pins the orchestrator to
-  `replicas: 1`. Our orchestrator is the advisory-lock leader, so the subscriber
-  runs in exactly one process by construction; standbys do not subscribe. The
-  per-campaign dedup still applies inside the leader.
-- **Pacing**: the fixed 1 s tick (current placeholder) is replaced. The leader
-  wakes on events and on due-timers only. A per-call spacer (VICIdial
-  `per_call_delay`, derived from a target calls-per-second) still bounds the
-  launch rate inside a batch.
-- **Idempotency**: every handler is idempotent against the Postgres state (claim
-  by `SKIP LOCKED`, outcome write-back is a conditional UPDATE), so a duplicated
-  or replayed Redis event cannot double-dial. Redis at-least-once + Postgres
-  idempotency = correct.
-- **Failure**: a Redis blip must not kill the leader. The subscriber reconnects
-  with backoff and, on reconnect, does one reconciliation pass from Postgres
-  (claim any due work) so no event-gap stalls a campaign.
+**Known limits (see GAPS.md).** The publish lock serializes all event inserts in
+the cluster. That is fine at dialer event rates (hundreds per second), but it
+is a ceiling. Postgres documents a global lock at NOTIFY commit under very high
+commit rates. The event table grows without bound; a retention job is open.
 
-**K8s impact.** Add a Redis dependency (managed/ElastiCache in prod, a chart
-dependency for dev). The orchestrator Deployment is unchanged (still the
-advisory-lock singleton); it gains `REDIS_URL`. Dispatch workers gain the
-publisher.
-
-**Crate impact.** New `ad_events` crate: the channel + typed event enum
-(mirrors `CampaignEventType`), a `Publisher` trait (Redis impl + in-memory fake
-for tests), and a `Consumer` the orchestrator loop drives. The existing
-`OrchestratorLoop` seam stays; its `CampaignScheduler.tick` becomes
-event-triggered instead of clock-triggered. The `CircuitBreaker` becomes real
-here: its state persists in Redis (or is rebuilt from recent Postgres call
-outcomes), so it survives across events and actually trips.
-
+**Proof.** `crates/ad_db/tests/pg_events.rs` (NOTIFY wake with a one-hour sweep,
+sweep recovery of a row with no NOTIFY, start-after-newest, decode skip, kind
+column), `pg_breaker.rs`, the re-admission tests in `pg_hopper.rs`, and
+`e2e/run_events_e2e.sh`: six failed calls trip the breaker, each retry is
+stored on the lead, and a due retry is re-admitted and dialed again with a
+60 s event sweep (so NOTIFY did the wake-up).
 
 ### 0.10.9 Time conditions (first-class)
 
@@ -772,10 +765,11 @@ Cloned/downloaded under `_research/`:
 
 - **Campaign lifecycle**: `draft → syncing → running ⇄ paused → completed/failed`.
 - **Source sync → queued_runs → batch dispatch → runs → reports**, coordinated
-  by a **singleton orchestrator** over **Redis pub/sub** events
+  by a **singleton orchestrator** over events (dograh: Redis pub/sub; ours:
+  Postgres LISTEN/NOTIFY, §0.10.8a)
   (`SyncCompleted`, `BatchCompleted`, `BatchFailed`, `CallCompleted`,
   `RetryNeeded`, `CircuitBreakerTripped`).
-- **Redis-backed concurrency slots** with an org-level cap *and* a secondary
+- **Concurrency slots** (dograh: Redis; ours: Postgres rows, decision D-3) with an org-level cap *and* a secondary
   `campaign:<id>` scope cap; acquire → bind-to-run → release, with stale-slot
   timeout recovery and a fleet-wide count for autoscaling. **This replaces
   VICIdial pacing.**
@@ -839,7 +833,7 @@ Cloned/downloaded under `_research/`:
 | VICIdial concept | AgentDialer mechanism |
 |---|---|
 | Human agents log into agent screen | **LiveKit agent dispatched per answered call**; agent capacity is elastic (K8s pods). The "remote agent" seam becomes "SIP egress to a LiveKit/pipecat worker." |
-| `vicidial_live_agents` (who's available) | **Redis concurrency slots** = guaranteed-available agent capacity. A call is only placed when a slot is acquired. |
+| `vicidial_live_agents` (who's available) | **Concurrency slots** (Postgres rows, decision D-3) = guaranteed-available agent capacity. A call is only placed when a slot is acquired. |
 | Predictive/adaptive pacing to hit <3% abandonment | **Progressive/power dialing**: never dial beyond acquired capacity ⇒ abandonment is mechanically ~0%. Pacing degenerates to "dial as fast as slots free up." |
 | `drop_call_seconds` / `drop_action` / abandonment rate | **Circuit breaker + abandonment ledger**: we still *record* answered-but-not-connected events and compute the regulator's rate (answered-by-human-but-dropped ÷ answered-by-human) over the correct rolling window per jurisdiction. Used for reporting and as a hard safety cap, not as the pacing driver. |
 | Asterisk originate → bridge to agent | **Telephony provider `initiate_call`** over SIP → room/leg → agent attaches. One provider: SIP (with LiveKit as the first concrete egress). |
@@ -871,7 +865,7 @@ a research task before that jurisdiction's rule ships.
                            │  └─────┬──────┘   │  - circuit breaker check │ │
                            │        │          │  - stale/claim recovery  │ │
                            │        │          └───────────┬──────────────┘ │
-                           │        │   Redis pub/sub events │               │
+                           │        │   LISTEN/NOTIFY events │               │
                            │        ▼                        ▼               │
                            │  ┌───────────────┐     ┌──────────────────┐    │
                            │  │ Postgres      │     │ dispatch-workers │    │
@@ -883,10 +877,10 @@ a research task before that jurisdiction's rule ships.
                            │  │  dispositions │     │  - compliance gate│    │
                            │  └───────────────┘     │  - SIP initiate   │    │
                            │        ▲                └─────────┬────────┘    │
-                           │        │ Redis slots              │ SIP egress  │
+                           │        │ slot rows                │ SIP egress  │
                            │        │ (org + campaign scope)   ▼             │
                            │  ┌───────────────┐     ┌──────────────────┐    │
-                           │  │ Redis         │     │ sip-egress /     │    │
+                           │  │ Postgres:     │     │ sip-egress /     │    │
                            │  │ slots, events,│     │ provider:livekit │────┼──► LiveKit SIP
                            │  │ LISTEN/NOTIFY │     │ (CreateSIP-      │    │    (room + agent)
                            │  └───────────────┘     │  Participant)    │    │        │
@@ -941,9 +935,9 @@ agentdialer/
 │   │                               #   over ad_db queries.
 │   ├── ad_pacing/                  # dial strategies: Progressive (default), Power,
 │   │                               #   (optional) Predictive. Registry of DialStrategy.
-│   ├── ad_concurrency/             # Redis slot manager (org + campaign scope),
+│   ├── ad_concurrency/             # slot manager on Postgres rows (org + campaign scope),
 │   │                               #   acquire/bind/release, stale recovery, fleet count.
-│   ├── ad_events/                  # Redis pub/sub campaign event protocol (typed).
+│   ├── ad_events/                  # campaign event contract (typed); Postgres transport in ad_db.
 │   ├── ad_telephony/              # provider abstraction: trait TelephonyProvider,
 │   │   ├── registry.rs             #   registry + factory, ProviderSpec.
 │   │   └── providers/
@@ -1189,7 +1183,7 @@ Captured in top-level `AGENTS.md` + per-crate `AGENTS.md` + `REVIEW.md`:
   DB migration to add a variant** — discriminator in `VARCHAR`/`JSONB`.
 - **RAII/Drop over manual cleanup** (Bun). Slots, claims, and SIP legs are
   released in `Drop`/guard types so a panic or early return cannot orphan them;
-  the Redis stale-timeout and DB claim-recovery are the backstop, not the
+  the stale-slot timeout and DB claim-recovery are the backstop, not the
   primary path.
 - **Honest status**: never overstate what works. `experimental`/`beta` flags are
   real and surfaced. (Directly from Bun's "be humble & honest.")

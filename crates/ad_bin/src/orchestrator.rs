@@ -1,19 +1,20 @@
 //! The event-driven orchestrator (PLAN.md §0.10.8a). It is a singleton via a
 //! Postgres advisory lock (`ad_db::leader`). As leader it:
-//!   - subscribes to the Redis `CAMPAIGN_EVENTS` channel and reacts via the pure
-//!     `ad_orchestrator::react` (schedule next batch, schedule/drop retry, pause
-//!     on breaker, stop on completion);
+//!   - listens on the Postgres event channel (`ad_db::PgEventConsumer`: an event
+//!     table plus LISTEN/NOTIFY) and reacts via the pure `ad_orchestrator::react`
+//!     (schedule next batch, pause on breaker, stop on completion);
 //!   - dispatches a batch by claiming the hopper (`SKIP LOCKED`), gating on the
-//!     persistent circuit breaker (`BreakerStore`), and placing calls through
-//!     `ad_gateway` with a per-call spacer (target calls/sec, VICIdial-style);
-//!   - writes each outcome back to Postgres idempotently and publishes
-//!     `call_completed` (+ `retry_needed` on a non-answer);
-//!   - pops due retry timers and re-admits those leads;
-//!   - on a Redis blip, reconnects with backoff and reconciles from Postgres so
-//!     no event-gap stalls a campaign.
+//!     circuit breaker (`PgBreakerStore`, the `call_outcomes` window), and
+//!     placing calls through `ad_gateway` with a per-call spacer;
+//!   - writes each outcome back to Postgres idempotently, with the retry
+//!     decision (`next_eligible_at`) in the same transaction, and publishes
+//!     `call_completed` (+ `retry_scheduled`);
+//!   - re-admits leads whose retry is due, on an interval;
+//!   - after a listener reconnect, reconciles from Postgres so no gap stalls a
+//!     campaign.
 //!
-//! This replaces the earlier fixed 1 s poll. The pure decision logic lives in
-//! `ad_orchestrator`; this module is the I/O wiring.
+//! Postgres is the only store; there is no Redis. The pure decision logic lives
+//! in `ad_orchestrator`; this module is the I/O wiring.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,17 +23,17 @@ use ad_circuit_breaker::Config as BreakerConfig;
 use ad_compliance::dnc::DncSet;
 use ad_compliance::safe_hours::CallWindowSet;
 use ad_core::time::{Clock, SystemClock};
-use ad_core::{CampaignId, LeadId};
+use ad_core::CampaignId;
+use ad_db::{OutcomeRecord, PgBreakerStore, PgEventConsumer, PgEventLog, ScheduledRetry};
 use ad_dispatch::CallOutcome;
-use ad_events::{
-    BreakerStore, CampaignEvent, Consumer, DueTimers, Publisher, RedisBreakerStore, RedisConsumer,
-    RedisPublisher, RedisTimers, RetryReason,
-};
+use ad_events::{BreakerStore, CampaignEvent, Consumer, EventError, Publisher, RetryReason};
 use ad_gateway::{Gateway, LiveKitGateway};
 use ad_hopper::{select, Order, SelectionInput};
 use ad_lead::repo::LeadRepo;
 use ad_lead::LeadStatus;
-use ad_orchestrator::{react, ReactorAction, ReactorInput, RetryPolicy};
+use ad_orchestrator::{
+    react, retry_decision, ReactorAction, ReactorInput, RetryDecision, RetryPolicy,
+};
 
 use crate::config::{self, OrchestratorConfig};
 
@@ -42,9 +43,8 @@ const ORCHESTRATOR_LEADER_KEY: i64 = 0x4144_5f4f_5243; // "AD_ORC"
 struct Orchestrator {
     db: ad_db::Db,
     gateway: Gateway<LiveKitGateway>,
-    publisher: RedisPublisher,
-    timers: RedisTimers,
-    breaker: RedisBreakerStore,
+    publisher: PgEventLog,
+    breaker: PgBreakerStore,
     clock: SystemClock,
     worker: String,
     batch_limit: i64,
@@ -56,10 +56,6 @@ struct Orchestrator {
 }
 
 impl Orchestrator {
-    fn now_ms(&self) -> i64 {
-        self.clock.now_utc().timestamp_millis()
-    }
-
     /// Classify a dispatch outcome into a retry reason, or `None` if the call
     /// connected (answered) or should not retry.
     fn retry_reason(outcome: &CallOutcome) -> Option<RetryReason> {
@@ -167,40 +163,48 @@ impl Orchestrator {
             let setup_ms = started.elapsed().as_millis() as u64;
             let answered = matches!(outcome, CallOutcome::Answered);
             let attempt_at = self.clock.now_utc();
-
-            // Record the outcome in the breaker (persistent window).
             let is_failure = outcome.is_failure();
-            warn_err(
-                self.breaker
-                    .record(campaign_id.0, attempt_at, is_failure)
-                    .await,
-                "record breaker outcome",
-                campaign_id.0,
-            );
 
-            // Decide the retry + next lead status.
+            // Decide the retry (pure) and persist it with the outcome. The
+            // outcome row is also the breaker's record.
             let reason = Self::retry_reason(&outcome);
-            let next_status = if answered {
-                LeadStatus::Dispositioned
-            } else if reason.is_some() {
-                LeadStatus::Queued // will be re-admitted by a due-timer
+            let decision = reason
+                .map(|r| retry_decision(r, lead.called_count + 1, &self.retry_policy, attempt_at));
+            let retry = match (reason, decision) {
+                (Some(r), Some(RetryDecision::RetryAt(due_at))) => Some(ScheduledRetry {
+                    due_at,
+                    reason: r.as_str(),
+                }),
+                _ => None,
+            };
+            if decision == Some(RetryDecision::Exhausted) {
+                tracing::info!(
+                    campaign = campaign_id.0,
+                    lead = lead.id.0,
+                    attempts = lead.called_count + 1,
+                    "retry cap reached; no retry"
+                );
+            }
+            let next_status = if retry.is_some() {
+                LeadStatus::Queued // re-admitted when next_eligible_at is due
             } else {
                 LeadStatus::Dispositioned
             };
 
-            // Idempotent write-back. Only publish/schedule when newly recorded.
+            // Idempotent write-back. Only publish when newly recorded.
             let outcome_str = outcome_label(&outcome);
             let is_new = warn_err(
                 self.db
                     .leads()
-                    .record_outcome(
+                    .record_outcome(&OutcomeRecord {
                         campaign_id,
-                        lead.id,
-                        outcome_str,
+                        lead_id: lead.id,
+                        outcome: outcome_str,
                         answered,
                         attempt_at,
                         next_status,
-                    )
+                        retry,
+                    })
                     .await,
                 "record call outcome",
                 campaign_id.0,
@@ -214,6 +218,7 @@ impl Orchestrator {
                 detail = outcome_detail(&outcome),
                 setup_ms,
                 recorded = is_new,
+                retry_at = retry.map(|r| r.due_at.to_rfc3339()).unwrap_or_default(),
                 "call attempt"
             );
 
@@ -233,16 +238,16 @@ impl Orchestrator {
                     "publish call_completed",
                     campaign_id.0,
                 );
-                if let Some(r) = reason {
+                if let Some(r) = retry {
                     warn_err(
                         self.publisher
-                            .publish(&CampaignEvent::RetryNeeded {
+                            .publish(&CampaignEvent::RetryScheduled {
                                 campaign_id: campaign_id.0,
                                 lead_id: lead.id.0,
-                                reason: r,
+                                due_epoch_ms: r.due_at.timestamp_millis(),
                             })
                             .await,
-                        "publish retry_needed",
+                        "publish retry_scheduled",
                         campaign_id.0,
                     );
                 }
@@ -311,65 +316,11 @@ impl Orchestrator {
         )
         .map(|(o, _)| o)
         .unwrap_or(false);
-        // Attempts cap is enforced per-lead inside record_outcome write-back; we
-        // pass the lead's current called_count for RetryNeeded.
-        let lead_attempts = match event {
-            CampaignEvent::RetryNeeded { lead_id, .. } => warn_err(
-                self.db.leads().get(LeadId(*lead_id)).await,
-                "load lead for retry decision",
-                event.campaign_id(),
-            )
-            .map(|l| l.called_count)
-            .unwrap_or(0),
-            _ => 0,
-        };
-        let action = react(
-            event,
-            &ReactorInput {
-                now_epoch_ms: self.now_ms(),
-                breaker_open: open,
-                lead_attempts,
-                policy: self.retry_policy,
-            },
-        );
+        let action = react(event, &ReactorInput { breaker_open: open });
 
         match action {
             ReactorAction::ScheduleNextBatch { campaign_id } => {
                 self.dispatch_batch(CampaignId(campaign_id)).await?;
-            }
-            ReactorAction::ScheduleRetry {
-                campaign_id,
-                lead_id,
-                due_epoch_ms,
-            } => {
-                warn_err(
-                    self.timers
-                        .schedule(campaign_id, lead_id, due_epoch_ms)
-                        .await,
-                    "schedule retry timer",
-                    campaign_id,
-                );
-                warn_err(
-                    self.publisher
-                        .publish(&CampaignEvent::RetryScheduled {
-                            campaign_id,
-                            lead_id,
-                            due_epoch_ms,
-                        })
-                        .await,
-                    "publish retry_scheduled",
-                    campaign_id,
-                );
-            }
-            ReactorAction::DropRetry {
-                campaign_id,
-                lead_id,
-            } => {
-                tracing::info!(
-                    campaign = campaign_id,
-                    lead = lead_id,
-                    "retry cap reached; dropping"
-                );
             }
             ReactorAction::PauseCampaign { campaign_id } => {
                 // Do NOT publish circuit_breaker_tripped here: this arm is also
@@ -386,14 +337,13 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Pop due retry timers for all running campaigns and re-admit leads.
-    async fn drain_due_timers(&self) -> anyhow::Result<()> {
-        let now_ms = self.now_ms();
+    /// Re-admit the leads whose retry is due, for every running campaign.
+    async fn readmit_due_retries(&self) -> anyhow::Result<()> {
         let now = self.clock.now_utc();
         for campaign in self.db.campaigns().list_running().await? {
             // Do not re-admit retries while the breaker is open; the campaign is
-            // paused. The timers stay scheduled and drain once it closes. (This
-            // also prevents a kick/trip event storm while paused.)
+            // paused. The leads stay due and are re-admitted once it closes.
+            // (This also prevents a kick/trip event storm while paused.)
             if let Ok((true, _)) = self
                 .breaker
                 .evaluate(campaign.id.0, now, &self.breaker_cfg)
@@ -402,37 +352,20 @@ impl Orchestrator {
                 continue;
             }
             let due = warn_err(
-                self.timers.pop_due(campaign.id.0, now_ms).await,
-                "pop due retry timers",
+                self.db.hopper().readmit_due(campaign.id, now).await,
+                "re-admit due retries",
                 campaign.id.0,
             )
             .unwrap_or_default();
             if due.is_empty() {
                 continue;
             }
-            for lead_id in &due {
-                // Re-admit: clear the claim on the existing hopper row so the
-                // next batch can select it again. (The row was claimed, not
-                // removed, when first dialed.)
-                warn_err(
-                    sqlx::query(
-                        "UPDATE hopper SET claimed_by = NULL, claimed_at = NULL \
-                         WHERE lead_id = $1 AND campaign_id = $2",
-                    )
-                    .bind(lead_id)
-                    .bind(campaign.id.0)
-                    .execute(self.db.pool())
-                    .await,
-                    "re-admit retried lead",
-                    campaign.id.0,
-                );
-            }
             tracing::info!(
                 campaign = campaign.id.0,
                 leads = due.len(),
-                "retry timers due; leads re-admitted"
+                "retries due; leads re-admitted"
             );
-            // One kick per drain (not per lead) so the next batch dials the
+            // One kick per sweep (not per lead) so the next batch dials the
             // re-admitted leads.
             warn_err(
                 self.publisher
@@ -450,8 +383,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// On startup / after a Redis blip: kick each running campaign so claimable
-    /// work is dialed even without a triggering event.
+    /// On startup and after a listener reconnect: kick each running campaign so
+    /// claimable work is dialed even without a triggering event.
     async fn reconcile(&self) -> anyhow::Result<()> {
         for campaign in self.db.campaigns().list_running().await? {
             warn_err(
@@ -465,7 +398,7 @@ impl Orchestrator {
 }
 
 /// Log a failed side effect and carry on. Postgres stays the source of truth;
-/// `reconcile` and the timer drain recover what a lost event or write leaves.
+/// `reconcile` and the retry sweep recover what a lost event or write leaves.
 fn warn_err<T, E: std::fmt::Display>(result: Result<T, E>, what: &str, campaign: i64) -> Option<T> {
     match result {
         Ok(v) => Some(v),
@@ -501,10 +434,10 @@ pub fn run() -> anyhow::Result<()> {
     let per_call_gap = cfg.per_call_gap();
     let OrchestratorConfig {
         database_url,
-        redis_url,
         gateway: gw_config,
         batch_limit,
-        timer_poll_ms,
+        retry_sweep_ms,
+        event_sweep_ms,
         worker,
         ..
     } = cfg;
@@ -523,20 +456,13 @@ pub fn run() -> anyhow::Result<()> {
         tracing::info!("orchestrator: became leader, starting event loop");
 
         let orch = Arc::new(Orchestrator {
+            publisher: db.events(),
+            breaker: db.breaker(),
             db,
             gateway: Gateway::new(
                 LiveKitGateway::new(&gw_config),
                 gw_config.room_prefix.clone(),
             ),
-            publisher: RedisPublisher::connect(&redis_url)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-            timers: RedisTimers::connect(&redis_url)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-            breaker: RedisBreakerStore::connect(&redis_url)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
             clock: SystemClock,
             worker,
             batch_limit,
@@ -546,24 +472,23 @@ pub fn run() -> anyhow::Result<()> {
             windows: CallWindowSet::uniform(0, 2400).expect("full-day window"),
         });
 
-        // Background: pop due retry timers on an interval.
-        let timer_orch = orch.clone();
+        // Background: re-admit leads whose retry is due, on an interval.
+        let sweep_orch = orch.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = timer_orch.drain_due_timers().await {
-                    tracing::warn!(error = %e, "retry timer drain failed");
+                if let Err(e) = sweep_orch.readmit_due_retries().await {
+                    tracing::warn!(error = %e, "retry sweep failed");
                 }
-                tokio::time::sleep(Duration::from_millis(timer_poll_ms)).await;
+                tokio::time::sleep(Duration::from_millis(retry_sweep_ms)).await;
             }
         });
 
-        // Main: subscribe FIRST, then reconcile, so events the reconcile
-        // publishes (call_completed / retry_needed) are received by our own
-        // consumer. Reconnect with backoff + reconcile closes any gap.
+        // Main: LISTEN first, then reconcile, so the events reconcile publishes
+        // are received by our own consumer. A reconnect reconciles again.
+        let sweep = Duration::from_millis(event_sweep_ms);
         loop {
-            match RedisConsumer::connect(&redis_url).await {
+            match PgEventConsumer::connect(orch.db.pool(), sweep).await {
                 Ok(mut consumer) => {
-                    // After subscribe, so the events reconcile publishes are not lost.
                     if let Err(e) = orch.reconcile().await {
                         tracing::warn!(error = %e, "reconcile failed");
                     }
@@ -574,16 +499,20 @@ pub fn run() -> anyhow::Result<()> {
                                     tracing::error!(error = %e, "event handling failed");
                                 }
                             }
-                            Ok(None) => break, // stream ended; reconnect
+                            Ok(None) => break,
+                            // The consumer moved past the bad row; keep going.
+                            Err(EventError::Decode(e)) => {
+                                tracing::warn!(error = %e, "skipped an event that does not decode");
+                            }
                             Err(e) => {
-                                tracing::error!(error = %e, "consumer error; reconnecting");
+                                tracing::error!(error = %e, "event listener error; reconnecting");
                                 break;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "redis connect failed; retrying");
+                    tracing::error!(error = %e, "event listener connect failed; retrying");
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;

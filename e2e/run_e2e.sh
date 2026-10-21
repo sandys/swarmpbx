@@ -85,7 +85,6 @@ echo "== run OUR orchestrator (leader -> claim -> gateway originate) =="
 # A test in ad_bin fails when a required variable is missing here.
 docker run -d --name e2e-orch --network host \
   -e DATABASE_URL="$DATABASE_URL" \
-  -e REDIS_URL=redis://127.0.0.1:6379 \
   -e LIVEKIT_URL=ws://127.0.0.1:7880 \
   -e LIVEKIT_API_KEY=devkey -e LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b \
   -e AD_SIP_TRUNK_ID="$TRUNK_ID" -e AD_ROOM_PREFIX=campaign \

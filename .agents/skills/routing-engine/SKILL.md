@@ -16,62 +16,68 @@ metadata:
 
 `ad_routing` is the keystone of the campaign brain. It gives operators
 FusionPBX-grade control over dial logic as data, not code. It is typed Rust, not
-XML and not Lua. Read `PLAN.md` §0.10.5 for the full specification.
+XML and not Lua. Read `PLAN.md` §0.10.5 for the target specification.
 
-The engine was studied from the real FusionPBX dialplan code in
-`_research/fusionpbx/app/dialplans`. Conform to that model.
+The model comes from the real FusionPBX dialplan code in
+`_research/fusionpbx/app/dialplans` and from the FreeSWITCH evaluator in
+`_research/freeswitch/src/mod/dialplans/mod_dialplan_xml/mod_dialplan_xml.c`.
+Read both before you change the semantics.
 
-## The model (mirrors FusionPBX `dialplan_detail`)
+Caution: if you port a FusionPBX rule, expect a different result. The engine
+semantics are not the FreeSWITCH semantics yet (`GAPS.md` ROUT-1). Decision
+D-1 is open. The recommendation is to match FreeSWITCH.
 
-A ruleset is an ordered list of rules. Each rule is an ordered list of details.
-Each detail has these fields:
+## What is built
 
-- `tag`: `condition`, `action`, or `anti_action`.
-- `type`: the field to test (condition) or the verb to run (action).
+A `Ruleset` is an ordered list of `Detail` rows. `evaluate(&Ruleset,
+&Context)` returns the resolved actions as a `Vec<Action>` (`verb`, `args`).
+It is pure. A `Detail` has these fields (they mirror FusionPBX
+`dialplan_detail`):
+
+- `tag`: `Condition`, `Action`, or `AntiAction`.
+- `field_or_verb`: the field to test (condition) or the verb to run (action).
 - `data`: a regex (condition) or an argument string (action). Both support
-  variable interpolation.
-- `break`: `on_true`, `on_false`, `always`, or `never`. It controls flow between
-  groups.
-- `inline`: evaluate now (so a later condition reads a variable a prior action
-  set) or defer to execution.
-- `group`: an integer. It groups details into OR-of-AND condition blocks.
+  interpolation.
+- `group`: an integer. Details with the same group form one block.
 - `order`: the evaluation order.
+- `break_`: `OnTrue`, `OnFalse`, `Always`, or `Never` (the default).
+- `inline`: if true, `set`, `export`, and `unset` change the context at once,
+  so a later condition reads the new value.
 
-## The semantics (exactly FusionPBX)
+The current semantics:
 
-- In a group, all `condition` details are ANDed. Capture groups from condition
-  regexes (`$1`, `$2`) bind into the context.
-- `action` details in a matched group run. `anti_action` details run when the
-  group condition is false. This is the if/else.
-- `break` decides whether evaluation stops or falls through to the next group.
-- `continue` chaining across rulesets mirrors `dialplan_continue`.
-- Global rulesets apply to all orgs. An org ruleset overrides. This mirrors
-  FusionPBX global vs domain-specific dialplans.
+- In a group, all conditions are ANDed. The `$N` captures of a match go into
+  the context and stay there.
+- If the group matches, its actions run. If a condition of the group fails,
+  the anti-actions of the group run.
+- `break_` decides per group if evaluation stops.
 
-## Context and functions
+Interpolation supports `${var}`, `$N`, and function calls in the form
+`${name:arg1,arg2}`. The function registry (`builtin` in `context.rs`) has
+`cond_eq`, `regex_match`, `upper`, and `lower`. Functions are pure. Do not
+embed Lua. Do not shell out.
 
-Rules evaluate against a `Context`. The context is a string-to-string map: lead
-fields, call variables, campaign settings, and capture groups. Interpolation
-supports `${var}`, `$${global}`, capture references, and a registry of pure
-functions (for example `cond(x==y?a:b)`, `regex(...)`, `strftime(...)`,
-`tz_now(...)`, `dnc_check(...)`). Functions are pure and sandboxed. Do not embed
-Lua. Do not shell out.
+Actions are free strings. The engine itself runs only the inline `set`,
+`export`, and `unset`. The hopper honors `skip`, `hangup`, and `add_dnc`.
+Production passes no ruleset yet (`GAPS.md` ROUT-2).
 
-## Actions call our primitives
+## What is not built (the target)
 
-Actions are typed. They call AgentDialer primitives, not FreeSWITCH verbs.
-Examples: `set`, `unset`, `export`, `select_trunk`, `set_caller_id`,
-`bridge_agent`, `transfer`, `schedule_callback`, `set_status`, `add_dnc`,
-`recycle`, `set_record`, `limit`, `hangup`, `log`.
+`GAPS.md` ROUT-1 to ROUT-4 list the work. In short:
 
-## Registry rules
+- FreeSWITCH semantics: break and anti-actions per condition, `on-false` as
+  the default break, `$N` from the condition's own match, and extension
+  `continue`.
+- Versioned ruleset storage and an API. A campaign binds a selection ruleset
+  and an outcome ruleset.
+- A typed action registry that calls AgentDialer primitives, not FreeSWITCH
+  verbs: `set_trunk`, `set_caller_id`, `schedule_callback`, `recycle`,
+  `add_dnc`, `set_status`, `transfer`, `limit`, `hangup`.
+- More functions: `strftime`, `tz_now`, `lead_data`, `dnc_check`, `hash`.
+- Time conditions, `regex="all|any|xor"`, and global versus org scope.
+- An explain trace of each evaluation.
 
-- Add a function: one module plus one registration line.
-- Add an action: one module plus one registration line.
-- Do not run a migration to add a function or an action. The discriminator
-  lives in data.
-
-## The four rulesets
+The four rulesets of the target:
 
 1. Selection ruleset: lead to trunk, caller id, and agent.
 2. Outcome ruleset: disposition to next action (retry, callback, DNC, done).
@@ -81,6 +87,14 @@ Examples: `set`, `unset`, `export`, `select_trunk`, `set_caller_id`,
 Note: time conditions are business routing. They are not the compliance
 safe-hours gate. The safe-hours gate is in `ad_compliance` and fails closed.
 See the `compliance-engine` skill.
+
+## Registry rules
+
+- Add a function: one match arm in `builtin` (`context.rs`).
+- Add an action: one module plus one registration line, when the typed action
+  registry exists.
+- Do not run a migration to add a function or an action. The discriminator
+  lives in data.
 
 ## Tests
 

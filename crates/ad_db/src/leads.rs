@@ -15,29 +15,51 @@ pub struct PgLeadRepo {
     pool: PgPool,
 }
 
+/// A retry decision, persisted with the outcome that caused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledRetry {
+    /// The lead becomes eligible again at this time.
+    pub due_at: DateTime<Utc>,
+    /// The retry reason (`ad_events::RetryReason::as_str`).
+    pub reason: &'static str,
+}
+
+/// One terminal call attempt and what it does to the lead.
+#[derive(Debug, Clone, Copy)]
+pub struct OutcomeRecord<'a> {
+    pub campaign_id: CampaignId,
+    pub lead_id: LeadId,
+    /// The outcome discriminator (`answered`, `no_answer`, `failed`, ...).
+    pub outcome: &'a str,
+    pub answered: bool,
+    pub attempt_at: DateTime<Utc>,
+    /// The lead status to set (e.g. `dispositioned` for answered, `queued`
+    /// when a retry is due, `done`/`dnc` when terminal).
+    pub next_status: LeadStatus,
+    /// Sets the lead's `next_eligible_at` and `retry_reason`; `None` clears them.
+    pub retry: Option<ScheduledRetry>,
+}
+
 impl PgLeadRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    /// Write back a terminal call outcome, idempotently. Inserts one
-    /// `call_outcomes` row keyed by (lead_id, attempt_at); on a replayed event
-    /// the insert is a no-op and the lead is NOT updated again. Returns `true`
-    /// when this call recorded a new outcome (so the caller can publish /
-    /// schedule retries exactly once).
-    ///
-    /// `next_status` is the lead status to set when the outcome is new
-    /// (e.g. `dispositioned` for answered, `queued` when a retry is due,
-    /// `done`/`dnc` when terminal).
-    pub async fn record_outcome(
-        &self,
-        campaign_id: CampaignId,
-        lead_id: LeadId,
-        outcome: &str,
-        answered: bool,
-        attempt_at: DateTime<Utc>,
-        next_status: LeadStatus,
-    ) -> Result<bool, RepoError> {
+    /// Write back a terminal call outcome, idempotently, in one transaction.
+    /// Inserts one `call_outcomes` row keyed by (lead_id, attempt_at); on a
+    /// replayed event the insert is a no-op and the lead is NOT updated again.
+    /// Returns `true` when this call recorded a new outcome (so the caller can
+    /// publish exactly once).
+    pub async fn record_outcome(&self, rec: &OutcomeRecord<'_>) -> Result<bool, RepoError> {
+        let OutcomeRecord {
+            campaign_id,
+            lead_id,
+            outcome,
+            answered,
+            attempt_at,
+            next_status,
+            retry,
+        } = *rec;
         let mut tx = self.pool.begin().await.map_err(to_repo_err)?;
 
         // Insert the log row; ON CONFLICT means a replay inserts nothing.
@@ -63,12 +85,16 @@ impl PgLeadRepo {
                  SET called_count = called_count + 1, \
                      last_local_call_time = $2, \
                      status = $3, \
+                     next_eligible_at = $4, \
+                     retry_reason = $5, \
                      updated_at = now() \
                  WHERE id = $1",
             )
             .bind(lead_id.0)
             .bind(attempt_at)
             .bind(next_status.as_str())
+            .bind(retry.map(|r| r.due_at))
+            .bind(retry.map(|r| r.reason))
             .execute(&mut *tx)
             .await
             .map_err(to_repo_err)?;

@@ -52,10 +52,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 # Routing rule engine
 regex = "1"
-# Database
+# Database. Postgres is also the orchestrator event layer (an event table plus
+# LISTEN/NOTIFY, §0.10.8a); there is no Redis dependency.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "json"] }
-# Redis — the orchestrator event layer (pub/sub signals + due-timers), §0.10.8a
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio"] }
 
 [profile.release]
 lto = "thin"

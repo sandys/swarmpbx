@@ -1,11 +1,12 @@
-//! `ad_events` — the orchestrator event layer (PLAN.md §0.10.8a). Redis carries
-//! the control signals and the time-ordered schedule; Postgres stays the
-//! durable truth. This crate is the typed contract plus the transport seam.
+//! `ad_events` — the orchestrator event contract (PLAN.md §0.10.8a). This crate
+//! is the typed event set and the transport seam only. The Postgres transport
+//! (an event table plus LISTEN/NOTIFY) lives in `ad_db::events`; tests use the
+//! in-memory fakes here. Postgres is the durable truth; an event is a wake-up
+//! and an audit record, never the only copy of state.
 //!
 //! Shape follows dograh's `campaign_event_protocol.py` / `campaign_orchestrator.py`
 //! (a single `CAMPAIGN_EVENTS` channel, a tagged event set). We model the event
-//! set as one tagged enum for exhaustive matching, and keep the transport behind
-//! traits so tests use in-memory fakes and production uses Redis.
+//! set as one tagged enum for exhaustive matching.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -13,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-/// The single pub/sub channel, matching dograh's `RedisChannel.CAMPAIGN_EVENTS`.
+/// The single notification channel, matching dograh's `RedisChannel.CAMPAIGN_EVENTS`.
 pub const CAMPAIGN_EVENTS_CHANNEL: &str = "campaign_events";
 
 /// Why a terminal call must retry. Mirrors dograh's `RetryReason`.
@@ -27,8 +28,21 @@ pub enum RetryReason {
     Error,
 }
 
-/// The campaign event set. `type` is the serde tag, so the JSON on the wire
-/// matches dograh's `{"type": "...", "campaign_id": N, ...}` shape.
+impl RetryReason {
+    /// Stable storage string (the serde name).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RetryReason::Busy => "busy",
+            RetryReason::NoAnswer => "no_answer",
+            RetryReason::Voicemail => "voicemail",
+            RetryReason::Failed => "failed",
+            RetryReason::Error => "error",
+        }
+    }
+}
+
+/// The campaign event set. `type` is the serde tag, so the JSON matches
+/// dograh's `{"type": "...", "campaign_id": N, ...}` shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CampaignEvent {
@@ -49,16 +63,17 @@ pub enum CampaignEvent {
     CallCompleted {
         campaign_id: i64,
         lead_id: i64,
-        /// `true` when the call connected (answered). Drives the circuit breaker.
+        /// `true` when the call connected (answered).
         answered: bool,
     },
-    /// A terminal call needs a retry; the orchestrator schedules a due-timer.
+    /// A terminal call needs a retry. Informational: the decision is already
+    /// persisted on the lead (`next_eligible_at`) when this is published.
     RetryNeeded {
         campaign_id: i64,
         lead_id: i64,
         reason: RetryReason,
     },
-    /// A retry was placed on the due-timer schedule.
+    /// A retry is scheduled. Informational, like `RetryNeeded`.
     RetryScheduled {
         campaign_id: i64,
         lead_id: i64,
@@ -80,6 +95,19 @@ impl CampaignEvent {
             | CampaignEvent::RetryScheduled { campaign_id, .. }
             | CampaignEvent::CircuitBreakerTripped { campaign_id, .. }
             | CampaignEvent::CampaignCompleted { campaign_id } => *campaign_id,
+        }
+    }
+
+    /// The event type: the serde tag, stored in the event table's `kind` column.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            CampaignEvent::BatchCompleted { .. } => "batch_completed",
+            CampaignEvent::BatchFailed { .. } => "batch_failed",
+            CampaignEvent::CallCompleted { .. } => "call_completed",
+            CampaignEvent::RetryNeeded { .. } => "retry_needed",
+            CampaignEvent::RetryScheduled { .. } => "retry_scheduled",
+            CampaignEvent::CircuitBreakerTripped { .. } => "circuit_breaker_tripped",
+            CampaignEvent::CampaignCompleted { .. } => "campaign_completed",
         }
     }
 
@@ -123,25 +151,6 @@ pub trait Consumer: Send {
     ) -> impl Future<Output = Result<Option<CampaignEvent>, EventError>> + Send;
 }
 
-/// A time-ordered due-timer schedule (retries, pacing wakeups). Backed by a
-/// Redis sorted set in production; an in-memory map in tests.
-pub trait DueTimers: Send + Sync {
-    /// Schedule `lead_id` to become due at `due_epoch_ms` for a campaign.
-    fn schedule(
-        &self,
-        campaign_id: i64,
-        lead_id: i64,
-        due_epoch_ms: i64,
-    ) -> impl Future<Output = Result<(), EventError>> + Send;
-
-    /// Pop all leads whose due time is `<= now_epoch_ms` for a campaign.
-    fn pop_due(
-        &self,
-        campaign_id: i64,
-        now_epoch_ms: i64,
-    ) -> impl Future<Output = Result<Vec<i64>, EventError>> + Send;
-}
-
 // ---------------------------------------------------------------------------
 // In-memory fakes for tests. A shared bus so a publisher and a consumer in the
 // same test see the same events.
@@ -175,55 +184,7 @@ impl Consumer for InMemoryBus {
     }
 }
 
-/// In-memory due-timer schedule: a (campaign, due, lead) list.
-#[derive(Clone, Default)]
-pub struct InMemoryTimers {
-    entries: Arc<Mutex<Vec<(i64, i64, i64)>>>, // (campaign_id, due_epoch_ms, lead_id)
-}
-
-impl InMemoryTimers {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl DueTimers for InMemoryTimers {
-    async fn schedule(
-        &self,
-        campaign_id: i64,
-        lead_id: i64,
-        due_epoch_ms: i64,
-    ) -> Result<(), EventError> {
-        self.entries
-            .lock()
-            .unwrap()
-            .push((campaign_id, due_epoch_ms, lead_id));
-        Ok(())
-    }
-
-    async fn pop_due(&self, campaign_id: i64, now_epoch_ms: i64) -> Result<Vec<i64>, EventError> {
-        let mut g = self.entries.lock().unwrap();
-        let mut due = Vec::new();
-        g.retain(|(cid, when, lead)| {
-            if *cid == campaign_id && *when <= now_epoch_ms {
-                due.push(*lead);
-                false
-            } else {
-                true
-            }
-        });
-        Ok(due)
-    }
-}
-
-#[cfg(feature = "redis")]
-mod redis_transport;
-#[cfg(feature = "redis")]
-pub use redis_transport::{RedisConsumer, RedisPublisher, RedisTimers};
-
 mod breaker_store;
-#[cfg(feature = "redis")]
-pub use breaker_store::RedisBreakerStore;
 pub use breaker_store::{BreakerStore, InMemoryBreakerStore};
 
 #[cfg(test)]

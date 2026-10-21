@@ -15,14 +15,6 @@ database:
   existingSecret: ""        # name of a Secret with key DATABASE_URL
   url: ""                   # or an inline url (dev only; prefer a Secret)
 
-# Redis: the orchestrator event layer (pub/sub signals, retry due-timers, the
-# circuit-breaker window). The orchestrator requires it. Set an existing secret
-# with key REDIS_URL, or an inline url. The default expects an in-cluster
-# Service named "redis".
-redis:
-  existingSecret: ""        # name of a Secret with key REDIS_URL
-  url: "redis://redis:6379" # or an inline url
-
 # LiveKit + SIP trunk for the gateway (origination).
 livekit:
   url: "ws://livekit:7880"
@@ -52,7 +44,8 @@ orchestrator:
   replicas: 2
   batchLimit: 20            # AD_BATCH_LIMIT: hopper rows claimed per batch
   callsPerSec: 10           # AD_CALLS_PER_SEC: origination rate limit
-  timerPollMs: 1000         # AD_TIMER_POLL_MS: retry due-timer poll interval
+  retrySweepMs: 1000        # AD_RETRY_SWEEP_MS: interval of the due-retry sweep
+  eventSweepMs: 2000        # AD_EVENT_SWEEP_MS: max wait before the event table is read again
   resources: {}
 
 # The dispatch workers: stateless, N replicas, claim via SKIP LOCKED. Scale

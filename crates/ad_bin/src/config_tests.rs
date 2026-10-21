@@ -21,7 +21,6 @@ fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 fn all_required() -> Vec<(&'static str, &'static str)> {
     vec![
         ("DATABASE_URL", "postgres://ad:ad@db:5432/ad"),
-        ("REDIS_URL", "redis://redis:6379"),
         ("LIVEKIT_URL", "ws://livekit:7880"),
         ("LIVEKIT_API_KEY", "key"),
         ("LIVEKIT_API_SECRET", "secret"),
@@ -38,7 +37,6 @@ fn orchestrator_reports_every_missing_required_var_at_once() {
         err.missing,
         vec![
             "DATABASE_URL",
-            "REDIS_URL",
             "LIVEKIT_URL",
             "LIVEKIT_API_KEY",
             "LIVEKIT_API_SECRET",
@@ -46,28 +44,28 @@ fn orchestrator_reports_every_missing_required_var_at_once() {
         ]
     );
     let msg = err.to_string();
-    assert!(msg.contains("REDIS_URL"), "{msg}");
+    assert!(msg.contains("AD_SIP_TRUNK_ID"), "{msg}");
     assert!(msg.contains("README.md"), "{msg}");
 }
 
 #[test]
 fn empty_or_blank_value_counts_as_missing() {
     let mut pairs = all_required();
-    pairs.retain(|(k, _)| *k != "REDIS_URL" && *k != "AD_SIP_TRUNK_ID");
-    pairs.push(("REDIS_URL", ""));
+    pairs.retain(|(k, _)| *k != "LIVEKIT_URL" && *k != "AD_SIP_TRUNK_ID");
+    pairs.push(("LIVEKIT_URL", ""));
     pairs.push(("AD_SIP_TRUNK_ID", "   "));
     let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
-    assert_eq!(err.missing, vec!["REDIS_URL", "AD_SIP_TRUNK_ID"]);
+    assert_eq!(err.missing, vec!["LIVEKIT_URL", "AD_SIP_TRUNK_ID"]);
 }
 
 #[test]
 fn defaults_apply_when_optional_vars_are_unset() {
     let cfg = OrchestratorConfig::from_lookup(lookup_from(&all_required())).unwrap();
-    assert_eq!(cfg.redis_url, "redis://redis:6379");
     assert_eq!(cfg.gateway.room_prefix, "campaign");
     assert_eq!(cfg.batch_limit, 20);
     assert_eq!(cfg.calls_per_sec, 10.0);
-    assert_eq!(cfg.timer_poll_ms, 1000);
+    assert_eq!(cfg.retry_sweep_ms, 1000);
+    assert_eq!(cfg.event_sweep_ms, 2000);
     assert_eq!(cfg.worker, "orchestrator");
     assert_eq!(cfg.per_call_gap(), Duration::from_millis(100));
 }
@@ -77,13 +75,13 @@ fn invalid_numbers_are_rejected_not_ignored() {
     let mut pairs = all_required();
     pairs.push(("AD_CALLS_PER_SEC", "fast"));
     pairs.push(("AD_BATCH_LIMIT", "0"));
-    pairs.push(("AD_TIMER_POLL_MS", "-5"));
+    pairs.push(("AD_RETRY_SWEEP_MS", "-5"));
     let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
     assert!(err.missing.is_empty());
     assert_eq!(err.invalid.len(), 3, "{:?}", err.invalid);
     assert!(err.invalid[0].starts_with("AD_BATCH_LIMIT="));
     assert!(err.invalid[1].starts_with("AD_CALLS_PER_SEC="));
-    assert!(err.invalid[2].starts_with("AD_TIMER_POLL_MS="));
+    assert!(err.invalid[2].starts_with("AD_RETRY_SWEEP_MS="));
 }
 
 #[test]

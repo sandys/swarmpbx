@@ -108,6 +108,35 @@ impl PgHopperRepo {
         Ok(claimed)
     }
 
+    /// Re-admit the campaign's queued leads whose retry is due (`next_eligible_at
+    /// <= now`). In one statement: clear the due time and make the hopper row
+    /// claimable again (insert it if it is missing). Returns the re-admitted
+    /// lead ids. A second call finds nothing, so a repeated sweep is harmless.
+    pub async fn readmit_due(
+        &self,
+        campaign_id: CampaignId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<LeadId>, HopperError> {
+        let rows = sqlx::query(
+            "WITH due AS ( \
+                 UPDATE leads SET next_eligible_at = NULL, updated_at = now() \
+                 WHERE campaign_id = $1 AND status = 'queued' \
+                   AND next_eligible_at IS NOT NULL AND next_eligible_at <= $2 \
+                 RETURNING id, campaign_id) \
+             INSERT INTO hopper (campaign_id, lead_id) SELECT campaign_id, id FROM due \
+             ON CONFLICT (lead_id) DO UPDATE SET claimed_by = NULL, claimed_at = NULL \
+             RETURNING lead_id",
+        )
+        .bind(campaign_id.0)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(err)?;
+        rows.iter()
+            .map(|r| r.try_get::<i64, _>("lead_id").map(LeadId).map_err(err))
+            .collect()
+    }
+
     /// Count available (unclaimed) items for a campaign.
     pub async fn available_count(&self, campaign_id: CampaignId) -> Result<i64, HopperError> {
         let row = sqlx::query(

@@ -65,7 +65,8 @@ CI runs the exact same compose. If you didn't run the tests, it isn't done.
 
 The data layer is `ad_db` (sqlx + Postgres). The dockerized test tier above
 starts Postgres as a compose service and points the integration tests at it via
-`DATABASE_URL`. For an interactive local Postgres and Redis, use
+`DATABASE_URL`. Postgres is also the orchestrator event layer; there is no
+Redis. For an interactive local Postgres, use
 `docker-compose.yml`:
 ```
 docker compose up -d

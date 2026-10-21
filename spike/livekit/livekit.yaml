@@ -2,8 +2,11 @@
 port: 7880
 rtc:
   tcp_port: 7881
-  port_range_start: 50000
-  port_range_end: 50050
+  # Keep the WebRTC range below the host ephemeral range (32768-60999). The e2e
+  # stacks use host networking, so a client socket can take an ephemeral port
+  # inside an overlapping range first, and the room join then times out.
+  port_range_start: 21000
+  port_range_end: 21999
   use_external_ip: false
 redis:
   address: 127.0.0.1:6379

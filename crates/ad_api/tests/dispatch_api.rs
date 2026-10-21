@@ -112,6 +112,9 @@ async fn running_campaign_dispatches_eligible_and_skips_noncompliant() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // The stub initiator is surfaced as experimental, never presented as real.
+    assert_eq!(v["experimental"], true);
+    assert_eq!(v["initiator"], "stub");
     assert_eq!(v["gate"], "dispatch");
     // Only the eligible lead is dispatched (the no-tz lead was held by the
     // hopper's compliance gate before dispatch).

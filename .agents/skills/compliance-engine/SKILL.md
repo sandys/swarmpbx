@@ -20,6 +20,16 @@ penalties. Treat every change here with care.
 
 Read `PLAN.md` §9 for the full design.
 
+Warning: until COMP-1 and COMP-2 in `GAPS.md` are done, do not claim that
+production dialing is compliant. The orchestrator passes a 24-hour window and
+an empty DNC list (COMP-1). No table stores call times, holidays, or DNC
+entries. A lead without an explicit IANA timezone never dials (COMP-2). Counsel
+must also review the rules (decision D-5).
+
+The VICIdial reference shows how a mature dialer stores this data
+(`_research/vicidial/`, see `GAPS.md` Appendix A). Read it before you add the
+tables.
+
 ## Two rules you must never break
 
 1. Fail closed. If the engine cannot prove a call is permitted, it denies.
@@ -74,7 +84,12 @@ When you change the engine:
 1. Add or update tests first.
 2. Prove the test has teeth: break the logic once, confirm the test fails, then
    revert.
-3. Run `cargo test -p ad_compliance` and `cargo clippy --all-targets -- -D warnings`.
+3. Run the crate tests in Docker. Then run the full tier (`vertical-slice` skill):
+   ```
+   docker compose -f docker-compose.test.yml run --rm --build tests \
+       cargo test -p ad_compliance
+   docker compose -f docker-compose.test.yml down
+   ```
 
 ## The API
 

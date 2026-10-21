@@ -5,8 +5,9 @@
 #   docker compose -f docker-compose.test.yml down -v
 #
 # The `tests` service runs fmt + clippy + the full suite, including the Postgres
-# integration tests, against the `postgres` service in this compose. Named
-# volumes cache the cargo registry and the target dir, so repeat runs are fast.
+# integration tests (data layer and event layer), against the `postgres`
+# service in this compose. Named volumes cache the cargo registry and the
+# target dir, so repeat runs are fast.
 services:
   postgres:
     image: postgres:16-alpine
@@ -20,14 +21,6 @@ services:
       timeout: 3s
       retries: 30
 
-  redis:
-    image: redis:7-alpine
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-
   tests:
     build:
       context: .
@@ -35,12 +28,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     environment:
       # Point the integration tests at the compose services by name.
       DATABASE_URL: postgres://agentdialer:agentdialer@postgres:5432/agentdialer
-      REDIS_URL: redis://redis:6379
       CARGO_HOME: /cache/cargo
       CARGO_TARGET_DIR: /cache/target
     volumes:
@@ -61,8 +51,6 @@ services:
         cargo clippy --all-targets -- -D warnings
         echo "== tests (incl. postgres integration) =="
         cargo test --all
-        echo "== redis integration tests (ad_events) =="
-        cargo test -p ad_events --features redis
         echo "OK: all tests green in Docker"
 
 volumes:

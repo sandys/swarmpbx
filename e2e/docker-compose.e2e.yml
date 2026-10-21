@@ -7,6 +7,8 @@
 #
 # Host networking so SIP/RTP/WebRTC ports work without NAT (WSL2), matching the
 # proven MVP harness.
+# Redis here serves LiveKit server and livekit/sip (spike/livekit/*.yaml), not
+# agentdialer. The orchestrator uses only Postgres.
 services:
   redis:
     image: redis:7

@@ -7,8 +7,10 @@ use std::collections::HashSet;
 
 use ad_campaign::repo::{CampaignRepo, NewCampaign};
 use ad_core::{CampaignId, LeadId, OrgId};
-use ad_db::Db;
+use ad_db::{Db, OutcomeRecord, ScheduledRetry};
 use ad_lead::repo::{LeadRepo, NewLead};
+use ad_lead::LeadStatus;
+use chrono::{DateTime, Utc};
 
 async fn db() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
@@ -147,4 +149,101 @@ async fn rolled_back_claim_releases_lock_for_recovery() {
         .unwrap();
     assert_eq!(b_after.len(), 1);
     assert_eq!(b_after[0].lead_id.0, only_lead);
+}
+
+/// Record an attempt that schedules a retry at `due_at`.
+async fn schedule_retry(db: &Db, campaign: CampaignId, lead: LeadId, due_at: DateTime<Utc>) {
+    let attempt_at = due_at - chrono::Duration::minutes(30);
+    db.leads()
+        .record_outcome(&OutcomeRecord {
+            campaign_id: campaign,
+            lead_id: lead,
+            outcome: "no_answer",
+            answered: false,
+            attempt_at,
+            next_status: LeadStatus::Queued,
+            retry: Some(ScheduledRetry {
+                due_at,
+                reason: "no_answer",
+            }),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn readmit_due_returns_only_due_leads_and_makes_them_claimable() {
+    let Some(db) = db().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (campaign, ids) = seed(&db, 3).await;
+    let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+
+    // Dial all three: the hopper rows are claimed.
+    let claimed = db.hopper().claim_batch(campaign, "w", 10).await.unwrap();
+    assert_eq!(claimed.len(), 3);
+    assert_eq!(db.hopper().available_count(campaign).await.unwrap(), 0);
+
+    // Lead 0 is due; lead 1 is due later; lead 2 has no hopper row any more.
+    schedule_retry(&db, campaign, ids[0], now - chrono::Duration::seconds(1)).await;
+    schedule_retry(&db, campaign, ids[1], now + chrono::Duration::minutes(5)).await;
+    schedule_retry(&db, campaign, ids[2], now).await;
+    sqlx::query("DELETE FROM hopper WHERE lead_id = $1")
+        .bind(ids[2].0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let mut due = db.hopper().readmit_due(campaign, now).await.unwrap();
+    due.sort_by_key(|l| l.0);
+    assert_eq!(due, vec![ids[0], ids[2]], "due at or before now only");
+
+    // The due leads are claimable again; the future one is not.
+    assert_eq!(db.hopper().available_count(campaign).await.unwrap(), 2);
+    let next_eligible: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT next_eligible_at FROM leads WHERE id = $1")
+            .bind(ids[0].0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(next_eligible, None, "the due time is cleared");
+
+    // A second sweep finds nothing, so a repeated sweep is harmless.
+    assert!(db
+        .hopper()
+        .readmit_due(campaign, now)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The later lead becomes due later.
+    let later = now + chrono::Duration::minutes(6);
+    assert_eq!(
+        db.hopper().readmit_due(campaign, later).await.unwrap(),
+        vec![ids[1]]
+    );
+}
+
+#[tokio::test]
+async fn readmit_due_ignores_leads_that_are_not_queued() {
+    let Some(db) = db().await else {
+        return;
+    };
+    let (campaign, ids) = seed(&db, 1).await;
+    let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    schedule_retry(&db, campaign, ids[0], now - chrono::Duration::seconds(1)).await;
+    // The lead left the queue (for example DNC) after the retry was set.
+    sqlx::query("UPDATE leads SET status = 'dnc' WHERE id = $1")
+        .bind(ids[0].0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    assert!(db
+        .hopper()
+        .readmit_due(campaign, now)
+        .await
+        .unwrap()
+        .is_empty());
 }

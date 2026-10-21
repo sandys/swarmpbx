@@ -70,12 +70,48 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
 - Write property tests for invariants. The compliance engine has fail-closed
   and always-open property tests. See `crates/ad_compliance/tests/properties.rs`.
 
+## Rules for the parts of a slice
+
+- Database: if the slice changes the schema, add a new numbered migration in
+  `crates/ad_db/migrations/`. Do not edit an applied migration (sqlx stores its
+  checksum). Add an integration test in `crates/ad_db/tests/`. The test tier
+  runs it against the compose Postgres.
+- Configuration: if the slice adds, renames, or removes an environment
+  variable, change `crates/ad_bin/src/config.rs`, the README "Configuration"
+  table, the Helm chart, and every e2e script that starts the role. A test in
+  `ad_bin` fails if one of them is out of date.
+- Honest status: if an endpoint is not real yet, say so in its response.
+  `POST /v1/campaigns/:id/dispatch/run-batch` returns `experimental: true` and
+  names its stub initiator (`crates/ad_api/src/dispatch.rs`).
+- Runtime behavior: if the slice changes how a role runs, run the e2e script
+  that covers the role (`e2e/`).
+
 ## Checklist for a slice
 
 1. Write the domain logic in its crate. Keep decision functions pure.
 2. Add the API endpoint through the `router()` factory.
 3. Write unit tests next to the logic and contract tests next to the API.
-4. Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
-   and `cargo test --all`. All must pass.
-5. For a user-facing endpoint, boot the server once and send one real request to
-   confirm the wiring. Example: `AD_API_ADDR=127.0.0.1:18080 agentdialer api`.
+4. Run one crate's tests while you work. Compose starts Postgres first:
+   ```
+   docker compose -f docker-compose.test.yml run --rm --build tests \
+       cargo test -p ad_api
+   docker compose -f docker-compose.test.yml down
+   ```
+5. Run the full Docker test tier (fmt, clippy, all tests). All must pass:
+   ```
+   docker compose -f docker-compose.test.yml up --build \
+       --abort-on-container-exit --exit-code-from tests
+   docker compose -f docker-compose.test.yml down
+   ```
+6. For a user-facing endpoint, boot the server once in its image and send one
+   real request from a container:
+   ```
+   docker build -t agentdialer:dev .
+   docker run -d --name ad-api --network host \
+       -e AD_API_ADDR=127.0.0.1:18080 agentdialer:dev api
+   docker run --rm --network host python:3.12-slim python3 -c \
+       'import urllib.request as u; print(u.urlopen("http://127.0.0.1:18080/health").read())'
+   docker rm -f ad-api
+   ```
+
+Do not run `cargo`, `curl`, or any other toolchain on the host.

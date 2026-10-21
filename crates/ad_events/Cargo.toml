@@ -5,21 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-# The real Redis transport (pub/sub + due-timer ZSET). Off by default so pure
-# consumers and the fast test tier build without Redis.
-redis = ["dep:redis", "dep:tokio", "dep:futures-util"]
-
+# The event contract and in-memory fakes only. The Postgres transport is in
+# ad_db::events.
 [dependencies]
 ad_core = { path = "../ad_core" }
 ad_circuit_breaker = { path = "../ad_circuit_breaker" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-redis = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

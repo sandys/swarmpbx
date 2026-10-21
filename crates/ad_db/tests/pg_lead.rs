@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use ad_campaign::repo::{CampaignRepo, NewCampaign};
 use ad_core::{CampaignId, LeadId, OrgId};
-use ad_db::Db;
+use ad_db::{Db, OutcomeRecord};
 use ad_lead::repo::{LeadRepo, NewLead, RepoError};
 
 async fn db() -> Option<Db> {
@@ -143,34 +143,22 @@ async fn record_outcome_is_idempotent_on_replay() {
 
     let attempt = chrono::DateTime::from_timestamp(1_700_000_500, 0).unwrap();
 
+    let rec = OutcomeRecord {
+        campaign_id: campaign,
+        lead_id: lead.id,
+        outcome: "no_answer",
+        answered: false,
+        attempt_at: attempt,
+        next_status: ad_lead::LeadStatus::Queued,
+        retry: None,
+    };
+
     // First record: new -> true, lead advances once.
-    let first = db
-        .leads()
-        .record_outcome(
-            campaign,
-            lead.id,
-            "no_answer",
-            false,
-            attempt,
-            ad_lead::LeadStatus::Queued,
-        )
-        .await
-        .unwrap();
+    let first = db.leads().record_outcome(&rec).await.unwrap();
     assert!(first, "first record is new");
 
-    // Replay the SAME attempt (Redis is at-least-once): no-op -> false.
-    let replay = db
-        .leads()
-        .record_outcome(
-            campaign,
-            lead.id,
-            "no_answer",
-            false,
-            attempt,
-            ad_lead::LeadStatus::Queued,
-        )
-        .await
-        .unwrap();
+    // Replay the SAME attempt (event delivery is at-least-once): no-op -> false.
+    let replay = db.leads().record_outcome(&rec).await.unwrap();
     assert!(!replay, "replay of same attempt is a no-op");
 
     // called_count advanced exactly once, status set, last call time stamped.
@@ -186,4 +174,63 @@ async fn record_outcome_is_idempotent_on_replay() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn record_outcome_persists_and_clears_the_retry() {
+    let Some(db) = db().await else {
+        return;
+    };
+    let campaign = make_campaign(&db).await;
+    let lead = db
+        .leads()
+        .create(nl(campaign, "+15550006666"))
+        .await
+        .unwrap();
+    let first = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let due = first + chrono::Duration::minutes(30);
+
+    db.leads()
+        .record_outcome(&OutcomeRecord {
+            campaign_id: campaign,
+            lead_id: lead.id,
+            outcome: "no_answer",
+            answered: false,
+            attempt_at: first,
+            next_status: ad_lead::LeadStatus::Queued,
+            retry: Some(ad_db::ScheduledRetry {
+                due_at: due,
+                reason: "no_answer",
+            }),
+        })
+        .await
+        .unwrap();
+    let row: (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+        sqlx::query_as("SELECT next_eligible_at, retry_reason FROM leads WHERE id = $1")
+            .bind(lead.id.0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(row, (Some(due), Some("no_answer".to_string())));
+
+    // A later answered attempt clears the retry.
+    db.leads()
+        .record_outcome(&OutcomeRecord {
+            campaign_id: campaign,
+            lead_id: lead.id,
+            outcome: "answered",
+            answered: true,
+            attempt_at: due,
+            next_status: ad_lead::LeadStatus::Dispositioned,
+            retry: None,
+        })
+        .await
+        .unwrap();
+    let row: (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+        sqlx::query_as("SELECT next_eligible_at, retry_reason FROM leads WHERE id = $1")
+            .bind(lead.id.0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(row, (None, None));
 }

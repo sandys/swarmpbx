@@ -1,14 +1,9 @@
-# Event-driven e2e stack: Redis + Postgres only. The orchestrator (our image)
-# is started by run_events_e2e.sh with a failing gateway, so we test the event
-# layer (breaker trip + retry scheduling) deterministically without the media
-# stack. Host networking so the orchestrator container reaches both on
-# 127.0.0.1.
+# Event-driven e2e stack: Postgres only. Postgres is the event layer (an event
+# table plus LISTEN/NOTIFY). The orchestrator (our image) is started by
+# run_events_e2e.sh with a failing gateway, so we test the event layer (breaker
+# trip, retry storage, re-admission) deterministically without the media
+# stack. Host networking so the orchestrator container reaches it on 127.0.0.1.
 services:
-  redis:
-    image: redis:7-alpine
-    network_mode: host
-    command: ["redis-server", "--port", "6379"]
-
   postgres:
     image: postgres:16-alpine
     network_mode: host
