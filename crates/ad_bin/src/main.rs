@@ -4,6 +4,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod config;
 mod orchestrator;
 
 #[derive(Parser)]
@@ -48,14 +49,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_api() -> anyhow::Result<()> {
-    let addr = std::env::var("AD_API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    config::check_required("api", config::API, config::process_env)?;
+    let addr = config::process_env("AD_API_ADDR").unwrap_or_else(|| "0.0.0.0:8080".into());
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(ad_api::serve(&addr))
 }
 
 fn run_migrate() -> anyhow::Result<()> {
-    let url = std::env::var("DATABASE_URL")
-        .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set to run migrations"))?;
+    config::check_required("migrate", config::MIGRATE, config::process_env)?;
+    let url = config::process_env("DATABASE_URL").unwrap_or_default();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let db = ad_db::Db::connect(&url).await?;

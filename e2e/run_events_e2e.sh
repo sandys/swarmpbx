@@ -14,6 +14,7 @@
 # Exits non-zero on any failure. Always tears down.
 set -uo pipefail
 cd "$(dirname "$0")"
+. ./lib.sh
 
 COMPOSE="docker compose -f docker-compose.events.e2e.yml"
 PSQL() { docker exec evt-postgres psql -U ad -d ad -tAc "$1"; }
@@ -22,21 +23,12 @@ FAIL=0
 
 cleanup() {
   echo "== teardown =="
+  docker logs evt-orch > "$E2E_OUT/run_events_e2e.orchestrator.log" 2>&1 || true
   docker rm -f evt-orch evt-postgres evt-redis >/dev/null 2>&1 || true
   $COMPOSE down >/dev/null 2>&1 || true
-  echo "== teardown complete =="
+  echo "== teardown complete (orchestrator log: $E2E_OUT/run_events_e2e.orchestrator.log) =="
 }
 trap cleanup EXIT
-
-wait_for() {  # wait_for <timeout_s> <desc> <cmd...>
-  local timeout=$1 desc=$2; shift 2
-  local deadline=$(( $(date +%s) + timeout ))
-  until "$@" >/dev/null 2>&1; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then echo "FAIL: timed out: $desc"; return 1; fi
-    sleep 1
-  done
-  echo "ok: $desc"
-}
 
 echo "== start redis + postgres =="
 $COMPOSE up -d 2>&1 | tail -2
@@ -50,10 +42,10 @@ export DATABASE_URL="postgres://ad:ad@127.0.0.1:5432/ad"
 docker build -q -t agentdialer:e2e .. >/dev/null
 migrated=0
 for i in $(seq 1 10); do
-  docker run --rm --network host -e DATABASE_URL="$DATABASE_URL" agentdialer:e2e migrate >/tmp/evt_migrate.log 2>&1 && { migrated=1; break; }
+  docker run --rm --network host -e DATABASE_URL="$DATABASE_URL" agentdialer:e2e migrate >"$E2E_OUT/run_events_e2e.migrate.log" 2>&1 && { migrated=1; break; }
   sleep 2
 done
-[ "$migrated" = 1 ] || { echo "FAIL: migrate"; cat /tmp/evt_migrate.log; exit 1; }
+[ "$migrated" = 1 ] || { echo "FAIL: migrate"; cat "$E2E_OUT/run_events_e2e.migrate.log"; exit 1; }
 
 # One running campaign (id 1) with 6 leads + 6 hopper rows. Six failures exceed
 # the breaker's min_calls (5) and 50% threshold, so it must trip.

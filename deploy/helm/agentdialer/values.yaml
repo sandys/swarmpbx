@@ -1,5 +1,9 @@
 # AgentDialer values. One image, four roles (PLAN.md §5). The orchestrator is a
 # singleton via a Postgres advisory lock, NOT a Kubernetes Service.
+#
+# The environment each role needs is defined in crates/ad_bin/src/config.rs and
+# listed in README.md ("Configuration"). A test in ad_bin fails when a template
+# here does not pass a required variable, or passes one the binary does not read.
 
 image:
   repository: agentdialer
@@ -11,11 +15,21 @@ database:
   existingSecret: ""        # name of a Secret with key DATABASE_URL
   url: ""                   # or an inline url (dev only; prefer a Secret)
 
+# Redis: the orchestrator event layer (pub/sub signals, retry due-timers, the
+# circuit-breaker window). The orchestrator requires it. Set an existing secret
+# with key REDIS_URL, or an inline url. The default expects an in-cluster
+# Service named "redis".
+redis:
+  existingSecret: ""        # name of a Secret with key REDIS_URL
+  url: "redis://redis:6379" # or an inline url
+
 # LiveKit + SIP trunk for the gateway (origination).
 livekit:
   url: "ws://livekit:7880"
-  existingSecret: ""        # Secret with LIVEKIT_API_KEY, LIVEKIT_API_SECRET
-  sipTrunkId: ""            # outbound SIP trunk id
+  existingSecret: ""        # Secret with LIVEKIT_API_KEY, LIVEKIT_API_SECRET (preferred)
+  apiKey: ""                # or inline values (dev only)
+  apiSecret: ""
+  sipTrunkId: ""            # outbound SIP trunk id (the orchestrator requires it)
   roomPrefix: "campaign"
 
 # The API: a normal Deployment + Service + HPA.
@@ -36,9 +50,9 @@ api:
 # guarantee against split-brain.
 orchestrator:
   replicas: 2
-  tickMs: 1000
-  batchLimit: 20
-  maxConcurrent: 50
+  batchLimit: 20            # AD_BATCH_LIMIT: hopper rows claimed per batch
+  callsPerSec: 10           # AD_CALLS_PER_SEC: origination rate limit
+  timerPollMs: 1000         # AD_TIMER_POLL_MS: retry due-timer poll interval
   resources: {}
 
 # The dispatch workers: stateless, N replicas, claim via SKIP LOCKED. Scale

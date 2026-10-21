@@ -15,6 +15,7 @@
 # Always tears down.
 set -uo pipefail
 cd "$(dirname "$0")"
+. ./lib.sh
 
 COMPOSE="docker compose -f docker-compose.webrtc.e2e.yml"
 LK_API_KEY=devkey
@@ -23,23 +24,12 @@ FAIL=0
 
 cleanup() {
   echo "== teardown =="
+  docker logs webrtc-probe > "$E2E_OUT/run_webrtc_e2e.probe.log" 2>&1 || true
   docker rm -f webrtc-probe >/dev/null 2>&1 || true
   $COMPOSE down >/dev/null 2>&1 || true
-  echo "== teardown complete =="
+  echo "== teardown complete (probe log: $E2E_OUT/run_webrtc_e2e.probe.log) =="
 }
 trap cleanup EXIT
-
-wait_for() {  # wait_for <timeout_s> <desc> <cmd...>
-  local timeout=$1 desc=$2; shift 2
-  local deadline=$(( $(date +%s) + timeout ))
-  until "$@" >/dev/null 2>&1; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then echo "FAIL: timed out: $desc"; return 1; fi
-    sleep 1
-  done
-  echo "ok: $desc"
-}
-agent_stat() { curl -s --max-time 2 http://127.0.0.1:8088/stats 2>/dev/null \
-  | python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
 
 echo "== build the webrtc probe (cached libwebrtc) =="
 docker build -q -f ../Dockerfile.test -t agentdialer:test-build .. >/dev/null
@@ -54,8 +44,7 @@ $COMPOSE up -d --build 2>&1 | tail -3
 
 wait_for 90 "livekit healthy" bash -c \
   "docker run --rm --network host -e LIVEKIT_URL=http://127.0.0.1:7880 -e LIVEKIT_API_KEY=$LK_API_KEY -e LIVEKIT_API_SECRET=$LK_API_SECRET livekit/livekit-cli:latest room list" || FAIL=1
-wait_for 90 "agent connected to room campaign-1" bash -c \
-  "[ \"\$(curl -s http://127.0.0.1:8088/stats | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"connected\"])')\" = True ]" || FAIL=1
+wait_for 90 "agent connected to room campaign-1" agent_connected || FAIL=1
 
 if [ "$FAIL" -ne 0 ]; then echo "STACK NOT HEALTHY"; exit 1; fi
 
@@ -71,10 +60,8 @@ docker run -d --name webrtc-probe --network host \
   /cache/target/debug/examples/webrtc_bridge_probe >/dev/null 2>&1
 
 echo "== assert: the agent received OUR audio (frames_in > 0, subscribed >= 1) =="
-wait_for 40 "agent subscribed to our track" bash -c \
-  "[ \"\$(curl -s http://127.0.0.1:8088/stats | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"subscribed_tracks\"])')\" -ge 1 ]" || FAIL=1
-wait_for 40 "agent received our tone (frames_in>0)" bash -c \
-  "[ \"\$(curl -s http://127.0.0.1:8088/stats | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"frames_in\"])')\" -gt 0 ]" || FAIL=1
+wait_for 40 "agent subscribed to our track" agent_subscribed || FAIL=1
+wait_for 40 "agent received our tone (frames_in>0)" agent_frames_in || FAIL=1
 
 echo "== assert: our probe got two-way audio (exit 0: outbound>0 AND inbound>0) =="
 # Wait for the probe to finish and capture its exit code.
@@ -87,7 +74,7 @@ while :; do
   sleep 1
 done
 echo "-- probe output --"; docker logs webrtc-probe 2>&1 | tail -3
-echo "-- agent stats --"; curl -s http://127.0.0.1:8088/stats; echo
+echo "-- agent stats --"; agent_stats_json
 if [ "${probe_exit:-1}" != "0" ]; then echo "FAIL: probe exit=$probe_exit (need 0)"; FAIL=1; else echo "ok: probe two-way audio (exit 0)"; fi
 
 if [ "$FAIL" -eq 0 ]; then

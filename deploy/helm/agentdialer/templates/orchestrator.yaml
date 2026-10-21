@@ -32,18 +32,21 @@ spec:
           image: {{ include "agentdialer.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["orchestrator"]
+          # The env set must match the orchestrator contract in
+          # crates/ad_bin/src/config.rs. A test in ad_bin fails on drift.
           env:
             - name: HOSTNAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: AD_TICK_MS
-              value: {{ .Values.orchestrator.tickMs | quote }}
             - name: AD_BATCH_LIMIT
               value: {{ .Values.orchestrator.batchLimit | quote }}
-            - name: AD_MAX_CONCURRENT
-              value: {{ .Values.orchestrator.maxConcurrent | quote }}
+            - name: AD_CALLS_PER_SEC
+              value: {{ .Values.orchestrator.callsPerSec | quote }}
+            - name: AD_TIMER_POLL_MS
+              value: {{ .Values.orchestrator.timerPollMs | quote }}
             {{- include "agentdialer.dbEnv" . | nindent 12 }}
+            {{- include "agentdialer.redisEnv" . | nindent 12 }}
             {{- include "agentdialer.livekitEnv" . | nindent 12 }}
           resources:
             {{- toYaml .Values.orchestrator.resources | nindent 12 }}

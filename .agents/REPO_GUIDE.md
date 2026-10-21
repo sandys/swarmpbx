@@ -35,6 +35,14 @@ contract for anyone (human or agent) editing the code.
 - **Honest status.** `experimental` means experimental and is surfaced in APIs.
   Never overstate what works in commits/PRs/messages.
 
+## Scratch files
+- Put all scratch work in a subdirectory of `_research/`. Use
+  `_research/scratch/<topic>/` for scripts, logs, and temporary output.
+- Do not use `/tmp` or a tool's own session scratchpad for project work.
+- Put a downloaded reference file in its own new subdirectory of `_research/`.
+  Read it as data. Do not run code from inside that directory.
+- `_research/` is git-ignored. A scratch file never goes into a commit.
+
 ## Testing
 - Tests live next to the code they test (or in the crate's `tests/`).
 - A test must **fail without** the change and **pass with** it. For
@@ -57,12 +65,23 @@ CI runs the exact same compose. If you didn't run the tests, it isn't done.
 
 The data layer is `ad_db` (sqlx + Postgres). The dockerized test tier above
 starts Postgres as a compose service and points the integration tests at it via
-`DATABASE_URL`. For an interactive local database, use `docker-compose.yml`:
+`DATABASE_URL`. For an interactive local Postgres and Redis, use
+`docker-compose.yml`:
 ```
 docker compose up -d
 ```
 The API uses Postgres when `DATABASE_URL` is set, else an in-memory store. Apply
-migrations with `agentdialer migrate` (needs `DATABASE_URL`).
+migrations with `agentdialer migrate` (needs `DATABASE_URL`). Run the binary in
+its image, not on the host (README.md, "Run locally").
+
+## Environment variables
+- `crates/ad_bin/src/config.rs` defines the variables of each role. It is the
+  single source of truth.
+- When you add, rename, or remove a variable, change these in the same change:
+  `config.rs`, the README.md "Configuration" table, the Helm chart, and every
+  e2e script that starts that role.
+- A test in `ad_bin` fails when a launcher misses a required variable, sets a
+  variable the binary does not read, or the README table is out of date.
 
 **Always stop the stack after tests. Never leave it up.** When you start
 `docker compose up -d` for a test run, run `docker compose down` as soon as the

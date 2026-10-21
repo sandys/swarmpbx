@@ -17,3 +17,6 @@
 # Regenerable spike media + logs
 spike/livekit/agent.ogg
 *.log
+
+# Output that the e2e scripts keep (e2e/lib.sh, E2E_OUT)
+/e2e/.out/

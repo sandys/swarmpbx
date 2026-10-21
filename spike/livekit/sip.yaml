@@ -5,8 +5,10 @@ ws_url: ws://127.0.0.1:7880
 redis:
   address: 127.0.0.1:6379
 sip_port: 5062
-rtp_port: 20000
-rtp_port_range_end: 20050
+# A range "start-end". A single number is a range of ONE port, so only one call
+# can carry media at a time. livekit/sip has no rtp_port_range_end key; the old
+# value here was ignored.
+rtp_port: 20000-20100
 use_external_ip: false
 logging:
   level: info

@@ -30,7 +30,21 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end }}
 {{- end -}}
 
-{{/* LiveKit env for the gateway-bearing roles. */}}
+{{/* REDIS_URL from a Secret (preferred) or an inline value. */}}
+{{- define "agentdialer.redisEnv" -}}
+- name: REDIS_URL
+{{- if .Values.redis.existingSecret }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.redis.existingSecret }}
+      key: REDIS_URL
+{{- else }}
+  value: {{ .Values.redis.url | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* LiveKit env for the gateway-bearing roles. The API key and secret come
+from a Secret (preferred) or inline values (dev). Both are always set. */}}
 {{- define "agentdialer.livekitEnv" -}}
 - name: LIVEKIT_URL
   value: {{ .Values.livekit.url | quote }}
@@ -49,5 +63,10 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
     secretKeyRef:
       name: {{ .Values.livekit.existingSecret }}
       key: LIVEKIT_API_SECRET
+{{- else }}
+- name: LIVEKIT_API_KEY
+  value: {{ .Values.livekit.apiKey | quote }}
+- name: LIVEKIT_API_SECRET
+  value: {{ .Values.livekit.apiSecret | quote }}
 {{- end }}
 {{- end -}}

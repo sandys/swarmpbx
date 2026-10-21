@@ -89,10 +89,78 @@ docker compose -f docker-compose.test.yml down
 
 Always stop the stack after tests.
 
+## Configuration
+
+Each role reads its settings from environment variables. The contract is in
+`crates/ad_bin/src/config.rs`. At startup a role reports every missing or invalid
+variable in one message and exits. A blank value counts as missing. A test in
+`ad_bin` checks the Helm chart, the e2e scripts, and this section against the
+contract, so they cannot drift.
+
+### `orchestrator`
+
+| Variable | Need | Default | Meaning |
+|---|---|---|---|
+| `DATABASE_URL` | required | — | Postgres URL. |
+| `REDIS_URL` | required | — | Redis URL: event channel, retry due-timers, breaker window. |
+| `LIVEKIT_URL` | required | — | LiveKit server URL. |
+| `LIVEKIT_API_KEY` | required | — | LiveKit API key. |
+| `LIVEKIT_API_SECRET` | required | — | LiveKit API secret. |
+| `AD_SIP_TRUNK_ID` | required | — | LiveKit outbound SIP trunk id. |
+| `AD_ROOM_PREFIX` | optional | `campaign` | Room name prefix. |
+| `AD_BATCH_LIMIT` | optional | `20` | Hopper rows claimed per batch. |
+| `AD_CALLS_PER_SEC` | optional | `10` | Origination rate limit. |
+| `AD_TIMER_POLL_MS` | optional | `1000` | Retry due-timer poll interval. |
+| `HOSTNAME` | optional | `orchestrator` | Worker id written into hopper claims. |
+| `RUST_LOG` | optional | `info` | Log filter (`tracing` `EnvFilter` syntax). |
+
+### `api`
+
+| Variable | Need | Default | Meaning |
+|---|---|---|---|
+| `AD_API_ADDR` | optional | `0.0.0.0:8080` | Listen address. |
+| `DATABASE_URL` | optional | in-memory store | Postgres URL. Migrations run at start. |
+| `RUST_LOG` | optional | `info` | Log filter. |
+
+### `migrate`
+
+| Variable | Need | Default | Meaning |
+|---|---|---|---|
+| `DATABASE_URL` | required | — | Postgres URL. |
+| `RUST_LOG` | optional | `info` | Log filter. |
+
+The `dispatch` role is a stub. It prints a message and exits. It has no
+contract yet.
+
+### Logs
+
+Every role writes its logs to stdout and its errors to stderr. It writes no log
+files. In a container, read them with `docker logs <container>`; in Kubernetes,
+use `kubectl logs`. Set `RUST_LOG=debug` for more detail, or
+`RUST_LOG=info,agentdialer=debug` for the binary only.
+
+### Run locally (all in Docker)
+
+```
+docker compose up -d        # Postgres on 127.0.0.1:5433, Redis on 127.0.0.1:6380
+docker build -t agentdialer:dev .
+DB=postgres://agentdialer:agentdialer@127.0.0.1:5433/agentdialer
+docker run --rm --network host -e DATABASE_URL=$DB agentdialer:dev migrate
+docker run --rm --network host \
+    -e DATABASE_URL=$DB -e REDIS_URL=redis://127.0.0.1:6380 \
+    -e LIVEKIT_URL=ws://127.0.0.1:7880 -e LIVEKIT_API_KEY=... -e LIVEKIT_API_SECRET=... \
+    -e AD_SIP_TRUNK_ID=ST_... \
+    agentdialer:dev orchestrator
+docker compose down
+```
+
 ## End-to-end tests
 
 The `e2e/` directory holds automated end-to-end tests. Each brings up a real
-stack, asserts behavior, and tears down.
+stack, asserts behavior, and tears down. The scripts need only bash and the
+Docker CLI on the host: every other tool (HTTP polling, JSON, `psql`,
+`redis-cli`, SIPp) runs in a container (`e2e/lib.sh`). Each script keeps the
+orchestrator or probe log in `e2e/.out/` (git-ignored).
 
 - `e2e/run_e2e.sh` — the orchestrator wins leadership, claims the hopper, and
   `ad_gateway` originates a real call that lands in a LiveKit room with an agent
@@ -111,7 +179,8 @@ stack, asserts behavior, and tears down.
 `deploy/helm/agentdialer` is the Helm chart. The orchestrator is a leader-elected
 Deployment (no Service). The gateway runs as `hostNetwork` media pods with an RTP
 port range. The API has a Service and an HPA. A migrate Job runs as a pre-upgrade
-hook.
+hook. Set `database`, `redis`, and `livekit` (including `sipTrunkId`) in the
+values; each takes an existing Secret or an inline value for development.
 
 ## Status
 

@@ -28,11 +28,13 @@ use ad_events::{
     BreakerStore, CampaignEvent, Consumer, DueTimers, Publisher, RedisBreakerStore, RedisConsumer,
     RedisPublisher, RedisTimers, RetryReason,
 };
-use ad_gateway::{Gateway, GatewayConfig, LiveKitGateway};
+use ad_gateway::{Gateway, LiveKitGateway};
 use ad_hopper::{select, Order, SelectionInput};
 use ad_lead::repo::LeadRepo;
 use ad_lead::LeadStatus;
 use ad_orchestrator::{react, ReactorAction, ReactorInput, RetryPolicy};
+
+use crate::config::{self, OrchestratorConfig};
 
 const ORCHESTRATOR_LEADER_KEY: i64 = 0x4144_5f4f_5243; // "AD_ORC"
 
@@ -82,13 +84,16 @@ impl Orchestrator {
             .await
             .map_err(|e| anyhow::anyhow!("breaker evaluate: {e}"))?;
         if open {
-            self.publisher
-                .publish(&CampaignEvent::CircuitBreakerTripped {
-                    campaign_id: campaign_id.0,
-                    failure_rate: stats.failure_rate,
-                })
-                .await
-                .ok();
+            warn_err(
+                self.publisher
+                    .publish(&CampaignEvent::CircuitBreakerTripped {
+                        campaign_id: campaign_id.0,
+                        failure_rate: stats.failure_rate,
+                    })
+                    .await,
+                "publish circuit_breaker_tripped",
+                campaign_id.0,
+            );
             tracing::warn!(
                 campaign = campaign_id.0,
                 rate = stats.failure_rate,
@@ -104,19 +109,28 @@ impl Orchestrator {
             .await?;
         if claimed.is_empty() {
             // No work: the campaign is complete for now.
-            self.publisher
-                .publish(&CampaignEvent::CampaignCompleted {
-                    campaign_id: campaign_id.0,
-                })
-                .await
-                .ok();
+            warn_err(
+                self.publisher
+                    .publish(&CampaignEvent::CampaignCompleted {
+                        campaign_id: campaign_id.0,
+                    })
+                    .await,
+                "publish campaign_completed",
+                campaign_id.0,
+            );
             return Ok(());
         }
 
         let mut leads = Vec::with_capacity(claimed.len());
         for item in &claimed {
-            if let Ok(l) = self.db.leads().get(item.lead_id).await {
-                leads.push(l);
+            match self.db.leads().get(item.lead_id).await {
+                Ok(l) => leads.push(l),
+                Err(e) => tracing::warn!(
+                    campaign = campaign_id.0,
+                    lead = item.lead_id.0,
+                    error = %e,
+                    "claimed lead could not be loaded; skipped"
+                ),
             }
         }
         let dnc = DncSet::default();
@@ -132,23 +146,37 @@ impl Orchestrator {
             },
         );
 
+        for excluded in &selection.excluded {
+            tracing::info!(
+                campaign = campaign_id.0,
+                lead = excluded.lead.id.0,
+                reason = ?excluded.reason,
+                "lead excluded at dispatch"
+            );
+        }
+
         let mut processed = 0u32;
         let mut failed = 0u32;
         for lead in &selection.eligible {
             // Place the call via the gateway (the CallInitiator seam).
+            let started = std::time::Instant::now();
             let outcome = {
                 use ad_dispatch::CallInitiator;
                 self.gateway.initiate(lead).await
             };
+            let setup_ms = started.elapsed().as_millis() as u64;
             let answered = matches!(outcome, CallOutcome::Answered);
             let attempt_at = self.clock.now_utc();
 
             // Record the outcome in the breaker (persistent window).
             let is_failure = outcome.is_failure();
-            self.breaker
-                .record(campaign_id.0, attempt_at, is_failure)
-                .await
-                .ok();
+            warn_err(
+                self.breaker
+                    .record(campaign_id.0, attempt_at, is_failure)
+                    .await,
+                "record breaker outcome",
+                campaign_id.0,
+            );
 
             // Decide the retry + next lead status.
             let reason = Self::retry_reason(&outcome);
@@ -162,42 +190,61 @@ impl Orchestrator {
 
             // Idempotent write-back. Only publish/schedule when newly recorded.
             let outcome_str = outcome_label(&outcome);
-            let is_new = self
-                .db
-                .leads()
-                .record_outcome(
-                    campaign_id,
-                    lead.id,
-                    outcome_str,
-                    answered,
-                    attempt_at,
-                    next_status,
-                )
-                .await
-                .unwrap_or(false);
+            let is_new = warn_err(
+                self.db
+                    .leads()
+                    .record_outcome(
+                        campaign_id,
+                        lead.id,
+                        outcome_str,
+                        answered,
+                        attempt_at,
+                        next_status,
+                    )
+                    .await,
+                "record call outcome",
+                campaign_id.0,
+            )
+            .unwrap_or(false);
+
+            tracing::info!(
+                campaign = campaign_id.0,
+                lead = lead.id.0,
+                outcome = outcome_str,
+                detail = outcome_detail(&outcome),
+                setup_ms,
+                recorded = is_new,
+                "call attempt"
+            );
 
             if is_new {
                 processed += 1;
                 if is_failure {
                     failed += 1;
                 }
-                self.publisher
-                    .publish(&CampaignEvent::CallCompleted {
-                        campaign_id: campaign_id.0,
-                        lead_id: lead.id.0,
-                        answered,
-                    })
-                    .await
-                    .ok();
-                if let Some(r) = reason {
+                warn_err(
                     self.publisher
-                        .publish(&CampaignEvent::RetryNeeded {
+                        .publish(&CampaignEvent::CallCompleted {
                             campaign_id: campaign_id.0,
                             lead_id: lead.id.0,
-                            reason: r,
+                            answered,
                         })
-                        .await
-                        .ok();
+                        .await,
+                    "publish call_completed",
+                    campaign_id.0,
+                );
+                if let Some(r) = reason {
+                    warn_err(
+                        self.publisher
+                            .publish(&CampaignEvent::RetryNeeded {
+                                campaign_id: campaign_id.0,
+                                lead_id: lead.id.0,
+                                reason: r,
+                            })
+                            .await,
+                        "publish retry_needed",
+                        campaign_id.0,
+                    );
                 }
             }
 
@@ -205,55 +252,75 @@ impl Orchestrator {
             tokio::time::sleep(self.per_call_gap).await;
         }
 
+        tracing::info!(
+            campaign = campaign_id.0,
+            claimed = claimed.len(),
+            eligible = selection.eligible.len(),
+            excluded = selection.excluded.len(),
+            recorded = processed,
+            failed,
+            "batch finished"
+        );
+
         // Announce the batch so the reactor schedules the next one.
-        self.publisher
-            .publish(&CampaignEvent::BatchCompleted {
-                campaign_id: campaign_id.0,
-                processed_count: processed,
-                failed_count: failed,
-                batch_size: claimed.len() as u32,
-            })
-            .await
-            .ok();
+        warn_err(
+            self.publisher
+                .publish(&CampaignEvent::BatchCompleted {
+                    campaign_id: campaign_id.0,
+                    processed_count: processed,
+                    failed_count: failed,
+                    batch_size: claimed.len() as u32,
+                })
+                .await,
+            "publish batch_completed",
+            campaign_id.0,
+        );
 
         // If this batch's failures opened the breaker, announce the trip once
         // here (not in the event handler, which would self-feed).
-        if let Ok((true, stats)) = self
-            .breaker
-            .evaluate(campaign_id.0, self.clock.now_utc(), &self.breaker_cfg)
-            .await
-        {
-            self.publisher
-                .publish(&CampaignEvent::CircuitBreakerTripped {
-                    campaign_id: campaign_id.0,
-                    failure_rate: stats.failure_rate,
-                })
-                .await
-                .ok();
+        if let Some((true, stats)) = warn_err(
+            self.breaker
+                .evaluate(campaign_id.0, self.clock.now_utc(), &self.breaker_cfg)
+                .await,
+            "evaluate breaker",
+            campaign_id.0,
+        ) {
+            warn_err(
+                self.publisher
+                    .publish(&CampaignEvent::CircuitBreakerTripped {
+                        campaign_id: campaign_id.0,
+                        failure_rate: stats.failure_rate,
+                    })
+                    .await,
+                "publish circuit_breaker_tripped",
+                campaign_id.0,
+            );
         }
         Ok(())
     }
 
     /// Handle one event via the pure reactor, then perform the I/O.
     async fn handle(&self, event: &CampaignEvent) -> anyhow::Result<()> {
-        let open = match self
-            .breaker
-            .evaluate(event.campaign_id(), self.clock.now_utc(), &self.breaker_cfg)
-            .await
-        {
-            Ok((o, _)) => o,
-            Err(_) => false,
-        };
+        // A breaker read error counts as "closed" (GAPS.md DIAL-8); it is logged.
+        let open = warn_err(
+            self.breaker
+                .evaluate(event.campaign_id(), self.clock.now_utc(), &self.breaker_cfg)
+                .await,
+            "evaluate breaker",
+            event.campaign_id(),
+        )
+        .map(|(o, _)| o)
+        .unwrap_or(false);
         // Attempts cap is enforced per-lead inside record_outcome write-back; we
         // pass the lead's current called_count for RetryNeeded.
         let lead_attempts = match event {
-            CampaignEvent::RetryNeeded { lead_id, .. } => self
-                .db
-                .leads()
-                .get(LeadId(*lead_id))
-                .await
-                .map(|l| l.called_count)
-                .unwrap_or(0),
+            CampaignEvent::RetryNeeded { lead_id, .. } => warn_err(
+                self.db.leads().get(LeadId(*lead_id)).await,
+                "load lead for retry decision",
+                event.campaign_id(),
+            )
+            .map(|l| l.called_count)
+            .unwrap_or(0),
             _ => 0,
         };
         let action = react(
@@ -275,18 +342,24 @@ impl Orchestrator {
                 lead_id,
                 due_epoch_ms,
             } => {
-                self.timers
-                    .schedule(campaign_id, lead_id, due_epoch_ms)
-                    .await
-                    .ok();
-                self.publisher
-                    .publish(&CampaignEvent::RetryScheduled {
-                        campaign_id,
-                        lead_id,
-                        due_epoch_ms,
-                    })
-                    .await
-                    .ok();
+                warn_err(
+                    self.timers
+                        .schedule(campaign_id, lead_id, due_epoch_ms)
+                        .await,
+                    "schedule retry timer",
+                    campaign_id,
+                );
+                warn_err(
+                    self.publisher
+                        .publish(&CampaignEvent::RetryScheduled {
+                            campaign_id,
+                            lead_id,
+                            due_epoch_ms,
+                        })
+                        .await,
+                    "publish retry_scheduled",
+                    campaign_id,
+                );
             }
             ReactorAction::DropRetry {
                 campaign_id,
@@ -328,11 +401,12 @@ impl Orchestrator {
             {
                 continue;
             }
-            let due = self
-                .timers
-                .pop_due(campaign.id.0, now_ms)
-                .await
-                .unwrap_or_default();
+            let due = warn_err(
+                self.timers.pop_due(campaign.id.0, now_ms).await,
+                "pop due retry timers",
+                campaign.id.0,
+            )
+            .unwrap_or_default();
             if due.is_empty() {
                 continue;
             }
@@ -340,27 +414,38 @@ impl Orchestrator {
                 // Re-admit: clear the claim on the existing hopper row so the
                 // next batch can select it again. (The row was claimed, not
                 // removed, when first dialed.)
-                sqlx::query(
-                    "UPDATE hopper SET claimed_by = NULL, claimed_at = NULL \
-                     WHERE lead_id = $1 AND campaign_id = $2",
-                )
-                .bind(lead_id)
-                .bind(campaign.id.0)
-                .execute(self.db.pool())
-                .await
-                .ok();
+                warn_err(
+                    sqlx::query(
+                        "UPDATE hopper SET claimed_by = NULL, claimed_at = NULL \
+                         WHERE lead_id = $1 AND campaign_id = $2",
+                    )
+                    .bind(lead_id)
+                    .bind(campaign.id.0)
+                    .execute(self.db.pool())
+                    .await,
+                    "re-admit retried lead",
+                    campaign.id.0,
+                );
             }
+            tracing::info!(
+                campaign = campaign.id.0,
+                leads = due.len(),
+                "retry timers due; leads re-admitted"
+            );
             // One kick per drain (not per lead) so the next batch dials the
             // re-admitted leads.
-            self.publisher
-                .publish(&CampaignEvent::BatchCompleted {
-                    campaign_id: campaign.id.0,
-                    processed_count: 0,
-                    failed_count: 0,
-                    batch_size: 0,
-                })
-                .await
-                .ok();
+            warn_err(
+                self.publisher
+                    .publish(&CampaignEvent::BatchCompleted {
+                        campaign_id: campaign.id.0,
+                        processed_count: 0,
+                        failed_count: 0,
+                        batch_size: 0,
+                    })
+                    .await,
+                "publish batch_completed (retry kick)",
+                campaign.id.0,
+            );
         }
         Ok(())
     }
@@ -369,9 +454,34 @@ impl Orchestrator {
     /// work is dialed even without a triggering event.
     async fn reconcile(&self) -> anyhow::Result<()> {
         for campaign in self.db.campaigns().list_running().await? {
-            self.dispatch_batch(campaign.id).await.ok();
+            warn_err(
+                self.dispatch_batch(campaign.id).await,
+                "reconcile dispatch",
+                campaign.id.0,
+            );
         }
         Ok(())
+    }
+}
+
+/// Log a failed side effect and carry on. Postgres stays the source of truth;
+/// `reconcile` and the timer drain recover what a lost event or write leaves.
+fn warn_err<T, E: std::fmt::Display>(result: Result<T, E>, what: &str, campaign: i64) -> Option<T> {
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(campaign, error = %e, "{what} failed");
+            None
+        }
+    }
+}
+
+fn outcome_detail(o: &CallOutcome) -> &str {
+    match o {
+        CallOutcome::NotAnswered(d) | CallOutcome::Failed(d) | CallOutcome::ComplianceDenied(d) => {
+            d
+        }
+        CallOutcome::Answered | CallOutcome::NoCapacity => "",
     }
 }
 
@@ -385,37 +495,23 @@ fn outcome_label(o: &CallOutcome) -> &'static str {
     }
 }
 
-fn env(key: &str) -> anyhow::Result<String> {
-    std::env::var(key).map_err(|_| anyhow::anyhow!("{key} must be set"))
-}
-
 pub fn run() -> anyhow::Result<()> {
-    let url = env("DATABASE_URL")?;
-    let redis_url = env("REDIS_URL")?;
-    let gw_config = GatewayConfig {
-        livekit_url: env("LIVEKIT_URL")?,
-        api_key: env("LIVEKIT_API_KEY")?,
-        api_secret: env("LIVEKIT_API_SECRET")?,
-        sip_trunk_id: env("AD_SIP_TRUNK_ID")?,
-        room_prefix: std::env::var("AD_ROOM_PREFIX").unwrap_or_else(|_| "campaign".into()),
-    };
-    let batch_limit: i64 = std::env::var("AD_BATCH_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
-    let calls_per_sec: f64 = std::env::var("AD_CALLS_PER_SEC")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10.0);
-    let per_call_gap = Duration::from_millis(((1000.0 / calls_per_sec).max(1.0)) as u64);
-    let timer_poll_ms: u64 = std::env::var("AD_TIMER_POLL_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
+    let cfg = OrchestratorConfig::from_lookup(config::process_env)?;
+    tracing::info!(config = ?cfg, "orchestrator: configuration loaded");
+    let per_call_gap = cfg.per_call_gap();
+    let OrchestratorConfig {
+        database_url,
+        redis_url,
+        gateway: gw_config,
+        batch_limit,
+        timer_poll_ms,
+        worker,
+        ..
+    } = cfg;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let db = ad_db::Db::connect(&url).await?;
+        let db = ad_db::Db::connect(&database_url).await?;
 
         tracing::info!("orchestrator: waiting to become leader");
         let _guard = loop {
@@ -426,7 +522,6 @@ pub fn run() -> anyhow::Result<()> {
         };
         tracing::info!("orchestrator: became leader, starting event loop");
 
-        let worker = std::env::var("HOSTNAME").unwrap_or_else(|_| "orchestrator".into());
         let orch = Arc::new(Orchestrator {
             db,
             gateway: Gateway::new(
@@ -455,7 +550,9 @@ pub fn run() -> anyhow::Result<()> {
         let timer_orch = orch.clone();
         tokio::spawn(async move {
             loop {
-                timer_orch.drain_due_timers().await.ok();
+                if let Err(e) = timer_orch.drain_due_timers().await {
+                    tracing::warn!(error = %e, "retry timer drain failed");
+                }
                 tokio::time::sleep(Duration::from_millis(timer_poll_ms)).await;
             }
         });
@@ -466,7 +563,10 @@ pub fn run() -> anyhow::Result<()> {
         loop {
             match RedisConsumer::connect(&redis_url).await {
                 Ok(mut consumer) => {
-                    orch.reconcile().await.ok(); // after subscribe: no lost self-events
+                    // After subscribe, so the events reconcile publishes are not lost.
+                    if let Err(e) = orch.reconcile().await {
+                        tracing::warn!(error = %e, "reconcile failed");
+                    }
                     loop {
                         match consumer.next_event().await {
                             Ok(Some(event)) => {
