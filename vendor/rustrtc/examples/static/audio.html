@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RustRTC Audio Saver</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>RustRTC Audio Saver</h1>
+    <p>Click "Start Recording" to send microphone audio to the server. The server will save it as
+        <code>output.ulaw</code>.</p>
+    <p>To play back the saved file: <code>ffplay -f mulaw -ar 8000 output.ulaw</code></p>
+
+    <div id="status">Status: Idle</div>
+    <br>
+    <button id="start-btn">Start Recording</button>
+    <button id="stop-btn" disabled>Stop</button>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn = document.getElementById('stop-btn');
+
+        let pc = null;
+        let stream = null;
+
+        startBtn.onclick = async () => {
+            try {
+                startBtn.disabled = true;
+                statusDiv.textContent = "Status: Requesting Microphone...";
+
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+                statusDiv.textContent = "Status: Connecting...";
+                pc = new RTCPeerConnection();
+
+                stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+                pc.onicecandidate = e => {
+                    if (e.candidate) {
+                        console.log("New candidate", e.candidate);
+                    }
+                };
+
+                pc.onconnectionstatechange = () => {
+                    statusDiv.textContent = "Status: " + pc.connectionState;
+                    if (pc.connectionState === 'connected') {
+                        stopBtn.disabled = false;
+                    }
+                };
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                // Wait for ICE gathering
+                await new Promise(resolve => {
+                    if (pc.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        const checkIce = () => {
+                            if (pc.iceGatheringState === 'complete') {
+                                pc.removeEventListener('icegatheringstatechange', checkIce);
+                                resolve();
+                            }
+                        };
+                        pc.addEventListener('icegatheringstatechange', checkIce);
+                    }
+                });
+
+                const response = await fetch('/offer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sdp: pc.localDescription.sdp })
+                });
+
+                const answer = await response.json();
+                await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answer.sdp }));
+
+            } catch (e) {
+                console.error(e);
+                statusDiv.textContent = "Error: " + e.message;
+                startBtn.disabled = false;
+            }
+        };
+
+        stopBtn.onclick = () => {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            if (stream) {
+                stream.getTracks().forEach(t => t.stop());
+                stream = null;
+            }
+            statusDiv.textContent = "Status: Stopped";
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        };
+    </script>
+</body>
+
+</html>

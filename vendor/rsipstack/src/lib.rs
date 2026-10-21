@@ -1,0 +1,296 @@
+//! # RSIPStack - A SIP Stack Implementation in Rust
+//!
+//! RSIPStack is a comprehensive Session Initiation Protocol (SIP) implementation
+//! written in Rust. It provides a complete SIP stack with support for multiple
+//! transport protocols, transaction management, dialog handling, and more.
+//!
+//! ## Features
+//!
+//! * **Complete SIP Implementation** - Full RFC 3261 compliance
+//! * **Multiple Transports** - UDP, TCP, TLS, WebSocket support
+//! * **Transaction Layer** - Automatic retransmissions and timer management
+//! * **Dialog Management** - Full dialog state machine implementation
+//! * **Async/Await Support** - Built on Tokio for high performance
+//! * **Type Safety** - Leverages Rust's type system for protocol correctness
+//! * **Extensible** - Modular design for easy customization
+//!
+//! ## Architecture
+//!
+//! The stack is organized into several layers following the SIP specification:
+//!
+//! ```text
+//! ┌─────────────────────────────────────┐
+//! │           Application Layer         │
+//! ├─────────────────────────────────────┤
+//! │           Dialog Layer              │
+//! ├─────────────────────────────────────┤
+//! │         Transaction Layer           │
+//! ├─────────────────────────────────────┤
+//! │          Transport Layer            │
+//! └─────────────────────────────────────┘
+//! ```
+//!
+//! ## Quick Start
+//!
+//! ### Creating a SIP Endpoint
+//!
+//! ```rust,no_run
+//! use rsipstack::EndpointBuilder;
+//! use tokio_util::sync::CancellationToken;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Create a SIP endpoint
+//!     let endpoint = EndpointBuilder::new()
+//!         .with_user_agent("MyApp/1.0")
+//!         .build();
+//!
+//!     // Get incoming transactions
+//!     let mut incoming = endpoint.incoming_transactions().expect("incoming_transactions");
+//!
+//!     // Start the endpoint (in production, you'd run this in a separate task)
+//!     // let endpoint_inner = endpoint.inner.clone();
+//!     // tokio::spawn(async move {
+//!     //     endpoint_inner.serve().await.ok();
+//!     // });
+//!
+//!     // Process incoming requests
+//!     while let Some(transaction) = incoming.recv().await {
+//!         // Handle the transaction
+//!         println!("Received: {}", transaction.original.method);
+//!         break; // Exit for example
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Sending SIP Requests
+//!
+//! ```rust,no_run
+//! use rsipstack::dialog::dialog_layer::DialogLayer;
+//! use rsipstack::dialog::invitation::InviteOption;
+//! use rsipstack::transaction::endpoint::EndpointInner;
+//! use std::sync::Arc;
+//!
+//! # async fn example() -> rsipstack::Result<()> {
+//! # let endpoint: Arc<EndpointInner> = todo!();
+//! # let state_sender = todo!();
+//! # let sdp_body = vec![];
+//! // Create a dialog layer
+//! let dialog_layer = DialogLayer::new(endpoint.clone());
+//!
+//! // Send an INVITE
+//! let invite_option = InviteOption {
+//!     caller: rsipstack::sip::Uri::try_from("sip:alice@example.com")?,
+//!     callee: rsipstack::sip::Uri::try_from("sip:bob@example.com")?,
+//!     contact: rsipstack::sip::Uri::try_from("sip:alice@myhost.com:5060")?,
+//!     content_type: Some("application/sdp".to_string()),
+//!     offer: Some(sdp_body),
+//!     ..Default::default()
+//! };
+//!
+//! let (dialog, response) = dialog_layer.do_invite(invite_option, state_sender).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Core Components
+//!
+//! ### Transport Layer
+//!
+//! The transport layer handles network communication across different protocols:
+//!
+//! * [`SipConnection`](transport::SipConnection) - Abstraction over transport protocols
+//! * [`SipAddr`](transport::SipAddr) - SIP addressing with transport information
+//! * [`TransportLayer`](transport::TransportLayer) - Transport management
+//!
+//! ### Transaction Layer
+//!
+//! The transaction layer provides reliable message delivery:
+//!
+//! * [`Transaction`](transaction::transaction::Transaction) - SIP transaction implementation
+//! * [`Endpoint`](transaction::Endpoint) - SIP endpoint for transaction management
+//! * [`TransactionState`](transaction::TransactionState) - Transaction state machine
+//!
+//! ### Dialog Layer
+//!
+//! The dialog layer manages SIP dialogs and sessions:
+//!
+//! * [`Dialog`](dialog::dialog::Dialog) - SIP dialog representation
+//! * [`DialogId`](dialog::DialogId) - Dialog identification
+//! * [`DialogState`](dialog::dialog::DialogState) - Dialog state management
+//!
+//! ## Error Handling
+//!
+//! The stack uses a comprehensive error type that covers all layers:
+//!
+//! ```rust
+//! use rsipstack::{Result, Error};
+//!
+//! fn handle_sip_error(error: Error) {
+//!     match error {
+//!         Error::TransportLayerError(msg, addr) => {
+//!             eprintln!("Transport error at {msg}: {addr}");
+//!         },
+//!         Error::TransactionError(msg, key) => {
+//!             eprintln!("Transaction error {msg}: {key}");
+//!         },
+//!         Error::DialogError(msg, id, code) => {
+//!             eprintln!("Dialog error {msg}: {id} (Status code: {code})");
+//!         },
+//!         _ => eprintln!("Other error: {}", error),
+//!     }
+//! }
+//! ```
+//!
+//! ## Configuration
+//!
+//! The stack can be configured for different use cases:
+//!
+//! ### Basic UDP Server
+//!
+//! ```rust,no_run
+//! use rsipstack::EndpointBuilder;
+//! use rsipstack::transport::{TransportLayer, udp::UdpConnection};
+//! use tokio_util::sync::CancellationToken;
+//!
+//! # async fn example() -> rsipstack::Result<()> {
+//! # let cancel_token = CancellationToken::new();
+//! let transport_layer = TransportLayer::new(cancel_token.child_token());
+//! let udp_conn = UdpConnection::create_connection("0.0.0.0:5060".parse()?, None, Some(cancel_token.child_token())).await?;
+//! transport_layer.add_transport(udp_conn.into());
+//!
+//! let endpoint = EndpointBuilder::new()
+//!     .with_transport_layer(transport_layer)
+//!     .build();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### Secure TLS Server
+//!
+//! ```rust,no_run
+//! #[cfg(feature = "rustls")]
+//! use rsipstack::transport::tls::{TlsConnection, TlsConfig};
+//! use rsipstack::transport::TransportLayer;
+//!
+//! # async fn example() -> rsipstack::Result<()> {
+//! # let cert_pem = vec![];
+//! # let key_pem = vec![];
+//! # let transport_layer: TransportLayer = todo!();
+//! // Configure TLS transport
+//! let tls_config = TlsConfig {
+//!     cert: Some(cert_pem),
+//!     key: Some(key_pem),
+//!     ..Default::default()
+//! };
+//!
+//! // TLS connections would be created using the TLS configuration
+//! // let tls_conn = TlsConnection::serve_listener(...).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Standards Compliance
+//!
+//! RSIPStack implements the following RFCs:
+//!
+//! * **RFC 3261** - SIP: Session Initiation Protocol (core specification)
+//! * **RFC 3581** - Symmetric Response Routing (rport)
+//! * **RFC 6026** - Correct Transaction Handling for 2xx Responses to INVITE.
+//!   Server `Accepted` state + Timer L (§7.1); client `Accepted` state + Timer M
+//!   (§7.2). Two documented deviations keep the rsipstack 0.5.x wire behavior
+//!   inside the new state machine. Client deviation: the transaction auto-ACKs
+//!   a 2xx (and re-ACKs every retransmitted/forked 2xx) while parked in
+//!   `Accepted`; strict §7.2 + RFC 3261 §17.1.1.3 place that responsibility on
+//!   the TU — set `EndpointOption::auto_ack_2xx = false` for strict TU-owned
+//!   ACKs (proxy mode: the 2xx then terminates the transaction at once).
+//!   Server deviation: the transaction keeps Timer G (T1, doubling to T2,
+//!   RFC 3261 §13.3.1.4) while in `Accepted` and stops it when the ACK
+//!   arrives, because the rsipstack dialog layer does not retransmit 2xx
+//!   itself. Dialog users must keep receiving the client transaction until
+//!   Timer M ends it (`DialogLayer::do_invite`/`do_invite_async` do this);
+//!   the absorption window delivers every retransmitted/forked 2xx to the TU.
+//!
+//! ## Performance
+//!
+//! The stack is designed for high performance:
+//!
+//! * **Zero-copy parsing** where possible
+//! * **Async I/O** with Tokio for scalability
+//! * **Efficient timer management** for large numbers of transactions
+//! * **Memory-safe** with Rust's ownership system
+//!
+//! ## Testing
+//!
+//! Comprehensive test suite covering:
+//!
+//! * Unit tests for all components
+//! * Integration tests for protocol compliance
+//! * Performance benchmarks
+//! * Interoperability testing
+//!
+//! ## Examples
+//!
+//! See the `examples/` directory for complete working examples:
+//!
+//! * Simple SIP client
+//! * SIP proxy server
+//! * WebSocket SIP gateway
+//! * Load testing tools
+// A SIP stack in Rust
+//
+// no_std-capable: embedded targets build with `--no-default-features` and a
+// platform backend (embassy, WP3); host builds use the default `std` feature
+// (tokio backend).
+#![cfg_attr(not(feature = "std"), no_std)]
+// `async_trait`'s expansion trips clippy's `double_must_use` on newer
+// toolchains (the generated futures already carry `#[must_use]`).
+#![allow(clippy::double_must_use)]
+#![allow(
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::module_inception,
+    clippy::wrong_self_convention,
+    clippy::large_enum_variant
+)]
+// The legacy ServerInviteDialog / ClientInviteDialog wrappers are retained
+// (deprecated) only for compatibility; internal code and the From/TryFrom
+// conversions keep using them during the transition to InviteDialog.
+#![allow(deprecated)]
+
+// `alloc` is a sysroot crate; naming it in std builds is valid and lets the
+// codebase share one set of alloc imports across std/no_std.
+extern crate alloc;
+
+/// Crate-internal prelude: fills the no_std gaps with `alloc`/`core` items.
+/// In std builds the std prelude already provides most of these; the glob
+/// import here is harmless (same types) and only activates under no_std.
+pub mod prelude {
+    extern crate alloc;
+    pub use alloc::borrow::{Cow, ToOwned};
+    pub use alloc::boxed::Box;
+    pub use alloc::collections::{BTreeMap, BTreeSet};
+    pub use alloc::string::String;
+    pub use alloc::sync::{Arc, Weak};
+    pub use alloc::vec::Vec;
+    #[cfg(not(feature = "std"))]
+    pub use alloc::{format, string::ToString, vec};
+    pub use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+    pub use core::time::Duration;
+}
+
+pub type Result<T> = core::result::Result<T, crate::error::Error>;
+pub use crate::error::Error;
+pub mod dialog;
+pub mod error;
+pub mod platform;
+pub mod resolver;
+pub mod transaction;
+pub mod transport;
+pub use transaction::EndpointBuilder;
+pub mod sip;
+pub use sip as rsip;
+
+pub const VERSION: &str = concat!("rsipstack/", env!("CARGO_PKG_VERSION"));

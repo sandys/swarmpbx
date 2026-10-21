@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RustRTC Multi-DataChannel Stress Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+        }
+
+        #status {
+            margin-bottom: 20px;
+        }
+
+        #log {
+            white-space: pre-wrap;
+            background: #f0f0f0;
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Multi-DataChannel Stress Test (2 Channels)</h1>
+    <div style="margin-bottom: 10px;">
+        <label><input type="checkbox" id="usePingPong" checked> Enable Ping-Pong Handshake</label>
+        <label><input type="checkbox" id="multiChannel" checked> Enable Multi-Channel</label>
+        <label style="margin-left: 20px;">Chunk Count <input type="text" id="chunkCount" value="256"></label>
+        <label style="margin-left: 20px;">Chunk Size <input type="text" id="chunkSize" value="62208"></label>
+        <label style="margin-left: 20px;">Backend:
+            <select id="backend">
+                <option value="rustrtc">rustrtc</option>
+                <option value="webrtc-rs">webrtc-rs</option>
+            </select>
+        </label>
+    </div>
+    <div id="status">Status: Ready</div>
+    <button id="startBtn" onclick="startTest()">Start Test</button>
+    <div id="stats1">
+        Channel 1: Received: <span id="bytesReceived1">0</span> / <span id="bytesExpected1">0</span> bytes
+        (<span id="percent1">0</span>%)
+    </div>
+    <div id="stats2">
+        Channel 2: Received: <span id="bytesReceived2">0</span> / <span id="bytesExpected2">0</span> bytes
+        (<span id="percent2">0</span>%)
+    </div>
+    <div id="log"></div>
+
+    <script>
+
+        let pc;
+        let dc1, dc2;
+        let bytesReceived1 = 0;
+        let bytesReceived2 = 0;
+        let startTime1, startTime2;
+        let finished1 = false;
+        let finished2 = false;
+
+        function log(msg) {
+            const logDiv = document.getElementById('log');
+            logDiv.innerText += msg + '\n';
+            console.log(msg);
+        }
+
+        function updateStatus(status) {
+            document.getElementById('status').innerText = 'Status: ' + status;
+        }
+
+        function setupDataChannel(dc, id) {
+            let bytesReceived = 0;
+            let totalExpected = parseInt(document.getElementById('chunkCount').value) * parseInt(document.getElementById('chunkSize').value);
+            let startTime;
+            const usePingPong = document.getElementById('usePingPong').checked;
+
+            document.getElementById(`bytesExpected${id}`).innerText = totalExpected;
+            document.getElementById(`bytesReceived${id}`).innerText = '0';
+            document.getElementById(`percent${id}`).innerText = '0';
+
+            dc.binaryType = 'arraybuffer';
+            dc.onopen = () => {
+                log(`DataChannel ${id} open`);
+                if (usePingPong) {
+                    log(`Sending ping on DC ${id}...`);
+                    dc.send(new TextEncoder().encode('ping'));
+                } else {
+                    startTime = performance.now();
+                    if (id === 1) startTime1 = startTime;
+                    else startTime2 = startTime;
+                }
+            };
+
+            dc.onmessage = (event) => {
+                const data = new Uint8Array(event.data);
+
+                // Check for pong
+                if (usePingPong && data.length === 4 && new TextDecoder().decode(data) === 'pong') {
+                    log(`Received pong on DC ${id}! Starting measurement...`);
+                    startTime = performance.now();
+                    if (id === 1) startTime1 = startTime;
+                    else startTime2 = startTime;
+                    return;
+                }
+
+                bytesReceived += data.length;
+                if (id === 1) bytesReceived1 = bytesReceived;
+                else bytesReceived2 = bytesReceived;
+
+                document.getElementById(`bytesReceived${id}`).innerText = bytesReceived;
+                const percent = (bytesReceived / totalExpected * 100).toFixed(1);
+                document.getElementById(`percent${id}`).innerText = percent;
+
+                if (bytesReceived >= totalExpected) {
+                    const duration = (performance.now() - startTime) / 1000;
+                    const speed = (bytesReceived / 1024 / 1024 / duration).toFixed(2);
+                    log(`Channel ${id} Complete! Received ${bytesReceived} bytes in ${duration.toFixed(2)}s (${speed} MB/s)`);
+
+                    if (id === 1) finished1 = true;
+                    else finished2 = true;
+
+                    if (finished1 && finished2) {
+                        updateStatus('All Completed');
+                        pc.close();
+                        document.getElementById('startBtn').disabled = false;
+                    }
+                }
+            };
+        }
+
+        async function startTest() {
+            let chunkCount = parseInt(document.getElementById('chunkCount').value);
+            let chunkSize = parseInt(document.getElementById('chunkSize').value);
+
+            document.getElementById('startBtn').disabled = true;
+            finished1 = false;
+            finished2 = false;
+            document.getElementById('log').innerText = '';
+
+            updateStatus('Creating PeerConnection...');
+
+            pc = new RTCPeerConnection({
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+            });
+
+            pc.oniceconnectionstatechange = () => {
+                log(`ICE Connection State: ${pc.iceConnectionState}`);
+            };
+
+            // Create DataChannels
+            dc1 = pc.createDataChannel('stress-test-1');
+            setupDataChannel(dc1, 1);
+
+            if (document.getElementById('multiChannel').checked) {
+                dc2 = pc.createDataChannel('stress-test-2');
+                setupDataChannel(dc2, 2);
+            } else {
+                finished2 = true;
+                dc2 = null;
+            }
+
+            // Create Offer
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            // Wait for ICE gathering to complete
+            await new Promise(resolve => {
+                if (pc.iceGatheringState === 'complete') {
+                    resolve();
+                } else {
+                    const checkState = () => {
+                        if (pc.iceGatheringState === 'complete') {
+                            pc.removeEventListener('icegatheringstatechange', checkState);
+                            resolve();
+                        }
+                    };
+                    pc.addEventListener('icegatheringstatechange', checkState);
+                }
+            });
+
+            const offerSdp = pc.localDescription.sdp;
+            const usePingPong = document.getElementById('usePingPong').checked;
+            const backend = document.getElementById('backend').value;
+            log('Sending Offer...');
+
+            // Send to server
+            const response = await fetch('/offer', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    sdp: offerSdp,
+                    ping_pong: usePingPong,
+                    chunk_count: chunkCount,
+                    chunk_size: chunkSize,
+                    backend: backend
+                })
+            });
+
+            const answerData = await response.json();
+            log('Received Answer');
+
+            await pc.setRemoteDescription(new RTCSessionDescription({
+                type: 'answer',
+                sdp: answerData.sdp
+            }));
+        }
+    </script>
+</body>
+
+</html>

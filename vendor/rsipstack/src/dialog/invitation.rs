@@ -1,0 +1,868 @@
+use super::{
+    authenticate::Credential,
+    dialog::{DialogInner, DialogStateSender},
+    dialog_layer::DialogLayer,
+    invite_dialog::InviteDialog,
+};
+use crate::prelude::*;
+use crate::sip::{
+    prelude::{HeadersExt, ToTypedHeader},
+    uri::ParamsExt,
+    Request, Response, SipMessage, StatusCodeKind,
+};
+use crate::{
+    dialog::{
+        dialog::{Dialog, DialogState, TerminatedReason},
+        dialog_layer::DialogLayerInnerRef,
+        DialogId,
+    },
+    transaction::{
+        key::{TransactionKey, TransactionRole},
+        make_tag,
+        transaction::Transaction,
+    },
+    transport::SipAddr,
+    Result,
+};
+use futures::FutureExt;
+use tracing::{debug, info, warn};
+
+/// INVITE Request Options
+///
+/// `InviteOption` contains all the parameters needed to create and send
+/// an INVITE request to establish a SIP session. This structure provides
+/// a convenient way to specify all the necessary information for initiating
+/// a call or session.
+///
+/// # Fields
+///
+/// * `caller` - URI of the calling party (From header)
+/// * `callee` - URI of the called party (To header and Request-URI)
+/// * `content_type` - MIME type of the message body (default: "application/sdp")
+/// * `offer` - Optional message body (typically SDP offer)
+/// * `contact` - Contact URI for this user agent
+/// * `credential` - Optional authentication credentials
+/// * `headers` - Optional additional headers to include
+///
+/// # Examples
+///
+/// ## Basic Voice Call
+///
+/// ```rust,no_run
+/// # use rsipstack::dialog::invitation::InviteOption;
+/// # fn example() -> rsipstack::Result<()> {
+/// # let sdp_offer_bytes = vec![];
+/// let invite_option = InviteOption {
+///     caller: "sip:alice@example.com".try_into()?,
+///     callee: "sip:bob@example.com".try_into()?,
+///     content_type: Some("application/sdp".to_string()),
+///     offer: Some(sdp_offer_bytes),
+///     contact: "sip:alice@192.168.1.100:5060".try_into()?,
+///     ..Default::default()
+/// };
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ```rust,no_run
+/// # use rsipstack::dialog::dialog_layer::DialogLayer;
+/// # use rsipstack::dialog::invitation::InviteOption;
+/// # fn example() -> rsipstack::Result<()> {
+/// # let dialog_layer: DialogLayer = todo!();
+/// # let invite_option: InviteOption = todo!();
+/// let request = dialog_layer.make_invite_request(&invite_option)?;
+/// println!("Created INVITE to: {}", request.uri);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Call with Custom Headers
+///
+/// ```rust,no_run
+/// # use rsipstack::dialog::invitation::InviteOption;
+/// # fn example() -> rsipstack::Result<()> {
+/// # let sdp_bytes = vec![];
+/// # let auth_credential = todo!();
+/// let custom_headers = vec![
+///     rsipstack::sip::Header::UserAgent("MyApp/1.0".into()),
+///     rsipstack::sip::Header::Subject("Important Call".into()),
+/// ];
+///
+/// let invite_option = InviteOption {
+///     caller: "sip:alice@example.com".try_into()?,
+///     callee: "sip:bob@example.com".try_into()?,
+///     content_type: Some("application/sdp".to_string()),
+///     offer: Some(sdp_bytes),
+///     contact: "sip:alice@192.168.1.100:5060".try_into()?,
+///     credential: Some(auth_credential),
+///     headers: Some(custom_headers),
+///     ..Default::default()
+/// };
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Call with Authentication
+///
+/// ```rust,no_run
+/// # use rsipstack::dialog::invitation::InviteOption;
+/// # use rsipstack::dialog::authenticate::Credential;
+/// # fn example() -> rsipstack::Result<()> {
+/// # let sdp_bytes = vec![];
+/// let credential = Credential {
+///     username: "alice".to_string(),
+///     password: "secret123".to_string(),
+///     realm: Some("example.com".to_string()),
+///     auth_username: None,
+/// };
+///
+/// let invite_option = InviteOption {
+///     caller: "sip:alice@example.com".try_into()?,
+///     callee: "sip:bob@example.com".try_into()?,
+///     offer: Some(sdp_bytes),
+///     contact: "sip:alice@192.168.1.100:5060".try_into()?,
+///     credential: Some(credential),
+///     ..Default::default()
+/// };
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default, Clone)]
+pub struct InviteOption {
+    pub caller_display_name: Option<String>,
+    pub caller_params: Vec<crate::sip::uri::Param>,
+    pub caller: crate::sip::Uri,
+    pub callee: crate::sip::Uri,
+    pub destination: Option<SipAddr>,
+    pub content_type: Option<String>,
+    pub offer: Option<Vec<u8>>,
+    pub contact: crate::sip::Uri,
+    pub credential: Option<Credential>,
+    pub headers: Option<Vec<crate::sip::Header>>,
+    pub support_prack: bool,
+    pub call_id: Option<String>,
+    /// RFC 7989: local Session-ID UUID for this call (32 hex chars; dashed
+    /// RFC 4122 input is normalized). When `None` no Session-ID header is
+    /// generated. Reuse the same value on transferred calls (REFER/Replaces)
+    /// to keep the session identifiable across dialogs.
+    pub session_id: Option<String>,
+    /// RFC 3608: preloaded route set for this out-of-dialog request. Each entry
+    /// is emitted as a `Route` header, in order, ahead of the caller-supplied
+    /// headers. Typically obtained from
+    /// [`Registration::preloaded_route_set`](crate::dialog::registration::Registration::preloaded_route_set)
+    /// so the request follows the path an IMS S-CSCF advertised at
+    /// registration. Empty by default, leaving existing behaviour unchanged.
+    pub route_set: Vec<crate::sip::typed::Route>,
+}
+
+pub struct DialogGuard {
+    pub dialog_layer_inner: DialogLayerInnerRef,
+    pub id: DialogId,
+}
+
+impl DialogGuard {
+    pub fn new(dialog_layer: &Arc<DialogLayer>, id: DialogId) -> Self {
+        Self {
+            dialog_layer_inner: dialog_layer.inner.clone(),
+            id,
+        }
+    }
+}
+
+impl Drop for DialogGuard {
+    fn drop(&mut self) {
+        let dlg = match self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) {
+            Some(dlg) => dlg,
+            None => return,
+        };
+        let _handle = crate::platform::spawn(async move {
+            if let Err(e) = dlg.hangup().await {
+                info!(id = %dlg.id(), error = %e, "failed to hangup dialog");
+            }
+        });
+    }
+}
+
+pub(super) struct DialogGuardForUnconfirmed {
+    pub dialog_layer_inner: DialogLayerInnerRef,
+    pub id: DialogId,
+    invite_tx: Option<Transaction>,
+    /// Whether the owning future started processing the INVITE.
+    started: bool,
+    /// The INVITE's dialog, `None` once `process_invite` returned.
+    dialog: Option<InviteDialog>,
+}
+
+impl Drop for DialogGuardForUnconfirmed {
+    fn drop(&mut self) {
+        let client_dialog = match self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) {
+            Some(Dialog::Invite(client_dialog)) => client_dialog,
+            Some(_) => return,
+            // The application already removed the dialog from the layer
+            // (`DialogLayer::remove_dialog`): its INVITE still has to end.
+            None => match self.dialog.take() {
+                Some(client_dialog) => client_dialog,
+                // `process_invite` returned: `do_invite` handles the outcome.
+                None => return,
+            },
+        };
+
+        // A task dropped before its first poll never sent an INVITE.
+        if !self.started {
+            client_dialog.inner.transition(DialogState::Terminated(
+                client_dialog.id(),
+                TerminatedReason::UacCancel,
+            ));
+            return;
+        }
+
+        match client_dialog.state() {
+            DialogState::Terminated(_, _) => {}
+            state @ (DialogState::Calling(_)
+            | DialogState::Trying(_)
+            | DialogState::Early(_, _)) => {
+                // CANCEL cannot be sent before a provisional response (RFC 3261
+                // §9.1): a Calling dialog ends now, its INVITE is CANCELed once
+                // a provisional arrives.
+                let calling = matches!(state, DialogState::Calling(_));
+                let invite_tx = self.invite_tx.take();
+                if calling || invite_tx.is_none() {
+                    client_dialog.inner.transition(DialogState::Terminated(
+                        client_dialog.id(),
+                        TerminatedReason::UacCancel,
+                    ));
+                }
+                let Some(mut invite_tx) = invite_tx else {
+                    return;
+                };
+
+                debug!(%self.id, "unconfirmed dialog dropped, cancelling it");
+                let _handle = crate::platform::spawn(async move {
+                    if calling {
+                        invite_tx.stop_retransmissions();
+                        let window = invite_tx.endpoint_inner.option.t1x64;
+                        let first = wait_response(&mut invite_tx, window, false).await;
+                        if !first
+                            .as_ref()
+                            .is_some_and(|r| r.status_code.kind() == StatusCodeKind::Provisional)
+                        {
+                            drop(invite_tx);
+                            bye_if_2xx(&client_dialog, first).await;
+                            return;
+                        }
+                    }
+                    let final_window = invite_tx.endpoint_inner.option.t1x64;
+                    invite_tx.stop_retransmissions();
+
+                    // CANCEL is a separate transaction. Keep driving it to its
+                    // own response or timeout even if the INVITE finishes first.
+                    let cancel_dialog = client_dialog.clone();
+                    let _handle = crate::platform::spawn(async move {
+                        if let Err(e) = cancel_dialog.send_cancel().await {
+                            warn!(id = %cancel_dialog.id(), error = %e, "dialog cancel failed");
+                        }
+                    });
+                    if !calling {
+                        client_dialog.inner.transition(DialogState::Terminated(
+                            client_dialog.id(),
+                            TerminatedReason::UacCancel,
+                        ));
+                        debug!(id = %client_dialog.id(), "dialog terminated");
+                    }
+
+                    // The callee may still answer after the CANCEL: keep the
+                    // INVITE transaction until its final response (up to
+                    // 64*T1) so a 2xx is ACKed, then end that session with a
+                    // BYE (RFC 3261 §9.1, §15).
+                    let final_response = wait_response(&mut invite_tx, final_window, true).await;
+                    // Closing the command channel terminates the dialog loop.
+                    drop(invite_tx);
+                    bye_if_2xx(&client_dialog, final_response).await;
+                });
+            }
+            DialogState::Confirmed(_, _) => {
+                let _handle = crate::platform::spawn(async move {
+                    if let Err(e) = client_dialog.hangup().await {
+                        info!(id = %client_dialog.id(), error = %e, "failed to hangup confirmed dialog");
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Wait up to `limit` for the INVITE transaction's first response, or its
+/// first final one.
+async fn wait_response(
+    invite_tx: &mut Transaction,
+    limit: core::time::Duration,
+    final_only: bool,
+) -> Option<Response> {
+    let wait = async {
+        while let Some(msg) = invite_tx.receive().await {
+            if let SipMessage::Response(resp) = msg {
+                if !final_only || resp.status_code.kind() != StatusCodeKind::Provisional {
+                    return Some(resp);
+                }
+            }
+        }
+        None
+    };
+    crate::platform::timeout(limit, wait).await.ok().flatten()
+}
+
+/// End the session a 2xx to an abandoned INVITE established.
+pub(super) async fn bye_if_2xx(client_dialog: &InviteDialog, resp: Option<Response>) {
+    if let Some(resp) = resp.filter(|r| r.status_code.kind() == StatusCodeKind::Successful) {
+        info!(id = %client_dialog.id(), "2xx after CANCEL, sending BYE");
+        if let Err(e) = client_dialog.bye_2xx_after_cancel(&resp).await {
+            warn!(id = %client_dialog.id(), error = %e, "BYE after CANCEL failed");
+        }
+    }
+}
+
+pub type InviteAsyncResult = Result<(DialogId, Option<Response>)>;
+
+impl DialogLayer {
+    /// Create an INVITE request from options
+    ///
+    /// Constructs a properly formatted SIP INVITE request based on the
+    /// provided options. This method handles all the required headers
+    /// and parameters according to RFC 3261.
+    ///
+    /// # Parameters
+    ///
+    /// * `opt` - INVITE options containing all necessary parameters
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Request)` - Properly formatted INVITE request
+    /// * `Err(Error)` - Failed to create request
+    ///
+    /// # Generated Headers
+    ///
+    /// The method automatically generates:
+    /// * Via header with branch parameter
+    /// * From header with tag parameter
+    /// * To header (without tag for initial request)
+    /// * Contact header
+    /// * Content-Type header
+    /// * CSeq header with incremented sequence number
+    /// * Call-ID header
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::dialog_layer::DialogLayer;
+    /// # use rsipstack::dialog::invitation::InviteOption;
+    /// # fn example() -> rsipstack::Result<()> {
+    /// # let dialog_layer: DialogLayer = todo!();
+    /// # let invite_option: InviteOption = todo!();
+    /// let request = dialog_layer.make_invite_request(&invite_option)?;
+    /// println!("Created INVITE to: {}", request.uri);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn make_invite_request(&self, opt: &InviteOption) -> Result<Request> {
+        let last_seq = self.increment_last_seq();
+        let to = crate::sip::typed::To {
+            display_name: None,
+            uri: opt.callee.clone(),
+            params: vec![],
+        };
+        let recipient = to.uri.clone();
+
+        let from = crate::sip::typed::From {
+            display_name: opt.caller_display_name.clone(),
+            uri: opt.caller.clone(),
+            params: opt.caller_params.clone(),
+        }
+        .with_tag(make_tag());
+
+        let call_id = opt
+            .call_id
+            .as_ref()
+            .map(|id| crate::sip::headers::CallId::from(id.clone()));
+
+        let target_transport = opt
+            .destination
+            .as_ref()
+            .and_then(|d| d.r#type)
+            .or_else(|| opt.callee.transport().cloned())
+            .filter(|t| *t != crate::sip::Transport::Udp);
+
+        let transport_addr = target_transport.and_then(|transport| {
+            self.endpoint
+                .transport_layer
+                .get_addrs()
+                .iter()
+                .find(|a| a.r#type == Some(transport))
+                .cloned()
+        });
+
+        let via = self.endpoint.get_via(transport_addr.clone(), None)?;
+        let mut request = self.endpoint.make_request(
+            crate::sip::Method::Invite,
+            recipient,
+            via,
+            from,
+            to,
+            last_seq,
+            call_id,
+        );
+
+        // RFC 3608: preload the Service-Route set learned at registration as
+        // Route headers, in order, so this out-of-dialog request traverses the
+        // proxies the registrar (e.g. an IMS S-CSCF) requires. Plain push, not
+        // unique_push, because a route set legitimately has several Route
+        // headers.
+        for route in &opt.route_set {
+            request.headers.push(route.clone().into());
+        }
+
+        let contact = if let Some(ref addr) = transport_addr {
+            let mut uri = opt.contact.clone();
+            uri.host_with_port = addr.addr.clone();
+            if !uri
+                .params
+                .iter()
+                .any(|p| matches!(p, crate::sip::Param::Transport(_)))
+            {
+                uri.params.push(crate::sip::Param::Transport(
+                    addr.r#type.unwrap_or(crate::sip::Transport::Tcp),
+                ));
+            }
+            if addr.r#type == Some(crate::sip::Transport::Tls) {
+                uri.scheme = Some(crate::sip::Scheme::Sips);
+            }
+            crate::sip::typed::Contact {
+                display_name: None,
+                uri,
+                params: vec![],
+            }
+        } else {
+            crate::sip::typed::Contact {
+                display_name: None,
+                uri: opt.contact.clone(),
+                params: vec![],
+            }
+        };
+
+        request
+            .headers
+            .unique_push(crate::sip::Header::Contact(contact.into()));
+
+        request.headers.unique_push(crate::sip::Header::ContentType(
+            opt.content_type
+                .clone()
+                .unwrap_or("application/sdp".to_string())
+                .into(),
+        ));
+
+        if opt.support_prack {
+            request
+                .headers
+                .unique_push(crate::sip::Header::Supported("100rel".into()));
+        }
+
+        // RFC 7044 §6.1: advertise histinfo so peers include History-Info in
+        // responses. Plain push — multiple Supported header lines are legal.
+        // The request's own headers and the caller-supplied ones (appended
+        // below) are both checked to avoid duplicates.
+        if self.endpoint.option.history_info_enabled {
+            let already = request
+                .headers
+                .iter()
+                .chain(opt.headers.iter().flatten())
+                .any(|h| {
+                    matches!(h, crate::sip::Header::Supported(s)
+                        if s.value().split(',').any(|t| t.trim().eq_ignore_ascii_case("histinfo")))
+                });
+            if !already {
+                request
+                    .headers
+                    .push(crate::sip::Header::Supported("histinfo".into()));
+            }
+        }
+
+        // RFC 7989: only include Session-ID when the application opted in;
+        // initial requests carry `<local>;remote=<nil>`.
+        if let Some(raw) = opt.session_id.as_deref() {
+            let uuid = crate::sip::headers::SessionId::normalize(raw)?;
+            request
+                .headers
+                .unique_push(crate::sip::headers::SessionId::from_local(&uuid)?.into());
+        }
+        // can't override default headers
+        if let Some(headers) = opt.headers.as_ref() {
+            for header in headers {
+                // only override if it is a "max-forwards" header
+                // so as not to duplicate it; this is important because
+                // some clients consider messages with duplicate "max-forwards"
+                // headers as malformed and may silently ignore invites
+                match header {
+                    crate::sip::Header::MaxForwards(_) => {
+                        request.headers.unique_push(header.clone())
+                    }
+                    _ => request.headers.push(header.clone()),
+                }
+            }
+        }
+        Ok(request)
+    }
+
+    /// Send an INVITE request and create a client dialog
+    ///
+    /// This is the main method for initiating outbound calls. It creates
+    /// an INVITE request, sends it, and manages the resulting dialog.
+    /// The method handles the complete INVITE transaction including
+    /// authentication challenges and response processing.
+    ///
+    /// # Parameters
+    ///
+    /// * `opt` - INVITE options containing all call parameters
+    /// * `state_sender` - Channel for receiving dialog state updates
+    ///
+    /// # Returns
+    ///
+    /// * `Ok((InviteDialog, Option<Response>))` - Created dialog and final response
+    /// * `Err(Error)` - Failed to send INVITE or process responses
+    ///
+    /// # Call Flow
+    ///
+    /// 1. Creates INVITE request from options
+    /// 2. Creates client dialog and transaction
+    /// 3. Sends INVITE request
+    /// 4. Processes responses (1xx, 2xx, 3xx-6xx)
+    /// 5. Handles authentication challenges if needed
+    /// 6. Returns established dialog and final response
+    ///
+    /// # Examples
+    ///
+    /// ## Basic Call Setup
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::dialog_layer::DialogLayer;
+    /// # use rsipstack::dialog::invitation::InviteOption;
+    /// # async fn example() -> rsipstack::Result<()> {
+    /// # let dialog_layer: DialogLayer = todo!();
+    /// # let invite_option: InviteOption = todo!();
+    /// # let state_sender = todo!();
+    /// let (dialog, response) = dialog_layer.do_invite(invite_option, state_sender).await?;
+    ///
+    /// if let Some(resp) = response {
+    ///     match resp.status_code {
+    ///         rsipstack::sip::StatusCode::OK => {
+    ///             println!("Call answered!");
+    ///             // Process SDP answer in resp.body
+    ///         },
+    ///         rsipstack::sip::StatusCode::BusyHere => {
+    ///             println!("Called party is busy");
+    ///         },
+    ///         _ => {
+    ///             println!("Call failed: {}", resp.status_code);
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Monitoring Dialog State
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::dialog_layer::DialogLayer;
+    /// # use rsipstack::dialog::invitation::InviteOption;
+    /// # use rsipstack::dialog::dialog::DialogState;
+    /// # async fn example() -> rsipstack::Result<()> {
+    /// # let dialog_layer: DialogLayer = todo!();
+    /// # let invite_option: InviteOption = todo!();
+    /// let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
+    /// let (dialog, response) = dialog_layer.do_invite(invite_option, state_tx).await?;
+    ///
+    /// // Monitor dialog state changes
+    /// tokio::spawn(async move {
+    ///     while let Some(state) = state_rx.recv().await {
+    ///         match state {
+    ///             DialogState::Early(_, resp) => {
+    ///                 println!("Ringing: {}", resp.status_code);
+    ///             },
+    ///             DialogState::Confirmed(_,_) => {
+    ///                 println!("Call established");
+    ///             },
+    ///             DialogState::Terminated(_, code) => {
+    ///                 println!("Call ended: {:?}", code);
+    ///                 break;
+    ///             },
+    ///             _ => {}
+    ///         }
+    ///     }
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Error Handling
+    ///
+    /// The method can fail for various reasons:
+    /// * Network connectivity issues
+    /// * Authentication failures
+    /// * Invalid SIP URIs or headers
+    /// * Transaction timeouts
+    /// * Protocol violations
+    ///
+    /// # Important: Cleanup Required
+    ///
+    /// When a 2xx response is received, the confirmed dialog is registered in
+    /// the internal dialog registry (not when [`InviteDialog::cancel`] was
+    /// called: that 2xx is ended with a BYE). **The caller is responsible for removing it**
+    /// after the dialog terminates by calling [`DialogLayer::remove_dialog`]
+    /// with the dialog's [`DialogId`].
+    ///
+    /// The recommended pattern is to listen for
+    /// [`DialogState::Terminated`](crate::dialog::dialog::DialogState::Terminated)
+    /// on the `state_sender` channel and call `remove_dialog` when received.
+    /// See the "Monitoring Dialog State" example above.
+    ///
+    /// Failure to call `remove_dialog` will cause the dialog to remain in the
+    /// registry indefinitely, resulting in a memory leak.
+    ///
+    /// # Authentication
+    ///
+    /// If credentials are provided in the options, the method will
+    /// automatically handle 401/407 authentication challenges by
+    /// resending the request with proper authentication headers.
+    pub async fn do_invite(
+        &self,
+        opt: InviteOption,
+        state_sender: DialogStateSender,
+    ) -> Result<(InviteDialog, Option<Response>)> {
+        let (dialog, tx) = self.create_client_invite_dialog(opt, state_sender)?;
+        let id = dialog.id();
+
+        self.inner
+            .dialogs
+            .insert(id.to_string(), Dialog::Invite(dialog.clone()));
+
+        let mut guard = DialogGuardForUnconfirmed {
+            dialog_layer_inner: self.inner.clone(),
+            id: id.clone(),
+            invite_tx: Some(tx),
+            started: true,
+            dialog: Some(dialog.clone()),
+        };
+
+        let tx = guard
+            .invite_tx
+            .as_mut()
+            .expect("transcation should be avaible");
+
+        let r = dialog.process_invite(tx).boxed().await;
+        guard.dialog = None;
+        self.inner.dialogs.remove(&id.to_string());
+
+        match r {
+            Ok((new_dialog_id, resp)) => {
+                match resp {
+                    Some(ref r)
+                        if r.status_code.kind() == crate::sip::StatusCodeKind::Successful =>
+                    {
+                        // A cancelled INVITE's 2xx was BYE'd: nothing to register.
+                        if !dialog.inner.is_terminated() {
+                            debug!(
+                                "client invite dialog confirmed: {} => {}",
+                                id, new_dialog_id
+                            );
+                            self.inner
+                                .dialogs
+                                .insert(new_dialog_id.to_string(), Dialog::Invite(dialog.clone()));
+                        }
+
+                        // RFC 6026 §7.2: the client transaction is in Accepted
+                        // with Timer M (64*T1) armed. Keep receiving until it
+                        // ends so retransmitted 2xx keep being re-ACKed and
+                        // forked 2xx are observed; abandoning the transaction
+                        // here would leave it (and its timers) in the
+                        // endpoint's table and silently stop the re-ACKs.
+                        if let Some(mut tx) = guard.invite_tx.take() {
+                            let dlg = dialog.clone();
+                            let confirmed_tag = new_dialog_id.remote_tag.clone();
+                            crate::platform::spawn(async move {
+                                let mut seen_forks: Vec<String> = Vec::new();
+                                while let Some(msg) = tx.receive().await {
+                                    dlg.end_forked_branch(&msg, &confirmed_tag, &mut seen_forks)
+                                        .await;
+                                }
+                                debug!(id = %new_dialog_id, "accepted transaction drained (Timer M expired)");
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                Ok((dialog, resp))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Asynchronously executes an INVITE transaction in the background.
+    ///
+    /// Registers the dialog under an early dialog ID while the INVITE is in progress.
+    /// Once completed, the early entry is removed and, on 2xx response,
+    /// the dialog is re-registered under the confirmed dialog ID.
+    /// Returns a JoinHandle resolving to the final dialog ID and response.
+    ///
+    /// # Important: Cleanup Required
+    ///
+    /// On a successful (2xx) response the confirmed dialog is registered in
+    /// the internal dialog registry (not when [`InviteDialog::cancel`] was
+    /// called: that 2xx is ended with a BYE). **The caller must remove it** after the
+    /// dialog terminates by calling [`DialogLayer::remove_dialog`] with the
+    /// confirmed dialog's [`DialogId`].
+    ///
+    /// Listen for
+    /// [`DialogState::Terminated`](crate::dialog::dialog::DialogState::Terminated)
+    /// on the `state_sender` channel and call `remove_dialog` when received.
+    /// Failure to do so will keep the dialog in the registry and cause a
+    /// memory leak.
+    pub fn do_invite_async(
+        self: &Arc<Self>,
+        opt: InviteOption,
+        state_sender: DialogStateSender,
+    ) -> Result<(InviteDialog, crate::platform::JoinHandle<InviteAsyncResult>)> {
+        let (dialog, tx) = self.create_client_invite_dialog(opt, state_sender)?;
+        let id0 = dialog.id();
+
+        // 1) register early key (so in-dialog requests can be matched)
+        self.inner
+            .dialogs
+            .insert(id0.to_string(), Dialog::Invite(dialog.clone()));
+
+        let inner = self.inner.clone();
+        let dialog_clone = dialog.clone();
+
+        // Own the guard before spawning so an abort before the first poll
+        // also removes the early registry entry.
+        let mut guard = DialogGuardForUnconfirmed {
+            dialog_layer_inner: inner.clone(),
+            id: id0.clone(),
+            invite_tx: Some(tx),
+            started: false,
+            dialog: Some(dialog_clone.clone()),
+        };
+
+        // 2) run invite in background, keep registry updated like do_invite()
+        let handle = crate::platform::spawn_with_result(async move {
+            guard.started = true;
+            let invite_tx = guard
+                .invite_tx
+                .as_mut()
+                .expect("transaction should be available");
+            let r = dialog_clone.process_invite(invite_tx).boxed().await;
+            guard.dialog = None;
+            let mut tx = guard
+                .invite_tx
+                .take()
+                .expect("transaction should be available");
+
+            // remove early key
+            inner.dialogs.remove(&id0.to_string());
+
+            match &r {
+                Ok((new_id, resp_opt)) => {
+                    let is_2xx = resp_opt
+                        .as_ref()
+                        .map(|resp| {
+                            resp.status_code.kind() == crate::sip::StatusCodeKind::Successful
+                        })
+                        .unwrap_or(false);
+
+                    if is_2xx {
+                        // A cancelled INVITE's 2xx was BYE'd: nothing to register.
+                        if !dialog_clone.inner.is_terminated() {
+                            debug!("client invite dialog confirmed: {} => {}", id0, new_id);
+                            inner
+                                .dialogs
+                                .insert(new_id.to_string(), Dialog::Invite(dialog_clone.clone()));
+                        }
+
+                        // RFC 6026 §7.2: keep draining the Accepted transaction
+                        // until Timer M ends it (re-ACKs retransmitted 2xx,
+                        // observes forked 2xx, and detaches it from the
+                        // endpoint's table). See do_invite for the rationale.
+                        let confirmed_id = new_id.clone();
+                        let confirmed_tag = new_id.remote_tag.clone();
+                        let forked_dlg = dialog_clone.clone();
+                        crate::platform::spawn(async move {
+                            let mut seen_forks: Vec<String> = Vec::new();
+                            while let Some(msg) = tx.receive().await {
+                                forked_dlg
+                                    .end_forked_branch(&msg, &confirmed_tag, &mut seen_forks)
+                                    .await;
+                            }
+                            debug!(id = %confirmed_id, "accepted transaction drained (Timer M expired)");
+                        });
+                    }
+                }
+                Err(e) => debug!(%id0, error = %e, "async invite failed"),
+            }
+
+            r
+        });
+
+        Ok((dialog, handle))
+    }
+
+    pub fn create_client_invite_dialog(
+        &self,
+        opt: InviteOption,
+        state_sender: DialogStateSender,
+    ) -> Result<(InviteDialog, Transaction)> {
+        let mut request = self.make_invite_request(&opt)?;
+        request.body = opt.offer.unwrap_or_default();
+        request
+            .headers
+            .unique_push(crate::sip::Header::ContentLength(
+                (request.body.len() as u32).into(),
+            ));
+        let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
+        let mut tx = Transaction::new_client(key, request.clone(), self.endpoint.clone(), None);
+
+        if opt.destination.is_some() {
+            tx.destination = opt.destination;
+        } else {
+            if let Some(route) = tx.original.route_header() {
+                if let Ok(first_route) = route.typed() {
+                    tx.destination = SipAddr::try_from(&first_route.uri).ok();
+                }
+            }
+        }
+
+        let id = DialogId::try_from(&tx)?;
+
+        let local_contact = request
+            .contact_header()
+            .ok()
+            .and_then(|c| c.typed().ok().map(|ct| ct.uri))
+            .or(Some(opt.contact));
+
+        let dlg_inner = DialogInner::new(
+            TransactionRole::Client,
+            id.clone(),
+            request.clone(),
+            self.endpoint.clone(),
+            state_sender,
+            opt.credential,
+            local_contact,
+            tx.tu_sender.clone(),
+        )?;
+
+        if let Some(destination) = &tx.destination {
+            let uri = destination.clone().into();
+            *dlg_inner.remote_uri.lock() = uri;
+        }
+        let dialog = InviteDialog::from_inner(Arc::new(dlg_inner));
+        Ok((dialog, tx))
+    }
+}

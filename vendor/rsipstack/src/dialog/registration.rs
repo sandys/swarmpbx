@@ -1,0 +1,996 @@
+use super::{
+    authenticate::{handle_client_authenticate, Credential},
+    DialogId,
+};
+use crate::prelude::*;
+use crate::sip::prelude::HeadersExt;
+use crate::sip::{Header, Param, Response, SipMessage, StatusCode};
+use crate::{
+    transaction::{
+        endpoint::EndpointInnerRef,
+        key::{TransactionKey, TransactionRole},
+        make_call_id, make_tag,
+        transaction::Transaction,
+    },
+    transport::{SipAddr, SipConnection},
+    Result,
+};
+use tracing::debug;
+
+/// SIP Registration Client
+///
+/// `Registration` provides functionality for SIP user agent registration
+/// with a SIP registrar server. Registration is the process by which a
+/// SIP user agent informs a registrar server of its current location
+/// and availability for receiving calls.
+///
+/// # Key Features
+///
+/// * **User Registration** - Registers user agent with SIP registrar
+/// * **Authentication Support** - Handles digest authentication challenges
+/// * **Contact Management** - Manages contact URI and expiration
+/// * **DNS Resolution** - Resolves registrar server addresses
+/// * **Automatic Retry** - Handles authentication challenges automatically
+///
+/// # Registration Process
+///
+/// 1. **DNS Resolution** - Resolves registrar server address
+/// 2. **REGISTER Request** - Sends initial REGISTER request
+/// 3. **Authentication** - Handles 401/407 challenges if needed
+/// 4. **Confirmation** - Receives 200 OK with registration details
+/// 5. **Refresh** - Periodically refreshes registration before expiration
+///
+/// # Examples
+///
+/// ## Basic Registration
+///
+/// ```rust,no_run
+/// # use rsipstack::dialog::registration::Registration;
+/// # use rsipstack::dialog::authenticate::Credential;
+/// # use rsipstack::transaction::endpoint::Endpoint;
+/// # async fn example() -> rsipstack::Result<()> {
+/// # let endpoint: Endpoint = todo!();
+/// let credential = Credential {
+///     username: "alice".to_string(),
+///     password: "secret123".to_string(),
+///     realm: Some("example.com".to_string()),
+///     auth_username: None,
+/// };
+///
+/// let mut registration = Registration::new(endpoint.inner.clone(), Some(credential));
+/// let server = rsipstack::sip::Uri::try_from("sip:sip.example.com").unwrap();
+/// let response = registration.register(server.clone(), None).await?;
+///
+/// if response.status_code == rsipstack::sip::StatusCode::OK {
+///     println!("Registration successful");
+///     println!("Expires in: {} seconds", registration.expires());
+/// }
+/// # Ok(())
+/// }
+/// ```
+///
+/// ## Registration Loop
+///
+/// ```rust,no_run
+/// # use rsipstack::dialog::registration::Registration;
+/// # use rsipstack::dialog::authenticate::Credential;
+/// # use rsipstack::transaction::endpoint::Endpoint;
+/// # use core::time::Duration;
+/// # async fn example() -> rsipstack::Result<()> {
+/// # let endpoint: Endpoint = todo!();
+/// # let credential: Credential = todo!();
+/// # let server = rsipstack::sip::Uri::try_from("sip:sip.example.com").unwrap();
+/// let mut registration = Registration::new(endpoint.inner.clone(), Some(credential));
+///
+/// loop {
+///     match registration.register(server.clone(), None).await {
+///         Ok(response) if response.status_code == rsipstack::sip::StatusCode::OK => {
+///             let expires = registration.expires();
+///             println!("Registered for {} seconds", expires);
+///
+///             // Re-register before expiration (with some margin)
+///             tokio::time::sleep(Duration::from_secs((expires * 3 / 4) as u64)).await;
+///         },
+///         Ok(response) => {
+///             eprintln!("Registration failed: {}", response.status_code);
+///             tokio::time::sleep(Duration::from_secs(30)).await;
+///         },
+///         Err(e) => {
+///             eprintln!("Registration error: {}", e);
+///             tokio::time::sleep(Duration::from_secs(30)).await;
+///         }
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Thread Safety
+///
+/// Registration is not thread-safe and should be used from a single task.
+/// The sequence number and state are managed internally and concurrent
+/// access could lead to protocol violations.
+pub struct Registration {
+    pub last_seq: u32,
+    pub endpoint: EndpointInnerRef,
+    pub credential: Option<Credential>,
+    pub contact: Option<crate::sip::typed::Contact>,
+    pub allow: Option<crate::sip::headers::Allow>,
+    /// Public address detected by the server (IP and port)
+    pub public_address: Option<crate::sip::HostWithPort>,
+    pub call_id: crate::sip::headers::CallId,
+    /// Outbound proxy — override transport destination while keeping the
+    /// domain in SIP headers. Used for NAT traversal with load-balanced
+    /// proxy clusters where DNS may resolve to different IPs, and for
+    /// registrars only reachable through an SBC. The registrar domain is
+    /// not resolved when this is set. The transport follows the Request-URI.
+    pub outbound_proxy: Option<core::net::SocketAddr>,
+    /// Service-Route set (RFC 3608) learned from the last successful
+    /// registration `200 OK`. These entries are the proxies the registrar
+    /// (e.g. an IMS S-CSCF) wants traversed on subsequent requests; a UA
+    /// preloads them as `Route` headers on later out-of-dialog requests.
+    /// Populated on each `200 OK`; empty when the response carried none.
+    pub service_route: Vec<crate::sip::typed::ServiceRoute>,
+    /// Registration lifetime granted by the registrar in the last successful
+    /// `200 OK`, see [`Registration::expires`]. `None` until a REGISTER
+    /// succeeds.
+    pub granted_expires: Option<u32>,
+    /// Extra headers added to every REGISTER (including the authenticated
+    /// retry). Each replaces any header of the same name already present.
+    pub extra_headers: Vec<Header>,
+}
+
+impl Registration {
+    /// Create a new registration client
+    ///
+    /// Creates a new Registration instance for registering with a SIP server.
+    /// The registration will use the provided endpoint for network communication
+    /// and credentials for authentication if required.
+    ///
+    /// # Parameters
+    ///
+    /// * `endpoint` - Reference to the SIP endpoint for network operations
+    /// * `credential` - Optional authentication credentials
+    ///
+    /// # Returns
+    ///
+    /// A new Registration instance ready to perform registration
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::registration::Registration;
+    /// # use rsipstack::dialog::authenticate::Credential;
+    /// # use rsipstack::transaction::endpoint::Endpoint;
+    /// # fn example() {
+    /// # let endpoint: Endpoint = todo!();
+    /// // Registration without authentication
+    /// let registration = Registration::new(endpoint.inner.clone(), None);
+    ///
+    /// // Registration with authentication
+    /// let credential = Credential {
+    ///     username: "alice".to_string(),
+    ///     password: "secret123".to_string(),
+    ///     realm: Some("example.com".to_string()),
+    ///     auth_username: None,
+    /// };
+    /// let registration = Registration::new(endpoint.inner.clone(), Some(credential));
+    /// # }
+    /// ```
+    pub fn new(endpoint: EndpointInnerRef, credential: Option<Credential>) -> Self {
+        let call_id = make_call_id(
+            endpoint.option.callid_suffix.as_deref(),
+            endpoint.option.callid_format,
+        );
+        Self {
+            last_seq: 0,
+            endpoint,
+            credential,
+            contact: None,
+            allow: None,
+            public_address: None,
+            call_id,
+            outbound_proxy: None,
+            service_route: Vec::new(),
+            granted_expires: None,
+            extra_headers: Vec::new(),
+        }
+    }
+
+    /// Get the discovered public address
+    ///
+    /// Returns the public IP address and port discovered during the registration
+    /// process. The SIP server indicates the client's public address through
+    /// the 'received' and 'rport' parameters in Via headers.
+    ///
+    /// This is essential for NAT traversal, as it allows the client to use
+    /// the correct public address in Contact headers and SDP for subsequent
+    /// dialogs and media sessions.
+    ///
+    /// # Returns
+    ///
+    /// * `Some((ip, port))` - The discovered public IP address and port
+    /// * `None` - No public address has been discovered yet
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::registration::Registration;
+    /// # async fn example() {
+    /// # let registration: Registration = todo!();
+    /// if let Some(public_address) = registration.discovered_public_address() {
+    ///     println!("Public address: {}", public_address);
+    ///     // Use this address for Contact headers in dialogs
+    /// } else {
+    ///     println!("No public address discovered yet");
+    /// }
+    /// # }
+    /// ```
+    pub fn discovered_public_address(&self) -> Option<crate::sip::HostWithPort> {
+        self.public_address.clone()
+    }
+
+    /// Get the Service-Route set (RFC 3608) from the last successful
+    /// registration.
+    ///
+    /// Returns the ordered list of routes the registrar asked the user agent
+    /// to traverse on subsequent requests. In IMS this is the originating
+    /// route set advertised by the S-CSCF. The slice is empty when the last
+    /// `200 OK` carried no `Service-Route` header.
+    ///
+    /// This accessor only exposes the learned set; applying it to outgoing
+    /// requests (preloading `Route` headers) is left to the caller.
+    pub fn service_route(&self) -> &[crate::sip::typed::ServiceRoute] {
+        &self.service_route
+    }
+
+    /// Build the preloaded `Route` set for out-of-dialog requests from the
+    /// learned Service-Route set (RFC 3608 §5.2).
+    ///
+    /// The returned routes are in the order the registrar sent them and can be
+    /// assigned to [`InviteOption::route_set`] (or otherwise pushed as `Route`
+    /// headers) so an initial request such as an INVITE traverses the
+    /// registrar's required path. Returns an empty vector when the last
+    /// registration carried no Service-Route.
+    ///
+    /// [`InviteOption::route_set`]: crate::dialog::invitation::InviteOption::route_set
+    pub fn preloaded_route_set(&self) -> Vec<crate::sip::typed::Route> {
+        self.service_route.iter().cloned().map(Into::into).collect()
+    }
+
+    /// Get the registration expiration time
+    ///
+    /// Returns the expiration time in seconds for the current registration.
+    /// This value is extracted from the Contact header's expires parameter
+    /// in the last successful registration response.
+    ///
+    /// # Returns
+    ///
+    /// The lifetime the registrar granted in the last successful `200 OK`
+    /// (RFC 3261 Section 10.2.4), or 50 before any registration succeeded.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::registration::Registration;
+    /// # use core::time::Duration;
+    /// # async fn example() {
+    /// # let registration: Registration = todo!();
+    /// let expires = registration.expires();
+    /// println!("Registration expires in {} seconds", expires);
+    ///
+    /// // Schedule re-registration before expiration
+    /// let refresh_time = expires * 3 / 4; // 75% of expiration time
+    /// tokio::time::sleep(Duration::from_secs(refresh_time as u64)).await;
+    /// # }
+    /// ```
+    pub fn expires(&self) -> u32 {
+        self.granted_expires.unwrap_or(50)
+    }
+
+    /// The outbound proxy to send to, with the Request-URI's transport
+    /// (e.g. TCP).
+    fn outbound_proxy_target(&self, server: &crate::sip::Uri) -> Option<SipAddr> {
+        let mut proxy = SipAddr::from(self.outbound_proxy?);
+        proxy.r#type = server.params.iter().find_map(|p| match p {
+            Param::Transport(t) => Some(*t),
+            _ => None,
+        });
+        Some(proxy)
+    }
+
+    /// Perform SIP registration with the server
+    ///
+    /// Sends a REGISTER request to the specified SIP server to register
+    /// the user agent's current location. This method handles the complete
+    /// registration process including DNS resolution, authentication
+    /// challenges, and response processing.
+    ///
+    /// # Parameters
+    ///
+    /// * `server` - SIP server hostname or IP address (e.g., "sip.example.com")
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Response)` - Final response from the registration server
+    /// * `Err(Error)` - Registration failed due to network or protocol error
+    ///
+    /// # Registration Flow
+    ///
+    /// 1. **DNS Resolution** - Resolves server address and transport
+    /// 2. **Request Creation** - Creates REGISTER request with proper headers
+    /// 3. **Initial Send** - Sends the registration request
+    /// 4. **Authentication** - Handles 401/407 challenges if credentials provided
+    /// 5. **Response Processing** - Returns final response (200 OK or error)
+    ///
+    /// # Response Codes
+    ///
+    /// * `200 OK` - Registration successful
+    /// * `401 Unauthorized` - Authentication required (handled automatically)
+    /// * `403 Forbidden` - Registration not allowed
+    /// * `404 Not Found` - User not found
+    /// * `423 Interval Too Brief` - Requested expiration too short
+    ///
+    /// # Examples
+    ///
+    /// ## Successful Registration
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::registration::Registration;
+    /// # use rsipstack::sip::prelude::HeadersExt;
+    /// # async fn example() -> rsipstack::Result<()> {
+    /// # let mut registration: Registration = todo!();
+    /// let server = rsipstack::sip::Uri::try_from("sip:sip.example.com").unwrap();
+    /// let response = registration.register(server, None).await?;
+    ///
+    /// match response.status_code {
+    ///     rsipstack::sip::StatusCode::OK => {
+    ///         println!("Registration successful");
+    ///         // Extract registration details from response
+    ///         if let Ok(_contact) = response.contact_header() {
+    ///             println!("Registration confirmed");
+    ///         }
+    ///     },
+    ///     rsipstack::sip::StatusCode::Forbidden => {
+    ///         println!("Registration forbidden");
+    ///     },
+    ///     _ => {
+    ///         println!("Registration failed: {}", response.status_code);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Error Handling
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::registration::Registration;
+    /// # use rsipstack::Error;
+    /// # async fn example() {
+    /// # let mut registration: Registration = todo!();
+    /// # let server = rsipstack::sip::Uri::try_from("sip:sip.example.com").unwrap();
+    /// match registration.register(server, None).await {
+    ///     Ok(response) => {
+    ///         // Handle response based on status code
+    ///     },
+    ///     Err(Error::DnsResolutionError(msg)) => {
+    ///         eprintln!("DNS resolution failed: {}", msg);
+    ///     },
+    ///     Err(Error::TransportLayerError(msg, addr)) => {
+    ///         eprintln!("Network error to {}: {}", addr, msg);
+    ///     },
+    ///     Err(e) => {
+    ///         eprintln!("Registration error: {}", e);
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # Authentication
+    ///
+    /// If credentials are provided during Registration creation, this method
+    /// will automatically handle authentication challenges:
+    ///
+    /// 1. Send initial REGISTER request
+    /// 2. Receive 401/407 challenge with authentication parameters
+    /// 3. Calculate authentication response using provided credentials
+    /// 4. Resend REGISTER with Authorization header
+    /// 5. Receive final response
+    ///
+    /// # Contact Header
+    ///
+    /// The method will automatically update the Contact header with the public
+    /// address discovered during the registration process. This is essential
+    /// for proper NAT traversal in SIP communications.
+    ///
+    /// If you want to use a specific Contact header, you can set it manually
+    /// before calling this method.
+    ///
+    pub async fn register(
+        &mut self,
+        server: crate::sip::Uri,
+        expires: Option<u32>,
+    ) -> Result<Response> {
+        self.last_seq += 1;
+
+        let mut to = crate::sip::typed::To {
+            display_name: None,
+            uri: server.clone(),
+            params: vec![],
+        };
+
+        if let Some(cred) = &self.credential {
+            to.uri.auth = Some(crate::sip::Auth {
+                user: cred.username.clone(),
+                password: None,
+            });
+        }
+
+        let from = crate::sip::typed::From {
+            display_name: None,
+            uri: to.uri.clone(),
+            params: vec![],
+        }
+        .with_tag(make_tag());
+
+        // Resolve (and, for TCP/TLS/WS/WSS, lazily dial+cache) the connection
+        // this REGISTER will actually go out on *before* building the Via
+        // header, and build Via from that connection's real local address
+        // instead of always falling back to the endpoint's first-bound
+        // transport (get_via(None, None) below). Without this, a request
+        // targeting `;transport=tcp` still gets a Via that claims the
+        // endpoint's default UDP transport — physically sent over TCP, but
+        // self-describing as UDP inside the SIP headers. A spec-compliant
+        // server can, and in the wild does (FreeSWITCH's sofia-sip), treat
+        // that mismatch as reason enough to silently drop the request: no
+        // response, no error, nothing distinguishable in the server's own
+        // logs from the request never having arrived — the exact symptom
+        // this fixes.
+        //
+        // `lookup` already correctly falls through to the existing bound
+        // UDP listener for a target with no explicit `;transport=` param
+        // (see `TransportLayerInner::lookup`'s `first_udp` fallback), so
+        // this is safe to do unconditionally rather than only for TCP/TLS.
+        //
+        // With an outbound proxy the packets go to the proxy, so look that up
+        // instead: the registrar domain may not even resolve from here.
+        let proxy_target = self.outbound_proxy_target(&server);
+        let via_target = match &proxy_target {
+            Some(proxy) => Ok(proxy.clone()),
+            None => SipAddr::try_from(&server),
+        };
+        let via = match via_target {
+            Ok(target_addr) => {
+                match self
+                    .endpoint
+                    .transport_layer
+                    .lookup(&target_addr, None)
+                    .await
+                {
+                    Ok((connection, _resolved)) => self
+                        .endpoint
+                        .get_via(Some(connection.get_addr().clone()), None)?,
+                    Err(_) => self.endpoint.get_via(None, None)?,
+                }
+            }
+            Err(_) => self.endpoint.get_via(None, None)?,
+        };
+
+        // Contact address selection priority:
+        // 1. Explicitly set self.contact (if caller set it)
+        // 2. Public address discovered during registration
+        //    (Via received parameter from server)
+        // 3. Local non-loopback address from Via (initial registration only)
+        let mut contact = self.contact.clone().unwrap_or_else(|| {
+            let contact_host_with_port = self
+                .public_address
+                .clone()
+                .unwrap_or_else(|| via.uri.host_with_port.clone());
+            crate::sip::typed::Contact {
+                display_name: None,
+                uri: crate::sip::Uri {
+                    auth: to.uri.auth.clone(),
+                    scheme: Some(crate::sip::Scheme::Sip),
+                    host_with_port: contact_host_with_port,
+                    params: vec![],
+                    headers: vec![],
+                },
+                params: vec![],
+            }
+        });
+
+        if expires.is_some() {
+            contact.params.retain(|p| !matches!(p, Param::Expires(_)));
+        }
+
+        let mut request = self.endpoint.make_request(
+            crate::sip::Method::Register,
+            server,
+            via,
+            from,
+            to,
+            self.last_seq,
+            None,
+        );
+
+        // Thanks to https://github.com/restsend/rsipstack/issues/32
+        let contact_for_retry = contact.clone();
+        // The Contact of the request that finally gets the 200 OK; matched
+        // against the response bindings to find the granted expiration.
+        let mut sent_contact = contact.clone();
+        request.headers.unique_push(self.call_id.clone().into());
+        request.headers.unique_push(contact.into());
+        if let Some(allow) = &self.allow {
+            request.headers.unique_push(allow.clone().into());
+        }
+        // RFC 3327 Path + RFC 5626 Outbound: tell the proxy to record
+        // a Path header so INVITEs route through the correct edge node
+        // (the one with our TCP connection).
+        request
+            .headers
+            .unique_push(Header::Supported("path, outbound".into()));
+        if let Some(expires) = expires {
+            request
+                .headers
+                .unique_push(crate::sip::headers::Expires::from(expires).into());
+        }
+        for extra in &self.extra_headers {
+            request
+                .headers
+                .retain(|h| !h.name().eq_ignore_ascii_case(extra.name()));
+            request.headers.push(extra.clone());
+        }
+
+        let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
+        let mut tx = Transaction::new_client(key, request, self.endpoint.clone(), None);
+
+        // Override transport destination if outbound proxy is configured.
+        // This keeps the domain in SIP headers (Request-URI, From, To) while
+        // sending all packets to the pinned proxy IP for NAT consistency.
+        if proxy_target.is_some() {
+            tx.destination = proxy_target;
+        }
+
+        tx.send().await?;
+        let mut auth_sent = false;
+
+        while let Some(msg) = tx.receive().await {
+            match msg {
+                SipMessage::Response(resp) => match resp.status_code {
+                    StatusCode::Trying => {
+                        continue;
+                    }
+                    StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized => {
+                        let received = resp.via_header().ok().and_then(|via| {
+                            SipConnection::parse_target_from_via(via)
+                                .ok()
+                                .map(|(_, host_with_port)| host_with_port)
+                        });
+                        if self.public_address != received {
+                            debug!(
+                                old = ?self.public_address,
+                                new = ?received,
+                                "updated public address from 401 response"
+                            );
+                            self.public_address = received;
+                            // Update the Contact's host/port but preserve URI params
+                            // (e.g., transport=tcp) so they persist across re-registrations.
+                            if let Some(ref mut contact) = self.contact {
+                                if let Some(ref pa) = self.public_address {
+                                    contact.uri.host_with_port = pa.clone();
+                                }
+                            } else {
+                                self.contact = None;
+                            }
+                        }
+
+                        if auth_sent {
+                            debug!(status = %resp.status_code, "received auth response after auth sent");
+                            return Ok(resp);
+                        }
+
+                        if let Some(cred) = &self.credential {
+                            self.last_seq += 1;
+
+                            tx = handle_client_authenticate(self.last_seq, &tx, resp, cred).await?;
+
+                            // Update Contact in the retry request to use the discovered
+                            // public address (rport/received from 401 Via header).
+                            // handle_client_authenticate clones tx.original which has
+                            // the stale Contact from the initial REGISTER.
+                            if let Some(ref pa) = self.public_address {
+                                let new_contact_uri = crate::sip::Uri {
+                                    auth: contact_for_retry.uri.auth.clone(),
+                                    scheme: Some(crate::sip::Scheme::Sip),
+                                    host_with_port: pa.clone(),
+                                    // Preserve URI params (e.g., transport=tcp) from original Contact
+                                    params: contact_for_retry.uri.params.clone(),
+                                    headers: vec![],
+                                };
+                                let mut new_contact = contact_for_retry.clone();
+                                new_contact.uri = new_contact_uri;
+                                tx.original
+                                    .headers
+                                    .retain(|h| !matches!(h, crate::sip::Header::Contact(_)));
+                                sent_contact = new_contact.clone();
+                                tx.original.headers.unique_push(new_contact.into());
+                            }
+
+                            tx.send().await?;
+                            auth_sent = true;
+                            continue;
+                        } else {
+                            debug!(status = %resp.status_code, "received auth response without credential");
+                            return Ok(resp);
+                        }
+                    }
+                    StatusCode::OK => {
+                        // Check if server indicated our public IP in Via header
+                        let received = resp.via_header().ok().and_then(|via| {
+                            SipConnection::parse_target_from_via(via)
+                                .ok()
+                                .map(|(_, host_with_port)| host_with_port)
+                        });
+
+                        // Do NOT adopt the Contact from the 200 OK response.
+                        // The response may contain Contact bindings from OTHER
+                        // devices sharing the same AOR (Address of Record).
+                        // Keep self.contact as-is — if explicitly set by the caller
+                        // (e.g., with transport=tcp), it should persist across
+                        // re-registrations. The Contact is rebuilt from
+                        // public_address only when self.contact is None.
+
+                        if self.public_address != received {
+                            debug!(
+                                old = ?self.public_address,
+                                new = ?received,
+                                "discovered public IP"
+                            );
+                            self.public_address = received;
+                        }
+
+                        // RFC 3608: adopt the Service-Route set advertised by
+                        // the registrar as the preloaded route set for later
+                        // out-of-dialog requests. Malformed values are ignored
+                        // rather than failing the registration.
+                        self.service_route = resp.typed_service_route_headers().unwrap_or_default();
+                        self.granted_expires =
+                            Some(granted_expiration(&resp, &sent_contact, expires));
+
+                        debug!(
+                            status = %resp.status_code,
+                            contact = ?self.contact.as_ref().map(|c| c.uri.to_string()),
+                            service_route = self.service_route.len(),
+                            "registration do_request done"
+                        );
+                        return Ok(resp);
+                    }
+                    _ => {
+                        debug!(status = %resp.status_code, "registration do_request done");
+                        return Ok(resp);
+                    }
+                },
+                _ => break,
+            }
+        }
+        Err(crate::Error::DialogError(
+            "registration transaction is already terminated".to_string(),
+            DialogId::try_from(&tx)?,
+            StatusCode::BadRequest,
+        ))
+    }
+
+    /// Create a NAT-aware Contact header with public address
+    ///
+    /// Creates a Contact header suitable for use in SIP dialogs that takes into
+    /// account the public address discovered during registration. This is essential
+    /// for proper NAT traversal in SIP communications.
+    ///
+    /// # Parameters
+    ///
+    /// * `username` - SIP username for the Contact URI
+    /// * `public_address` - Optional public address to use (IP and port)
+    /// * `local_address` - Fallback local address if no public address available
+    ///
+    /// # Returns
+    ///
+    /// A Contact header with appropriate address for NAT traversal
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::registration::Registration;
+    /// # use core::net::{IpAddr, Ipv4Addr};
+    /// # use rsipstack::transport::SipAddr;
+    /// # fn example() {
+    /// # let local_addr: SipAddr = todo!();
+    /// let contact = Registration::create_nat_aware_contact(
+    ///     "alice",
+    ///     Some(rsipstack::sip::HostWithPort {
+    ///         host: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)).into(),
+    ///         port: Some(5060.into()),
+    ///     }),
+    ///     &local_addr,
+    /// );
+    /// # }
+    /// ```
+    pub fn create_nat_aware_contact(
+        username: &str,
+        public_address: Option<crate::sip::HostWithPort>,
+        local_address: &SipAddr,
+    ) -> crate::sip::typed::Contact {
+        let contact_host_with_port = public_address.unwrap_or_else(|| local_address.clone().into());
+        let params = vec![];
+
+        // Don't add 'ob' parameter as it may confuse some SIP proxies
+        // and prevent proper ACK routing
+        // if public_address.is_some() {
+        //     params.push(Param::Ob);
+        // }
+
+        crate::sip::typed::Contact {
+            display_name: None,
+            uri: crate::sip::Uri {
+                scheme: Some(crate::sip::Scheme::Sip),
+                auth: Some(crate::sip::Auth {
+                    user: username.to_string(),
+                    password: None,
+                }),
+                host_with_port: contact_host_with_port,
+                params,
+                headers: vec![],
+            },
+            params: vec![],
+        }
+    }
+}
+
+/// Lifetime the registrar granted for our binding (RFC 3261 Section 10.2.4),
+/// mirroring pjsip's `calculate_response_expiration`:
+///
+/// 1. the lowest `expires` param among the response Contacts matching ours;
+/// 2. our Contact matched without `expires`: the `Expires` header, then the
+///    requested value;
+/// 3. nothing matched (a registrar rewriting URIs): a lone response Contact is
+///    taken as ours, otherwise the `Expires` header, then the requested value.
+///
+/// 3600 is the last resort when neither side specified a lifetime.
+pub(crate) fn granted_expiration(
+    resp: &Response,
+    ours: &crate::sip::typed::Contact,
+    requested: Option<u32>,
+) -> u32 {
+    if requested == Some(0) {
+        return 0;
+    }
+    let header_or_requested = || {
+        resp.expires_header()
+            .and_then(|h| h.value().trim().parse::<u32>().ok())
+            .or(requested)
+            .unwrap_or(3600)
+    };
+    let contacts = resp.typed_contact_headers().unwrap_or_default();
+    let matched: Vec<_> = contacts
+        .iter()
+        .filter(|c| contact_uri_matches(&c.uri, &ours.uri))
+        .collect();
+    if !matched.is_empty() {
+        return matched
+            .iter()
+            .filter_map(|c| c.expires())
+            .min()
+            .unwrap_or_else(header_or_requested);
+    }
+    if let [only] = contacts.as_slice() {
+        if let Some(expires) = only.expires() {
+            return expires;
+        }
+    }
+    header_or_requested()
+}
+
+/// Whether two Contact URIs denote the same binding: scheme, user, host
+/// (case-insensitive), port (default port filled in) and transport (UDP
+/// when absent). Other URI params are ignored; registrars may add some.
+fn contact_uri_matches(a: &crate::sip::Uri, b: &crate::sip::Uri) -> bool {
+    use crate::sip::uri::Scheme;
+    let scheme = |u: &crate::sip::Uri| u.scheme.clone().unwrap_or(Scheme::Sip);
+    let user = |u: &crate::sip::Uri| u.auth.as_ref().map(|a| a.user.clone());
+    let port = |u: &crate::sip::Uri| {
+        u.host_with_port
+            .port
+            .as_ref()
+            .map(|p| p.value().to_owned())
+            .unwrap_or(if scheme(u) == Scheme::Sips {
+                5061
+            } else {
+                5060
+            })
+    };
+    let transport = |u: &crate::sip::Uri| {
+        u.params
+            .iter()
+            .find_map(|p| match p {
+                Param::Transport(t) => Some(*t),
+                _ => None,
+            })
+            .unwrap_or(crate::sip::Transport::Udp)
+    };
+    scheme(a) == scheme(b)
+        && user(a) == user(b)
+        && a.host_with_port
+            .host
+            .to_string()
+            .eq_ignore_ascii_case(&b.host_with_port.host.to_string())
+        && port(a) == port(b)
+        && transport(a) == transport(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::granted_expiration;
+    use crate::sip::{typed::Contact, Response};
+
+    fn ok(extra: &str) -> Response {
+        format!(
+            "SIP/2.0 200 OK\r\n\
+             Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-test\r\n\
+             From: <sip:1001@example.com>;tag=a\r\n\
+             To: <sip:1001@example.com>;tag=b\r\n\
+             CSeq: 2 REGISTER\r\n\
+             Call-ID: reg-test\r\n\
+             {extra}\
+             Content-Length: 0\r\n\r\n"
+        )
+        .as_str()
+        .try_into()
+        .unwrap()
+    }
+
+    fn ours() -> Contact {
+        Contact::parse("<sip:1001@198.51.100.20:5060>").unwrap()
+    }
+
+    #[test]
+    fn picks_our_binding_among_other_devices() {
+        let resp = ok("Contact: <sip:1001@203.0.113.7:5080>;expires=60, \
+             <sip:1001@198.51.100.20:5060>;expires=1800\r\nExpires: 3600\r\n");
+        assert_eq!(granted_expiration(&resp, &ours(), Some(300)), 1800);
+    }
+
+    #[test]
+    fn matching_tolerates_default_port_transport_and_host_case() {
+        let ours = Contact::parse("<sip:1001@Host.Example.com;transport=udp>").unwrap();
+        let resp = ok("Contact: <sip:1001@host.example.com:5060;ob>;expires=900, \
+             <sip:1001@host.example.com:5060;transport=tcp>;expires=60\r\n");
+        assert_eq!(granted_expiration(&resp, &ours, Some(300)), 900);
+    }
+
+    #[test]
+    fn our_binding_without_param_uses_expires_header_then_requested() {
+        let resp = ok("Contact: <sip:1001@198.51.100.20:5060>\r\nExpires: 1200\r\n");
+        assert_eq!(granted_expiration(&resp, &ours(), Some(300)), 1200);
+        let resp = ok("Contact: <sip:1001@198.51.100.20:5060>\r\n");
+        assert_eq!(granted_expiration(&resp, &ours(), Some(300)), 300);
+    }
+
+    #[test]
+    fn unmatched_lone_contact_is_taken_as_ours() {
+        // Registrar rewrote our Contact (e.g. NAT/ALG): one binding left.
+        let resp = ok("Contact: <sip:1001@10.0.0.9:5062>;expires=600\r\nExpires: 3600\r\n");
+        assert_eq!(granted_expiration(&resp, &ours(), Some(300)), 600);
+    }
+
+    #[test]
+    fn unmatched_multiple_contacts_fall_back_to_header_then_requested() {
+        let contacts = "Contact: <sip:1001@10.0.0.9:5062>;expires=600, \
+             <sip:1001@10.0.0.8:5062>;expires=60\r\n";
+        let resp = ok(&format!("{contacts}Expires: 1500\r\n"));
+        assert_eq!(granted_expiration(&resp, &ours(), Some(300)), 1500);
+        assert_eq!(granted_expiration(&ok(contacts), &ours(), Some(300)), 300);
+    }
+
+    #[test]
+    fn nothing_specified_defaults_to_3600_and_unregister_is_zero() {
+        assert_eq!(granted_expiration(&ok(""), &ours(), None), 3600);
+        let resp = ok("Contact: <sip:1001@198.51.100.20:5060>;expires=1800\r\n");
+        assert_eq!(granted_expiration(&resp, &ours(), Some(0)), 0);
+    }
+}
+
+// ── resident keep-alive refresh policy ─────────────────────────────────────
+
+/// Outcome of one keep-alive REGISTER attempt.
+#[derive(Debug)]
+pub enum RefreshOutcome<'a> {
+    /// 2xx — the binding is (re)established for another expiry window.
+    Registered(&'a Response),
+    /// REGISTER answered with a non-2xx final response.
+    Rejected(&'a Response),
+    /// Transport / transaction failure (registrar unreachable).
+    Failed(&'a crate::Error),
+}
+
+/// 75% of the granted expiry, floored at 1 s.
+pub fn refresh_interval(expires: u32) -> core::time::Duration {
+    core::time::Duration::from_millis((u64::from(expires) * 3 / 4 * 1000).max(1000))
+}
+
+/// 1 s doubling per consecutive failure, capped at 60 s.
+pub fn backoff_interval(failures: u32) -> core::time::Duration {
+    const MIN_MS: u64 = 1_000;
+    const MAX_MS: u64 = 60_000;
+    core::time::Duration::from_millis((MIN_MS << failures.min(6)).min(MAX_MS))
+}
+
+impl Registration {
+    /// REGISTER immediately, then refresh at 75% of the expiry (or backoff).
+    /// `on_result` fires after every attempt. Returns on token cancel; the
+    /// caller owns the final expires=0 unregister.
+    pub async fn keep_alive<E>(
+        &mut self,
+        server: crate::sip::Uri,
+        expires: u32,
+        token: crate::platform::CancellationToken,
+        mut on_result: E,
+    ) where
+        E: FnMut(RefreshOutcome<'_>),
+    {
+        let refresh = refresh_interval(expires);
+        let mut failures: u32 = 0;
+        loop {
+            match self.register(server.clone(), Some(expires)).await {
+                Ok(resp) if resp.status_code.kind() == crate::sip::StatusCodeKind::Successful => {
+                    failures = 0;
+                    on_result(RefreshOutcome::Registered(&resp));
+                }
+                Ok(resp) => {
+                    failures += 1;
+                    on_result(RefreshOutcome::Rejected(&resp));
+                }
+                Err(e) => {
+                    failures += 1;
+                    on_result(RefreshOutcome::Failed(&e));
+                }
+            }
+
+            let wait = if failures == 0 {
+                refresh
+            } else {
+                backoff_interval(failures - 1)
+            };
+            // Prompt exit on Unregister/shutdown instead of waiting out.
+            let sleep_fut = crate::platform::sleep(wait);
+            let mut sleep_fut = core::pin::pin!(sleep_fut);
+            let cancelled = token.cancelled();
+            let mut cancelled = core::pin::pin!(cancelled);
+            if matches!(
+                crate::platform::select2(&mut sleep_fut, &mut cancelled).await,
+                crate::platform::Either::B(_)
+            ) {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_interval_is_75_percent_with_floor() {
+        assert_eq!(refresh_interval(600), core::time::Duration::from_secs(450));
+        assert_eq!(refresh_interval(1), core::time::Duration::from_secs(1));
+        assert_eq!(refresh_interval(2), core::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        assert_eq!(backoff_interval(0), core::time::Duration::from_secs(1));
+        assert_eq!(backoff_interval(1), core::time::Duration::from_secs(2));
+        assert_eq!(backoff_interval(3), core::time::Duration::from_secs(8));
+        assert_eq!(backoff_interval(10), core::time::Duration::from_secs(60));
+    }
+}
