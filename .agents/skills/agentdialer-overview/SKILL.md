@@ -2,9 +2,12 @@
 name: agentdialer-overview
 description: >
   Explains the AgentDialer framework: a SIP-only, AI-agent-native, Kubernetes-native
-  outbound dialer written in Rust. Use this skill when you start work on AgentDialer,
-  when you need to know which crate owns a concern, or when you need the map of the
-  media plane and the campaign brain. Read this first before you change code.
+  outbound dialer written in Rust. Its primary target is LiveKit Cloud SIP: the
+  README quickstart connects it to LiveKit Cloud SIP and a phone number and places
+  calls. Use this skill when you start work on AgentDialer, when you change the
+  quickstart or a trunk, when you need to know which crate owns a concern, or when
+  you need the map of the media plane and the campaign brain. Read this first
+  before you change code.
 license: AGPL-3.0-or-later
 metadata:
   project: agentdialer
@@ -29,6 +32,33 @@ Then read the reference code in `_research/` for the area you change.
 `GAPS.md` Appendix A maps each area to its reference files. Much of the design
 comes from these projects (VICIdial, dograh, FusionPBX, FreeSWITCH, drachtio,
 rtpengine). Do not implement a feature before you read how they do it.
+
+## The primary target
+
+LiveKit Cloud SIP is the primary target. The goal: a new user stands up the
+stack in Docker Compose, connects it to LiveKit Cloud SIP with a LiveKit phone
+number, and starts to place calls. README "Quickstart: place calls through
+LiveKit Cloud SIP" teaches it, and it must never break.
+
+- The node dials the LiveKit number at the project's SIP URI, as it dials a
+  carrier. LiveKit Cloud challenges with 407, and a dispatch rule puts each
+  call into a room of its own with a callee agent.
+- The stack is `docker-compose.quickstart.yml` with
+  `docker-compose.livekit-cloud.yml` (the callee agent).
+  `e2e/livekit-cloud/run.sh setup` makes the number, the trunks, and the rule,
+  and writes `.env.lkcloud`.
+- Use `e2e/livekit-cloud/run.sh` for every LiveKit Cloud API call. Never run
+  a one-off command against LiveKit Cloud.
+- Keep `e2e/run_twilio_e2e.sh --sim` green: it runs the quickstart stack with
+  the carrier simulator on every change. When you have the LiveKit Cloud
+  keys, also run `e2e/run_lkcloud_e2e.sh`.
+- Limit: LiveKit numbers take incoming calls only, so these calls do not go
+  through the public phone network. Do not claim that they do.
+
+Twilio Elastic SIP Trunking is a second supported carrier (README "Call
+through Twilio"), and it reaches real phones. The same quickstart stack
+places its calls with `.env.twilio`. Keep `crates/ad_sip/tests/twilio.rs`
+green. Use `e2e/twilio/run.sh` for every call to the Twilio API.
 
 ## The two halves
 
@@ -197,7 +227,9 @@ docker compose -f docker-compose.test.yml down
 
 If you change how a role behaves at runtime, also run the e2e script that
 covers it (`e2e/run_e2e.sh`, `e2e/run_events_e2e.sh`, or
-`e2e/run_webrtc_e2e.sh`). Always stop the stack after tests. If you did not run
+`e2e/run_webrtc_e2e.sh`). If you change the call path or the quickstart, also
+run `e2e/run_twilio_e2e.sh --sim`, and `e2e/run_lkcloud_e2e.sh` when you have
+the LiveKit Cloud keys. Always stop the stack after tests. If you did not run
 the tier, the work is not done.
 
 ## Where to go next
@@ -210,8 +242,12 @@ the tier, the work is not done.
   `PLAN.md` §0.0, `vendor/VENDORED.md`, `crates/ad_sip/`, `crates/ad_media/`,
   and `crates/ad_gateway/src/sip_call.rs`. The research notes are in
   `_research/scratch/media/` (the carrier lessons are in
-  `asterisk-freeswitch.md`). Test with `e2e/run_e2e.sh` (Kamailio, a NAT, a
-  SIPp carrier, both agent runtimes).
+  `asterisk-freeswitch.md`). Test with `e2e/run_e2e.sh` (Kamailio, a NAT,
+  the carrier simulator `e2e/carrier-sim`, both agent runtimes).
+- To change the quickstart or a trunk, read "The primary target" above and
+  the README sections "Quickstart: place calls through LiveKit Cloud SIP" and
+  "Call through Twilio". Put new carrier behavior into the simulator (diago),
+  not into ad hoc scripts.
 - To change the orchestrator, the cluster, the call attempts, or the event
   layer, read `PLAN.md` §0.10.7a, §0.10.8a, and §0.10.8b,
   `crates/ad_bin/src/orchestrator/` (`mod.rs`, `calls.rs`, `leader.rs`),

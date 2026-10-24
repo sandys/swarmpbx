@@ -52,6 +52,10 @@ spec:
             # sends through the SIP edge and advertises the pod IP.
             - name: AD_SIP_TRUNK
               value: {{ .Values.sip.trunk | quote }}
+            {{- if .Values.sip.callerId }}
+            - name: AD_SIP_CALLER_ID
+              value: {{ .Values.sip.callerId | quote }}
+            {{- end }}
             {{- if .Values.sip.proxy }}
             - name: AD_SIP_PROXY
               value: {{ .Values.sip.proxy | quote }}

@@ -13,8 +13,10 @@
 # (Docker drops routed traffic to a container IP of another bridge network,
 # so the carrier cannot be a container on a second network.)
 #
-# e2e/run_cluster_e2e.sh and e2e/run_e2e.sh drive this file. They set
-# E2E_CALLS.
+# e2e/run_e2e.sh, e2e/run_cluster_e2e.sh, and e2e/run_twilio_e2e.sh drive
+# this file. E2E_HOLD_MS sets how long the carrier holds a call. The
+# E2E_SIP_* variables point the nodes at a real trunk (Twilio) instead of the
+# carrier simulator.
 name: ad-cluster
 
 networks:
@@ -63,6 +65,7 @@ services:
       LIVEKIT_API_SECRET: devsecret_devsecret_devsecret_32b
       AGENT_NAME: e2e-livekit
       STATS_PORT: "8088"
+      MAX_CALL_S: "${E2E_AGENT_MAX_CALL_S:-0}"
     networks: [cluster]
 
   pipecat-bot:
@@ -109,19 +112,27 @@ services:
 
   # The carrier at 203.0.113.20. It waits for the NAT rule, so no packet
   # reaches it un-NATed.
+  # The carrier simulator (e2e/carrier-sim, on diago): it behaves like Twilio
+  # Elastic SIP Trunking termination: a 407 digest challenge, E.164 checks,
+  # a caller-ID check, and symmetric RTP. Its API: http://nat:8080/calls.
   carrier:
-    image: ctaloi/sipp:latest
+    build:
+      context: carrier-sim
+    image: ad-e2e-carrier-sim
     network_mode: "service:nat"
     entrypoint:
       - sh
       - -c
-      - >-
-        until [ -e /out/nat.ready ]; do sleep 0.2; done;
-        exec sipp -sf /out/carrier_cluster.xml -i 203.0.113.20 -p 5080
-        -mi 203.0.113.20 -mp 6000 -rtp_echo -m "$${E2E_CALLS}" -timeout 900s
-        -trace_msg -message_file /out/cluster_sip_messages.log
+      - until [ -e /out/nat.ready ]; do sleep 0.2; done; exec carrier-sim
     environment:
-      E2E_CALLS: "${E2E_CALLS:-24}"
+      SIM_SIP_ADDR: 203.0.113.20:5080
+      SIM_HTTP_ADDR: 0.0.0.0:8080
+      SIM_AUTH_USER: agentdialer
+      SIM_AUTH_PASSWORD: E2eTrunkPassw0rd
+      SIM_CALLER_IDS: "+15550001000"
+      SIM_SYMMETRIC_RTP: "1"
+      SIM_HOLD_MS: "${E2E_HOLD_MS:-20000}"
+      SIM_NUMBERS: "+15550000486=busy,+15550000503=fail,+15550000408=noanswer,+15550000603=decline"
     volumes:
       - ./.out:/out
 
@@ -134,7 +145,10 @@ services:
       - LIVEKIT_URL=ws://livekit:7880
       - LIVEKIT_API_KEY=devkey
       - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
-      - AD_SIP_TRUNK=203.0.113.20:5080
+      - AD_SIP_TRUNK=${E2E_SIP_TRUNK:-203.0.113.20:5080}
+      - AD_SIP_TRUNK_USER=${E2E_SIP_TRUNK_USER:-agentdialer}
+      - AD_SIP_TRUNK_PASSWORD=${E2E_SIP_TRUNK_PASSWORD:-E2eTrunkPassw0rd}
+      - AD_SIP_CALLER_ID=${E2E_SIP_CALLER_ID:-+15550001000}
       - AD_SIP_PROXY=kamailio:5060
       - AD_ETCD_ENDPOINTS=http://kine:2379
       - AD_ROOM_PREFIX=campaign
@@ -154,7 +168,10 @@ services:
       - LIVEKIT_URL=ws://livekit:7880
       - LIVEKIT_API_KEY=devkey
       - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
-      - AD_SIP_TRUNK=203.0.113.20:5080
+      - AD_SIP_TRUNK=${E2E_SIP_TRUNK:-203.0.113.20:5080}
+      - AD_SIP_TRUNK_USER=${E2E_SIP_TRUNK_USER:-agentdialer}
+      - AD_SIP_TRUNK_PASSWORD=${E2E_SIP_TRUNK_PASSWORD:-E2eTrunkPassw0rd}
+      - AD_SIP_CALLER_ID=${E2E_SIP_CALLER_ID:-+15550001000}
       - AD_SIP_PROXY=kamailio:5060
       - AD_ETCD_ENDPOINTS=http://kine:2379
       - AD_ROOM_PREFIX=campaign
@@ -174,7 +191,10 @@ services:
       - LIVEKIT_URL=ws://livekit:7880
       - LIVEKIT_API_KEY=devkey
       - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
-      - AD_SIP_TRUNK=203.0.113.20:5080
+      - AD_SIP_TRUNK=${E2E_SIP_TRUNK:-203.0.113.20:5080}
+      - AD_SIP_TRUNK_USER=${E2E_SIP_TRUNK_USER:-agentdialer}
+      - AD_SIP_TRUNK_PASSWORD=${E2E_SIP_TRUNK_PASSWORD:-E2eTrunkPassw0rd}
+      - AD_SIP_CALLER_ID=${E2E_SIP_CALLER_ID:-+15550001000}
       - AD_SIP_PROXY=kamailio:5060
       - AD_ETCD_ENDPOINTS=http://kine:2379
       - AD_ROOM_PREFIX=campaign

@@ -1,0 +1,20 @@
+# An override for docker-compose.quickstart.yml: the carrier simulator
+# (e2e/carrier-sim) stands in for Twilio, with Twilio's 407 challenge, its
+# E.164 and caller-ID checks, and symmetric RTP. e2e/run_twilio_e2e.sh --sim
+# uses it, so the quickstart stack runs on every change, also without
+# credentials. Paths are relative to the repository root (the
+# directory of the first compose file).
+services:
+  twilio-sim:
+    build:
+      context: e2e/carrier-sim
+    image: ad-e2e-carrier-sim
+    environment:
+      SIM_SIP_ADDR: 0.0.0.0:5080
+      SIM_HTTP_ADDR: 0.0.0.0:8080
+      SIM_AUTH_USER: agentdialer
+      SIM_AUTH_PASSWORD: E2eTrunkPassw0rd
+      SIM_CALLER_IDS: "+15550001000"
+      SIM_SYMMETRIC_RTP: "1"
+      # The agent ends the call first.
+      SIM_HOLD_MS: "120000"

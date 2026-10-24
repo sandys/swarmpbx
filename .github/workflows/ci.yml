@@ -58,3 +58,62 @@ jobs:
       # dialed exactly once. The script always tears down.
       - name: run cluster e2e
         run: ./e2e/run_cluster_e2e.sh
+
+  twilio-sim-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The quickstart stack (README.md) with the carrier simulator in place
+      # of the trunk, on the steps of "Call through Twilio": the steps must keep
+      # working. The script always tears down.
+      - name: run the quickstart stack against the simulator
+        run: ./e2e/run_twilio_e2e.sh --sim
+
+  twilio-e2e:
+    runs-on: ubuntu-latest
+    env:
+      TWILIO_SID: ${{ secrets.TWILIO_SID }}
+      TWILIO_SECRET: ${{ secrets.TWILIO_SECRET }}
+      TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+    steps:
+      - uses: actions/checkout@v4
+      # A real call through Twilio Elastic SIP Trunking to Twilio's free
+      # "Play" number. It runs only when the repository has the secrets.
+      - name: write .env from the secrets
+        if: env.TWILIO_SID != ''
+        run: |
+          umask 077
+          {
+            echo "TWILIO_SID=$TWILIO_SID"
+            echo "TWILIO_SECRET=$TWILIO_SECRET"
+            if [ -n "$TWILIO_ACCOUNT_SID" ]; then echo "TWILIO_ACCOUNT_SID=$TWILIO_ACCOUNT_SID"; fi
+          } > .env
+      - name: run the live Twilio e2e
+        if: env.TWILIO_SID != ''
+        run: ./e2e/run_twilio_e2e.sh
+
+  lkcloud-e2e:
+    runs-on: ubuntu-latest
+    env:
+      LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+      LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+      LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+      LIVEKIT_SIP_URI: ${{ secrets.LIVEKIT_SIP_URI }}
+    steps:
+      - uses: actions/checkout@v4
+      # The README quickstart: a real call over the internet to the project's
+      # LiveKit number at LiveKit Cloud SIP. It runs only when the repository
+      # has the secrets.
+      - name: write .env from the secrets
+        if: env.LIVEKIT_SIP_URI != ''
+        run: |
+          umask 077
+          {
+            echo "LIVEKIT_URL=$LIVEKIT_URL"
+            echo "LIVEKIT_API_KEY=$LIVEKIT_API_KEY"
+            echo "LIVEKIT_API_SECRET=$LIVEKIT_API_SECRET"
+            echo "LIVEKIT_SIP_URI=$LIVEKIT_SIP_URI"
+          } > .env
+      - name: run the LiveKit Cloud e2e
+        if: env.LIVEKIT_SIP_URI != ''
+        run: ./e2e/run_lkcloud_e2e.sh

@@ -24,6 +24,8 @@ from livekit.agents import AgentServer, AutoSubscribe, JobContext, JobExecutorTy
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "e2e-livekit")
 STATS_PORT = int(os.environ.get("STATS_PORT", "8088"))
+# Leave the call after this many seconds (0: stay until the callee leaves).
+MAX_CALL_S = float(os.environ.get("MAX_CALL_S", "0"))
 # 16 kHz keeps one worker process light enough for a dozen calls at once.
 SAMPLE_RATE, CHANNELS, SAMPLES = 16000, 1, 160  # 10 ms frames
 # A frame of the callee whose peak passes this carries a tone, not silence.
@@ -75,9 +77,20 @@ server = AgentServer(
 async def entrypoint(ctx: JobContext) -> None:
     call = json.loads(ctx.job.metadata or "{}")
     room = ctx.room.name
+    # The dialer names the callee. A job without it (the callee agent behind
+    # LiveKit Cloud SIP, e2e/livekit-cloud) takes the first remote participant.
     callee = call.get("callee_identity")
     update(room, attempt_id=call.get("attempt_id"), callee=callee)
     stop = asyncio.Event()
+
+    def is_callee(participant) -> bool:
+        nonlocal callee
+        if callee is None:
+            callee = participant.identity
+            # How LiveKit routed a SIP caller: sip.trunkID, sip.trunkPhoneNumber.
+            sip = {k: v for k, v in participant.attributes.items() if k.startswith("sip.")}
+            update(room, callee=callee, sip=sip)
+        return participant.identity == callee
 
     async def count(track: rtc.Track) -> None:
         async for event in rtc.AudioStream.from_track(
@@ -90,12 +103,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @ctx.room.on("track_subscribed")
     def _subscribed(track, _publication, participant):
-        if track.kind == rtc.TrackKind.KIND_AUDIO and participant.identity == callee:
+        if track.kind == rtc.TrackKind.KIND_AUDIO and is_callee(participant):
             asyncio.ensure_future(count(track))
 
     @ctx.room.on("participant_disconnected")
     def _left(participant):
-        if participant.identity == callee:
+        if is_callee(participant):
             stop.set()
 
     ctx.room.on("disconnected", lambda *_: stop.set())
@@ -109,6 +122,8 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     n, idx = 0, np.arange(SAMPLES)
+    if MAX_CALL_S > 0:
+        asyncio.get_running_loop().call_later(MAX_CALL_S, stop.set)
     while not stop.is_set():
         pcm = (0.2 * 32767 * np.sin(2 * np.pi * 440 * (idx + n) / SAMPLE_RATE)).astype(np.int16)
         n += SAMPLES

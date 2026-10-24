@@ -34,6 +34,20 @@ contract for anyone (human or agent) editing the code.
   tasks. See the Database section for the test workflow.
 - **Honest status.** `experimental` means experimental and is surfaced in APIs.
   Never overstate what works in commits/PRs/messages.
+- **LiveKit Cloud SIP is the primary target.** The README quickstart stands
+  up the stack in Docker Compose, connects it to LiveKit Cloud SIP with a
+  LiveKit phone number, and places calls. This use must never break. A change
+  must keep these green: `e2e/run_twilio_e2e.sh --sim` (the quickstart stack
+  with the carrier simulator, on every change), and, when you have the
+  LiveKit Cloud keys, `e2e/run_lkcloud_e2e.sh` (the quickstart, live). Keep
+  the README section "Quickstart: place calls through LiveKit Cloud SIP" true.
+- **Twilio is a supported carrier.** Keep `crates/ad_sip/tests/twilio.rs`
+  (test tier) green, and, when you have the credentials,
+  `e2e/run_twilio_e2e.sh`. Keep the README section "Call through Twilio" true.
+- **Test systems, not one-off scripts.** Put each test setup in a reusable,
+  committed script or tool (for example `e2e/livekit-cloud/run.sh`,
+  `e2e/twilio/run.sh`, the carrier simulator `e2e/carrier-sim` on diago). Do
+  not run one-off commands against an outside service.
 - **Managed services.** Production runs on managed Kubernetes with a managed
   Postgres (for example RDS). Treat Postgres and kine as services that you
   reach only by URL. A role waits for them with backoff; it never depends on a

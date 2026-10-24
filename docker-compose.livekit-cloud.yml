@@ -1,0 +1,16 @@
+# An override for docker-compose.quickstart.yml (README.md, "Quickstart"):
+# LiveKit Cloud SIP is the far end of the calls. The callee agent runs here and
+# joins each call's room in LiveKit Cloud, where the project's dispatch rule
+# sends it. Use it with two env files: .env (the LiveKit Cloud project) and
+# .env.lkcloud (the trunk and the number, from e2e/livekit-cloud/run.sh setup).
+services:
+  callee:
+    build:
+      context: e2e/agents/livekit
+    image: ad-e2e-livekit-agent
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_URL:?set LIVEKIT_URL in .env}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}
+      AGENT_NAME: ${LKCLOUD_CALLEE_AGENT:-agentdialer-e2e-callee}
+      STATS_PORT: "8088"

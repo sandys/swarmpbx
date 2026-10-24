@@ -20,3 +20,9 @@ spike/livekit/agent.ogg
 
 # Output that the e2e scripts keep (e2e/lib.sh, E2E_OUT)
 /e2e/.out/
+
+# The e2e Twilio trunk credentials (e2e/twilio/run.sh setup).
+.env.twilio
+.env.twilio.tmp
+.env.lkcloud
+.env.lkcloud.tmp

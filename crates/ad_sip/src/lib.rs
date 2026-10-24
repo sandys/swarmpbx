@@ -49,8 +49,12 @@ pub struct SipConfig {
     /// The SIP edge (Kamailio). Every INVITE goes to it. Kamailio then keeps
     /// itself on the call path with `Record-Route`.
     pub proxy: Option<SocketAddr>,
-    /// The user part of our From and Contact.
+    /// The user part of our Contact, and of our From when there is no
+    /// caller ID.
     pub user: String,
+    /// The caller ID: the user part of our From. Twilio requires an E.164
+    /// number of the account here (or a verified caller ID).
+    pub caller_id: Option<String>,
 }
 
 /// Digest credentials for a trunk.
@@ -107,7 +111,9 @@ pub struct SipUa {
 struct Inner {
     dialogs: Arc<DialogLayer>,
     contact: sip::Uri,
-    proxy: Option<SipAddr>,
+    caller: sip::Uri,
+    /// The SIP edge as a preloaded Route.
+    proxy: Option<sip::typed::Route>,
     local: SocketAddr,
     stop: CancellationToken,
 }
@@ -138,9 +144,13 @@ impl SipUa {
             .build();
         let incoming = endpoint.incoming_transactions().map_err(stack)?;
         let dialogs = Arc::new(DialogLayer::new(endpoint.inner.clone()));
-        let contact: sip::Uri = format!("sip:{}@{}", cfg.user, external)
-            .try_into()
-            .map_err(|_| SipError::Uri(cfg.user.clone()))?;
+        let uri = |user: &str| -> Result<sip::Uri, SipError> {
+            format!("sip:{user}@{external}")
+                .try_into()
+                .map_err(|_| SipError::Uri(user.to_string()))
+        };
+        let contact = uri(&cfg.user)?;
+        let caller = uri(cfg.caller_id.as_deref().unwrap_or(&cfg.user))?;
 
         let serving = endpoint;
         tokio::spawn(async move { serving.serve().await });
@@ -149,10 +159,17 @@ impl SipUa {
             inner: Arc::new(Inner {
                 dialogs,
                 contact,
-                proxy: cfg.proxy.map(|p| SipAddr {
-                    r#type: Some(sip::transport::Transport::Udp),
-                    ..SipAddr::from(p)
-                }),
+                caller,
+                proxy: match cfg.proxy {
+                    Some(p) => Some(sip::typed::Route {
+                        display_name: None,
+                        uri: format!("sip:{p};lr")
+                            .try_into()
+                            .map_err(|_| SipError::Uri(p.to_string()))?,
+                        params: vec![],
+                    }),
+                    None => None,
+                },
                 local,
                 stop,
             }),
@@ -190,25 +207,31 @@ impl SipUa {
             .clone()
             .try_into()
             .map_err(|_| SipError::Uri(call.target.clone()))?;
-        // Decide where the INVITE goes before it exists: through the SIP edge,
-        // or straight to the trunk. rsipstack retries a failed lookup until
-        // Timer B, so a trunk that we cannot reach is decided here: no call.
-        let destination = match &self.inner.proxy {
-            Some(proxy) => proxy.clone(),
+        // Decide where the INVITE goes before it exists. Through the SIP edge:
+        // a preloaded Route (RFC 3261 §8.1.2), which the CANCEL copies, so the
+        // CANCEL follows the INVITE. Straight to the trunk: its address.
+        // rsipstack retries a failed lookup until Timer B, so a trunk that we
+        // cannot reach is decided here: no call.
+        let (destination, route_set) = match &self.inner.proxy {
+            Some(route) => (None, vec![route.clone()]),
             None => match self.trunk_address(&callee).await {
-                Ok(addr) => SipAddr {
-                    r#type: Some(sip::transport::Transport::Udp),
-                    ..SipAddr::from(addr)
-                },
+                Ok(addr) => (
+                    Some(SipAddr {
+                        r#type: Some(sip::transport::Transport::Udp),
+                        ..SipAddr::from(addr)
+                    }),
+                    vec![],
+                ),
                 Err(why) => return Ok(Outcome::NotSent(why)),
             },
         };
         let (states_tx, states) = self.inner.dialogs.new_dialog_state_channel();
         let option = InviteOption {
-            caller: self.inner.contact.clone(),
+            caller: self.inner.caller.clone(),
             callee,
             contact: self.inner.contact.clone(),
-            destination: Some(destination),
+            destination,
+            route_set,
             content_type: Some("application/sdp".into()),
             offer: Some(call.offer.into_bytes()),
             credential: call.auth.map(|a| Credential {

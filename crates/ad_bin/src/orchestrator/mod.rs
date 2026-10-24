@@ -252,6 +252,7 @@ async fn start_sip(
         advertise,
         proxy,
         user: "agentdialer".into(),
+        caller_id: sip.caller_id.clone(),
     })
     .await?;
     tracing::info!(

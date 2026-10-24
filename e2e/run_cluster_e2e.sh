@@ -31,8 +31,7 @@ export E2E_ETCD_ENDPOINT=kine:2379
 
 CL="docker compose -f docker-compose.cluster.yml"
 N=24
-HOLD_MS=20000
-export E2E_CALLS=$N
+export E2E_HOLD_MS=20000
 LK_STATS=http://livekit-agent:8088/stats
 PC_STATS=http://pipecat-bot:8089/stats
 # A call ended by the carrier: its hangup event names the callee.
@@ -43,6 +42,7 @@ cleanup() {
   echo "== teardown =="
   agent_stats_json_of "$LK_STATS" > "$E2E_OUT/run_cluster_e2e.livekit-agent.stats.json" 2>/dev/null || true
   agent_stats_json_of "$PC_STATS" > "$E2E_OUT/run_cluster_e2e.pipecat-bot.stats.json" 2>/dev/null || true
+  agent_stats_json_of "$E2E_SIM_URL" > "$E2E_OUT/run_cluster_e2e.carrier.calls.json" 2>/dev/null || true
   for s in node-1 node-2 node-3 kamailio carrier livekit livekit-agent pipecat-bot kine nat; do
     $CL logs "$s" > "$E2E_OUT/run_cluster_e2e.$s.log" 2>&1 || true
   done
@@ -58,17 +58,14 @@ route_added() { [ "$($CL ps -a --format '{{.Service}} {{.State}} {{.ExitCode}}' 
 
 echo "== build images =="
 docker build -q -t agentdialer:e2e .. >/dev/null || { echo "FAIL: image build"; exit 1; }
-$CL build -q livekit-agent pipecat-bot >/dev/null 2>&1 || { echo "FAIL: agent image build"; exit 1; }
-
-echo "== the carrier holds each call $((HOLD_MS / 1000)) s, then sends BYE =="
-sed "s/HOLD_MS/$HOLD_MS/" carrier.xml > "$E2E_OUT/carrier_cluster.xml"
-grep -q "timeout=\"$HOLD_MS\"" "$E2E_OUT/carrier_cluster.xml" || { echo "FAIL: carrier hold not set"; exit 1; }
-rm -f "$E2E_OUT/cluster_sip_messages.log" "$E2E_OUT/nat.ready"
+$CL build -q livekit-agent pipecat-bot carrier >/dev/null 2>&1 || { echo "FAIL: test image build"; exit 1; }
+rm -f "$E2E_OUT/nat.ready"
 
 echo "== start Postgres, kine, LiveKit, the agents, Kamailio, the NAT, the carrier =="
 $CL up -d postgres kine livekit livekit-agent pipecat-bot kamailio kamailio-route nat carrier 2>&1 | tail -1
 wait_for 60 "the NAT is ready" test -e "$E2E_OUT/nat.ready" || exit 1
 wait_for 30 "Kamailio routes to the carrier through the NAT" route_added kamailio-route || exit 1
+wait_for 60 "the carrier answers its API" http_ok http://nat:8080/healthz || exit 1
 
 echo "== migrate (waits for Postgres by itself) =="
 docker run --rm --network "$E2E_NET" -e DATABASE_URL="$E2E_DATABASE_URL" agentdialer:e2e migrate \
@@ -156,10 +153,12 @@ pg "SELECT outcome, count(*) FROM call_attempts GROUP BY 1 ORDER BY 1;" | tee "$
 DIALS=$(pg "SELECT count(*) FROM call_attempts WHERE dialed_at IS NOT NULL")
 TWICE=$(pg "SELECT count(*) FROM (SELECT lead_id FROM call_attempts WHERE dialed_at IS NOT NULL GROUP BY lead_id HAVING count(*) > 1) x")
 BYES=$(pg "SELECT count(*) FROM call_attempts a WHERE EXISTS (SELECT 1 FROM attempt_events e WHERE e.attempt_id = a.id AND $CARRIER_BYE)")
-INVITES=$(grep -c "^INVITE sip:" "$E2E_OUT/cluster_sip_messages.log" 2>/dev/null); INVITES=${INVITES:-0}
+CALLS=$(sim_count "True")
+AUTHED=$(sim_count "c['auth'] == 'ok' and c['invites'] == 2")
 [ "$DIALS" = "$N" ] && [ "$TWICE" = 0 ] || { echo "FAIL: $DIALS dials, $TWICE leads dialed twice"; FAIL=1; }
-[ "$INVITES" = "$N" ] || { echo "FAIL: the carrier received $INVITES INVITEs, want $N"; FAIL=1; }
-echo "ok: $DIALS dials, $INVITES INVITEs at the carrier, $TWICE leads dialed twice, $BYES calls ended by the carrier's BYE"
+[ "$CALLS" = "$N" ] || { echo "FAIL: the carrier saw $CALLS calls, want $N"; FAIL=1; }
+[ "$AUTHED" = "$N" ] || { echo "FAIL: $AUTHED calls passed the 407 challenge, want $N"; FAIL=1; }
+echo "ok: $DIALS dials, $CALLS calls at the carrier (each challenged, then authenticated), $TWICE leads dialed twice, $BYES calls ended by the carrier's BYE"
 for c in 1 2; do
   AGENTS=$(pg "SELECT count(*) FROM call_attempts WHERE campaign_id=$c AND agent_identity IS NOT NULL")
   [ "$AGENTS" = $((N / 2)) ] || { echo "FAIL: campaign $c had $AGENTS calls with an agent"; FAIL=1; }

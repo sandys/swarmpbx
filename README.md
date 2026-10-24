@@ -2,8 +2,13 @@
 
 AgentDialer is a SIP-only, AI-agent-native, Kubernetes-native outbound dialer.
 It is written in Rust. AI agents (LiveKit and pipecat) replace human agents. The
-campaign and compliance "brain" is the product; the media plane reuses proven
-engines.
+campaign and compliance "brain" is the product. Each dialer node carries its
+own calls (SIP and RTP) with vendored libraries, behind Kamailio.
+
+The primary target is LiveKit Cloud SIP. The quickstart below connects the
+dialer to LiveKit Cloud SIP and a LiveKit phone number, and places calls.
+Twilio Elastic SIP Trunking is a second supported carrier ("Call through
+Twilio").
 
 `PLAN.md` holds the authoritative architecture. `.agents/REPO_GUIDE.md` holds
 the working conventions. Read both before you change code.
@@ -21,8 +26,260 @@ AgentDialer runs outbound dial campaigns:
 
 Parts of this are not complete yet. See "Known limits" under "Status".
 
-It does NOT interface with the PSTN. It speaks SIP only. The AI agent is the
-"human".
+It speaks SIP only. It reaches phone numbers through a SIP trunk. The AI agent
+is the "human".
+
+## Quickstart: place calls through LiveKit Cloud SIP
+
+These steps stand up the whole stack in Docker Compose, connect it to LiveKit
+Cloud SIP with a phone number, and place calls. This is the primary supported
+use, and it must never break: `e2e/run_lkcloud_e2e.sh` runs the same steps
+against LiveKit Cloud. The host needs only bash, git, and the Docker CLI.
+
+```
+ your agent ⇄ room (the stack's LiveKit) ⇄ WebRTC ⇄ agentdialer node
+ node ⇄ SIP ⇄ Kamailio ⇄ SIP (internet) ⇄ LiveKit Cloud SIP ⇄ room ⇄ callee agent
+ node ⇄ RTP (internet) ⇄ LiveKit Cloud SIP
+```
+
+A call goes like this:
+
+1. The node dials your LiveKit phone number at your project's SIP URI, as it
+   dials a carrier. LiveKit Cloud is the trunk.
+2. LiveKit Cloud asks for the trunk password (a 407 digest challenge). The
+   node answers with the credentials that setup made.
+3. A dispatch rule puts the call into a room of its own in LiveKit Cloud. A
+   callee agent joins that room and answers.
+4. The audio goes straight between the node and LiveKit Cloud. The stack's own
+   LiveKit server holds the dialer's side of the call, where your agent talks.
+
+LiveKit phone numbers take incoming calls only. So these calls stay in
+LiveKit Cloud: they do not go through the public phone network, and no phone
+rings. To call a real phone, use a carrier trunk ("Call through Twilio").
+
+### What you need
+
+1. A LiveKit Cloud project. Each LiveKit Cloud plan includes one free US phone
+   number.
+2. An API key and its secret (LiveKit Cloud, Settings, API keys).
+3. The project's SIP URI (LiveKit Cloud, Project Settings). The project URL
+   does not give it.
+4. A `.env` file at the repository root. It is git-ignored:
+
+   ```
+   LIVEKIT_URL=wss://<project>.livekit.cloud
+   LIVEKIT_API_KEY=...
+   LIVEKIT_API_SECRET=...
+   LIVEKIT_SIP_URI=sip:<id>.sip.livekit.cloud
+   ```
+
+### 1. Connect LiveKit Cloud SIP
+
+```
+e2e/livekit-cloud/run.sh setup
+```
+
+The script runs in a container, with LiveKit's SDK and the `lk` CLI. It never
+prints a secret. It does these steps, and it reuses each part that exists:
+
+- It rents a LiveKit phone number, or it reuses the number of the project. It
+  prints the number.
+- It creates the inbound trunk `agentdialer-e2e`, with the user `agentdialer`
+  and a generated digest password. The dialer uses this trunk.
+- It creates the dispatch rule `agentdialer-e2e`. The rule serves the trunk and
+  the number. It gives each call a room of its own, and it sends the callee
+  agent `agentdialer-e2e-callee` into the room.
+- It creates the outbound trunk `agentdialer-e2e-outbound` for a reference call
+  (step 4). The trunk points at the project's own SIP URI, because LiveKit
+  numbers take incoming calls only.
+- It writes `.env.lkcloud` (git-ignored) for the stack: the SIP URI host as
+  `AD_SIP_TRUNK`, the trunk user and password, the caller ID, and the number.
+
+You can run it again at any time. `e2e/livekit-cloud/run.sh inspect` shows the
+number, the trunks, and the rule.
+
+### 2. Start the stack
+
+```
+QS="docker compose -f docker-compose.quickstart.yml -f docker-compose.livekit-cloud.yml --env-file .env --env-file .env.lkcloud"
+$QS up -d --build
+```
+
+The stack is Postgres, kine, LiveKit (the dialer's rooms), Kamailio (the SIP
+edge), the migrate job, the API (on `127.0.0.1:8080`), one dialer node, a demo
+agent, and the callee agent.
+- The demo agent joins each call on the dialer's side. It plays a tone and
+  leaves after `DEMO_AGENT_MAX_CALL_S` (default 30 s). The node then ends the
+  call.
+- The callee agent connects to LiveKit Cloud and joins each call's room there.
+  It also plays a tone.
+
+### 3. Place calls
+
+`scripts/api.sh` calls the API from a container on the stack's network. Put
+your LiveKit number in the lead:
+
+```
+NUMBER=$(sed -n 's/^LKCLOUD_NUMBER=//p' .env.lkcloud)
+scripts/api.sh POST /v1/campaigns \
+  '{"org_id": 1, "name": "first-calls", "concurrency_cap": 1,
+    "agent": {"runtime": "livekit", "agent_name": "demo"}}'
+# -> {"id":1, ... "state":"draft"}
+scripts/api.sh POST /v1/campaigns/1/leads \
+  "{\"leads\": [{\"phone_number\": \"$NUMBER\", \"timezone\": \"America/New_York\"}]}"
+scripts/api.sh POST /v1/campaigns/1/transition '{"transition": "start"}'
+scripts/api.sh POST /v1/campaigns/1/transition '{"transition": "sync_complete"}'
+```
+
+The campaign starts to dial when it is `running`.
+
+- Write each phone number in E.164 (`+` and the country code).
+- Give each lead an IANA timezone. A lead without one never dials, because
+  compliance fails closed.
+
+### 4. Watch
+
+```
+$QS logs -f node
+scripts/api.sh GET /v1/campaigns/1
+e2e/livekit-cloud/run.sh call
+```
+
+- The LiveKit Cloud dashboard shows a room for each call. The room name starts
+  with `agentdialer-e2e-`.
+- `e2e/livekit-cloud/run.sh call` is a reference call. LiveKit's own SIP
+  client calls your number through the outbound trunk, and the callee agent
+  joins. Use it to check the LiveKit Cloud side alone. The stack must be up,
+  because the callee agent runs in it.
+
+### 5. Stop
+
+```
+$QS down -v
+e2e/livekit-cloud/run.sh teardown   # optional: delete the trunks and the rule
+```
+
+Teardown keeps the number. If you do not need the number, release it in the
+LiveKit Cloud dashboard.
+
+### Your own agents
+
+- The dialer's side: put your agent in the campaign:
+  `{"runtime": "livekit", "agent_name": "<name>"}` for a LiveKit agent, or
+  `{"runtime": "pipecat", "start_url": "<url>"}` for a pipecat bot. The agent
+  must reach the stack's LiveKit server: run it on the stack's network
+  (`agentdialer-quickstart_default`) with `LIVEKIT_URL=ws://livekit:7880`.
+- The LiveKit Cloud side: the dispatch rule sends the agent
+  `agentdialer-e2e-callee` into each call's room. To answer with your own
+  agent, register it in LiveKit Cloud with that agent name, and start the
+  stack without `-f docker-compose.livekit-cloud.yml`.
+
+### If a call fails
+
+| Symptom | Cause |
+|---|---|
+| setup: `LIVEKIT_SIP_URI is not set` | Copy the SIP URI from LiveKit Cloud, Project Settings, into `.env`. |
+| setup: `LiveKit refused the request` | LiveKit Cloud refused the key, the secret, or the request. The message gives LiveKit's reason. |
+| setup: `LiveKit has no US number for rent now` | LiveKit has no free number at this time. Try again later. |
+| The campaign does not dial | The campaign is not `running`, or the lead has no timezone. |
+| The call connects, but the demo agent hears nothing | The callee agent did not join the room in LiveKit Cloud. Read `$QS logs callee`. |
+
+## Call through Twilio
+
+Twilio Elastic SIP Trunking is a second supported carrier, and it reaches real
+phones. The quickstart stack places the calls; only the trunk changes.
+`e2e/run_twilio_e2e.sh` runs these steps against a real trunk, and
+`e2e/run_twilio_e2e.sh --sim` runs them on every change with the carrier
+simulator in Twilio's place (CI).
+
+### What you need
+
+1. A Twilio account where Elastic SIP Trunking is available. An upgraded
+   account has it. Twilio's documents do not agree about Trial accounts. On
+   2026-10-22, Twilio's API refused trunks for a Trial account with HTTP 401.
+2. A caller ID: a Twilio number of the account, or a verified caller ID
+   (Twilio Console, Phone Numbers, Verified Caller IDs). Twilio requires one
+   of them in From.
+   - CAUTION: On a Trial account, Twilio calls verified numbers only. Put a
+     verified number in the lead. That phone rings.
+3. An API key (Twilio Console, Account, API keys & tokens). A Main key works
+   alone. A Standard key also needs the account SID.
+4. A `.env` file at the repository root. It is git-ignored:
+
+   ```
+   TWILIO_SID=SK...
+   TWILIO_SECRET=...
+   # With a Standard key:   TWILIO_ACCOUNT_SID=AC...
+   # A second pair, used with TWILIO_CREDS=2 (for example the account SID
+   # and the auth token):   TWILIO_SID2=AC...  TWILIO_SECRET2=...
+   # To choose the caller ID (default: the first number of the account,
+   # else the first verified caller ID):
+   # TWILIO_CALLER_ID=+15551234567
+   ```
+
+### 1. Set up the trunk
+
+```
+e2e/twilio/run.sh setup
+```
+
+The script runs in a container. It never prints a secret. It creates the trunk
+`agentdialer-e2e` (termination URI `agentdialer-<id>.pstn.twilio.com`), or it
+reuses the trunk when it exists. It also does these steps:
+
+- It creates a credential list with a generated digest password.
+- It turns on Symmetric RTP.
+- It selects the caller ID.
+- It writes `.env.twilio` (git-ignored) for the stack.
+
+You can run it again at any time. `e2e/twilio/run.sh inspect` shows the
+account, its numbers, its verified caller IDs, and its trunks.
+
+If setup prints `ACTION` for Symmetric RTP, turn on "Symmetric RTP" for the
+trunk in the Twilio Console. The node is behind NAT: its SDP names a private
+address, so Twilio must send the audio to the address that the audio comes
+from.
+
+### 2. Start the stack
+
+```
+docker compose -f docker-compose.quickstart.yml --env-file .env.twilio up -d --build
+```
+
+This is the quickstart stack without the callee agent.
+
+### 3. Place calls
+
+Do step 3 of the quickstart, but set `NUMBER` to the number to call, for
+example `NUMBER=+16504894546`. That is Twilio's "Play" test number. Calls to
+it are free, and you can reach it only through a trunk.
+
+### 4. Watch
+
+```
+docker compose -f docker-compose.quickstart.yml logs -f node
+scripts/api.sh GET /v1/campaigns/1
+e2e/twilio/run.sh calls +16504894546 2026-10-21T00:00:00Z   # Twilio's record
+```
+
+### 5. Stop
+
+```
+docker compose -f docker-compose.quickstart.yml down -v
+e2e/twilio/run.sh teardown   # optional: delete the trunk and its credentials
+```
+
+### If a call fails
+
+| Symptom | Cause |
+|---|---|
+| setup: "not available on a Trial account" | Twilio refuses trunks for the account. With an API key, try the account SID and the auth token: put them in `.env` as `TWILIO_SID2` and `TWILIO_SECRET2`, then run `TWILIO_CREDS=2 e2e/twilio/run.sh setup`. If Twilio refuses both, upgrade the account. |
+| setup: no caller ID | Get a Twilio number, or verify a caller ID in the Twilio Console. You can also set `TWILIO_CALLER_ID` in `.env`. |
+| A Trial account: outcome `failed` with SIP 403 (Twilio error 32100) | The destination or the caller ID is not verified. |
+| outcome `failed` with SIP 403 | The trunk credentials or the caller ID. Run setup again. |
+| outcome `failed` with SIP 400 | The number is not E.164. |
+| The call connects, but the agent hears nothing | Symmetric RTP is off on the trunk. |
+| The callee hangs up, but the call ends only about 30 s later | Behind NAT, Twilio's BYE may not reach Kamailio; the node's media timeout ends the call. Give Kamailio a public address to fix this. |
 
 ## Architecture
 
@@ -36,8 +293,9 @@ Two halves (see `PLAN.md` §0 and §0.10):
    - Kamailio is the SIP edge: a SIP-aware load balancer that keeps itself on
      each call's path (`Record-Route`). It carries no audio.
    - Every part is a normal Kubernetes pod: no host networking, no RTP port
-     range per call. The RTP goes straight between the carrier and the node,
-     through the NAT gateway (the carrier latches).
+     range per call. The RTP goes straight between the trunk (LiveKit Cloud
+     SIP or a carrier) and the node, through the NAT gateway (the trunk
+     latches).
 
 2. The campaign brain. The product:
    - campaigns, leads/lists, the hopper, pacing, dispositions, retries, DNC.
@@ -46,8 +304,8 @@ Two halves (see `PLAN.md` §0 and §0.10):
      orchestrator (no blind polling). There is no Redis in the product.
 
 ```
- carrier ⇄ SIP ⇄ Kamailio ⇄ SIP ⇄ agentdialer node (ad_sip)
- carrier ⇄ RTP (through the NAT gateway) ⇄ node (ad_media)
+ trunk ⇄ SIP ⇄ Kamailio ⇄ SIP ⇄ agentdialer node (ad_sip)
+ trunk ⇄ RTP (through the NAT gateway) ⇄ node (ad_media)
                           node ⇄ WebRTC ⇄ LiveKit room ⇄ LiveKit / pipecat agent
 ```
 
@@ -184,6 +442,7 @@ contract, so they cannot drift.
 | `AD_SIP_ADVERTISE_IP` | optional | the local address of the route to the proxy (else to the trunk) | The address in Via, Contact, and the SDP: the pod IP. Helm sets it from `status.podIP`. |
 | `AD_SIP_TRUNK_USER` | optional | — | The digest user for the trunk. Set it with `AD_SIP_TRUNK_PASSWORD`, or neither. |
 | `AD_SIP_TRUNK_PASSWORD` | optional | — | The digest password for the trunk. |
+| `AD_SIP_CALLER_ID` | optional | — | The caller ID in our From, in E.164 (`+15551234567`). Twilio requires a number of the account or a verified caller ID. Without it, From is `agentdialer`. |
 | `AD_MEDIA_PUBLIC_IP` | optional | — | The `public` media mode: the SDP names this address (an Elastic IP of the pod) instead of the pod IP. |
 | `AD_ETCD_ENDPOINTS` | required | — | kine (the etcd API on Postgres) endpoints, comma-separated. The nodes find each other, elect the leader, and receive their calls there. |
 | `AD_ROOM_PREFIX` | optional | `campaign` | Room name prefix. The room of a call is `<prefix>-<attempt id>`. |
@@ -245,8 +504,9 @@ docker run --rm --network host \
 docker compose down
 ```
 
-For a complete stack (Kamailio, a NAT, a SIPp carrier, LiveKit, and both test
-agents), use `e2e/docker-compose.cluster.yml`, which `e2e/run_e2e.sh` drives.
+For a complete stack (Kamailio, a NAT, the carrier simulator, LiveKit, and both
+test agents), use `e2e/docker-compose.cluster.yml`, which `e2e/run_e2e.sh`
+drives.
 
 ## End-to-end tests
 
@@ -258,18 +518,47 @@ orchestrator or probe log in `e2e/.out/` (git-ignored). The checks treat
 Postgres and kine as managed services: they use the database URL and the kine
 endpoint, never a shell in a container.
 
-The two call tests run on `e2e/docker-compose.cluster.yml`: one bridge network,
-no host networking. Kamailio is the SIP edge. The carrier (SIPp with
-`-rtp_echo`, which latches) is on the "internet" behind a NAT container that
-source-NATs with random ports, as the AWS NAT gateway does.
+The carrier in the tests is `e2e/carrier-sim`, a SIP carrier simulator built
+on diago (`github.com/emiago/diago`). It behaves like Twilio Elastic SIP
+Trunking termination:
+- a 407 digest challenge for each new INVITE;
+- E.164 and caller-ID checks;
+- symmetric RTP (it sends the audio back to the address it comes from);
+- per-number behaviors: echo, tone, busy, decline, unavailable, failure,
+  and no answer.
 
+Its API (`/calls`) reports what it saw on each call, and the tests assert on
+that API.
+
+The cluster call tests run on `e2e/docker-compose.cluster.yml`: one bridge
+network, no host networking, with Kamailio as the SIP edge. The carrier is on
+the "internet" behind a NAT container that source-NATs with random ports, as
+the AWS NAT gateway does.
+
+- `e2e/run_lkcloud_e2e.sh` — the quickstart above, as a live test against
+  LiveKit Cloud: setup, the quickstart stack, a campaign and a lead through
+  the API, and a real call over the internet to the project's LiveKit number.
+  It checks the digest auth, that each agent hears the other's tone, and that
+  our BYE ends the call. It also places a reference call from LiveKit's
+  outbound trunk. It needs the LiveKit Cloud keys and the SIP URI in `.env`.
+- `e2e/run_twilio_e2e.sh` — "Call through Twilio", as a test: the quickstart
+  stack, a campaign and a lead through the API, a real call through Twilio to
+  its free "Play" number, Twilio's audio at the agent, and Twilio's own record
+  of the call. It needs `.env` and an account where Elastic SIP Trunking is
+  available. On a Trial account, set `TWILIO_E2E_TO` to a verified number.
+  `--sim` runs the same stack and steps with the simulator in Twilio's place,
+  with no credentials.
 - `e2e/run_e2e.sh` — one node carries two calls itself: one with a real
   LiveKit agent (explicit dispatch) and one with a real pipecat bot (a start
-  request). Each agent joins its call room before the dial. The INVITE goes
-  through Kamailio. The agent's tone goes out as RTP through the NAT, comes back
-  from the carrier, and the agent hears it. The carrier's BYE comes back through
-  Kamailio and ends the attempt. The leader settles each lead, closes the room,
-  and completes both campaigns.
+  request). Each agent joins its call room before the dial.
+  - The INVITE goes through Kamailio. The carrier challenges it with 407, and
+    the node answers with the trunk credentials and the caller ID.
+  - The agent's tone goes out as RTP through the NAT, comes back from the
+    carrier, and the agent hears it.
+  - The carrier's BYE comes back through Kamailio and ends the attempt. The
+    leader settles each lead, closes the room, and completes both campaigns.
+  - A third campaign checks that the carrier's busy, failure, and no-answer
+    replies become the matching outcomes.
 - `e2e/run_cluster_e2e.sh` — three nodes share 24 calls through kine, with both
   agent runtimes, the same way. The test kills a node and then the leader. It
   checks that the dead node's calls end without a second dial, that a new
@@ -285,8 +574,19 @@ source-NATs with random ports, as the AWS NAT gateway does.
 - `spike/livekit/run_mvp_test.sh` — a real LiveKit agent wired into a room as a
   subscriber, then a SIP call driven into it (two-way audio proven).
 
-CI runs the four `e2e/` scripts on every change (`.github/workflows/ci.yml`).
-CI does not run the spike script.
+CI runs the `e2e/` scripts on every change (`.github/workflows/ci.yml`).
+Among them, `run_twilio_e2e.sh --sim` runs the quickstart stack with the
+carrier simulator, so the stack keeps working also without credentials. The
+LiveKit Cloud quickstart test (`run_lkcloud_e2e.sh`) runs in CI when the
+repository has the secrets `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+`LIVEKIT_API_SECRET`, and `LIVEKIT_SIP_URI`. The live Twilio test runs in CI
+when the repository has the secrets `TWILIO_SID` and `TWILIO_SECRET` (and, for
+a Standard key, `TWILIO_ACCOUNT_SID`). CI does not run the spike script.
+
+The test tier also runs `crates/ad_sip/tests/twilio.rs` on every change: our
+SIP user agent against an in-process callee that answers like Twilio. It
+checks the 407 digest, the caller ID in From, the E.164 Request-URI, and
+`Max-Forwards: 70`, and that bad credentials end the call after one retry.
 
 ## Deployment
 
@@ -311,6 +611,13 @@ Built and proven (Docker-first tests + e2e):
   behind Kamailio, and bridges the audio into the room with our own WebRTC
   participant. No `livekit/sip`, no host networking. Proven through a NAT with
   a latching carrier (`e2e/run_e2e.sh`, `e2e/run_cluster_e2e.sh`).
+- the quickstart, the primary target: the quickstart stack placed real calls
+  over the internet to a LiveKit number at LiveKit Cloud SIP, through Docker's
+  NAT and a home NAT. LiveKit's 407 digest challenge passed, the audio crossed
+  both ways, and our BYE ended the call (`e2e/run_lkcloud_e2e.sh`, 2026-10-24).
+  These calls did not go through the public phone network. A live call through
+  Twilio is not proven yet: Twilio refused trunks for the test account
+  (`GAPS.md` CARRIER-1).
 - the cluster (`PLAN.md` §0.10.8b): orchestrator replicas are nodes that share
   the calls through kine. One node leads and assigns calls; a dead node's calls
   end without a second dial; Postgres fences a node that lost a call. Proven
@@ -341,7 +648,7 @@ Known limits of the call path (`PLAN.md` §0.0, "Open"):
 
 - RTP latching follows `rustrtc`'s rules, which one marked packet can win; the
   patch against RTP bleed is not done.
-- Not tested yet: digest auth (407) and a resent 200 against SIPp. Not built:
+- Not tested yet: a resent 200. Not built:
   session timers, the trunk OPTIONS check, the `public` media mode, DTMF.
 - A node that dies drops its live calls; nothing sends BYE to the carrier for
   them yet.

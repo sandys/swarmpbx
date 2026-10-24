@@ -30,6 +30,7 @@ livekit:
 sip:
   trunk: ""                 # AD_SIP_TRUNK: the carrier's host:port (required)
   proxy: ""                 # AD_SIP_PROXY: the SIP edge's host:port, e.g. kamailio:5060
+  callerId: ""              # AD_SIP_CALLER_ID: E.164, e.g. a Twilio number of the account
 
 # The API: a normal Deployment + Service + HPA.
 api:

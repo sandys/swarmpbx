@@ -104,6 +104,32 @@ fn invalid_numbers_are_rejected_not_ignored() {
 }
 
 #[test]
+fn the_caller_id_must_be_e164() {
+    for good in ["+15551234567", "+447911123456"] {
+        let mut pairs = all_required();
+        pairs.push(("AD_SIP_CALLER_ID", good));
+        let cfg = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap();
+        assert_eq!(cfg.sip.caller_id.as_deref(), Some(good));
+    }
+    for bad in [
+        "15551234567",
+        "+0551234567",
+        "+1555",
+        "+1555abc4567",
+        "agentdialer",
+    ] {
+        let mut pairs = all_required();
+        pairs.push(("AD_SIP_CALLER_ID", bad));
+        let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
+        assert!(
+            err.invalid[0].starts_with("AD_SIP_CALLER_ID="),
+            "{bad}: {:?}",
+            err.invalid
+        );
+    }
+}
+
+#[test]
 fn the_sip_settings_have_defaults_and_are_checked() {
     let cfg = OrchestratorConfig::from_lookup(lookup_from(&all_required())).unwrap();
     assert_eq!(cfg.sip.trunk, "carrier.example:5060");
@@ -355,14 +381,21 @@ fn e2e_scripts_pass_exactly_the_role_contract() {
 /// Every `agentdialer:e2e` service in the e2e compose files, as (file, service,
 /// role, env names). The files use one layout: a service at two spaces, its
 /// `command: ["<role>"]` and an `environment:` list of `- NAME=value` lines.
+/// The agentdialer services of every compose file: `e2e/*.yml` and the
+/// repository's `docker-compose*.yml` (the quickstart among them).
 fn e2e_compose_services() -> Vec<(String, String, String, BTreeSet<String>)> {
     let mut out = Vec::new();
-    let dir = repo_root().join("e2e");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "yml"))
-        .collect();
+    let in_dir = |dir: PathBuf, keep: &dyn Fn(&str) -> bool| -> Vec<PathBuf> {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().is_some_and(|n| keep(&n.to_string_lossy())))
+            .collect()
+    };
+    let mut files = in_dir(repo_root().join("e2e"), &|n| n.ends_with(".yml"));
+    files.extend(in_dir(repo_root(), &|n| {
+        n.starts_with("docker-compose") && n.ends_with(".yml")
+    }));
     files.sort();
     for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
@@ -402,7 +435,7 @@ fn e2e_compose_services() -> Vec<(String, String, String, BTreeSet<String>)> {
             };
             if indent == 4 {
                 in_env = t == "environment:";
-                if t == "image: agentdialer:e2e" {
+                if t.starts_with("image: agentdialer:") {
                     *ours = true;
                 }
                 if let Some(cmd) = t.strip_prefix("command:") {
@@ -432,6 +465,37 @@ fn e2e_compose_services_pass_exactly_the_role_contract() {
     );
     for (file, service, role, env) in &services {
         assert_env_matches_contract(&format!("{file} ({service})"), role, env);
+    }
+}
+
+/// The quickstart stack (LiveKit Cloud SIP, Twilio) must send through the SIP
+/// edge, answer the trunk's 407 challenge, and carry a caller ID.
+#[test]
+fn the_quickstart_node_passes_what_a_trunk_needs() {
+    let services = e2e_compose_services();
+    let nodes: Vec<_> = services
+        .iter()
+        .filter(|(file, _, role, _)| {
+            file == "docker-compose.quickstart.yml" && role == "orchestrator"
+        })
+        .collect();
+    assert!(
+        !nodes.is_empty(),
+        "docker-compose.quickstart.yml must run an orchestrator"
+    );
+    for (_, service, _, env) in nodes {
+        for need in [
+            "AD_SIP_TRUNK",
+            "AD_SIP_PROXY",
+            "AD_SIP_TRUNK_USER",
+            "AD_SIP_TRUNK_PASSWORD",
+            "AD_SIP_CALLER_ID",
+        ] {
+            assert!(
+                env.contains(need),
+                "docker-compose.quickstart.yml ({service}) must set {need}"
+            );
+        }
     }
 }
 #[test]

@@ -134,3 +134,35 @@ except Exception:
     pass
 ' "$1" 2>/dev/null
 }
+# The carrier simulator (e2e/carrier-sim) reports what it saw at /calls.
+E2E_SIM_URL="${E2E_SIM_URL:-http://nat:8080/calls}"
+# sim_count <expr>: the number of calls at the carrier for which the Python
+# expression <expr> over the call record `c` is true.
+sim_count() {
+  docker run --rm --network "$E2E_NET" "$E2E_PY_IMAGE" python3 -c '
+import json, sys, urllib.request
+try:
+    calls = json.load(urllib.request.urlopen(sys.argv[1], timeout=5))
+    expr = "(" + sys.argv[2] + ")"  # the parentheses allow a multi-line expression
+    print(sum(1 for c in calls if eval(expr, {}, {"c": c})))
+except Exception:
+    print("")
+' "$E2E_SIM_URL" "$1" 2>/dev/null
+}
+# sim_eq <expr> <n>: exactly n calls at the carrier match <expr>.
+sim_eq() { [ "$(sim_count "$1")" = "$2" ]; }
+
+# The number of rooms in an agent's /stats whose record passes a Python
+# expression over r (for example "r['loud_in'] > 0").
+rooms_count() {
+  docker run --rm --network "$E2E_NET" "$E2E_PY_IMAGE" python3 -c '
+import json, sys, urllib.request
+try:
+    rooms = json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["rooms"]
+    expr = "(" + sys.argv[2] + ")"
+    print(sum(1 for r in rooms.values() if eval(expr, {}, {"r": r})))
+except Exception:
+    print("")
+' "$1" "$2" 2>/dev/null
+}
+rooms_ge() { local n; n=$(rooms_count "$1" "$2"); [ "${n:-0}" -ge "$3" ] 2>/dev/null; }

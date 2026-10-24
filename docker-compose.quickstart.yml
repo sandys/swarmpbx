@@ -1,0 +1,123 @@
+# The quickstart stack (README.md): place calls through a SIP trunk.
+#
+# One agentdialer node carries the calls itself (SIP and RTP) behind Kamailio,
+# LiveKit runs the call rooms, and a demo agent joins each call (it plays a
+# tone and leaves after DEMO_AGENT_MAX_CALL_S). Every service is a normal
+# container on a bridge network: no host networking. The node reaches the
+# trunk through Docker's NAT; the far end sends the audio back to the address
+# that the audio comes from.
+#
+# An env file gives the trunk. LiveKit Cloud SIP is the primary target
+# (README.md, "Quickstart"):
+#   e2e/livekit-cloud/run.sh setup   # once: the number, the trunks, .env.lkcloud
+#   docker compose -f docker-compose.quickstart.yml -f docker-compose.livekit-cloud.yml \
+#       --env-file .env --env-file .env.lkcloud up -d --build
+# Twilio Elastic SIP Trunking (README.md, "Call through Twilio"):
+#   e2e/twilio/run.sh setup          # once: the trunk, its credentials, .env.twilio
+#   docker compose -f docker-compose.quickstart.yml --env-file .env.twilio up -d --build
+# Then create a campaign, load leads, and start it with scripts/api.sh.
+#
+# e2e/run_lkcloud_e2e.sh and e2e/run_twilio_e2e.sh run these steps as tests.
+name: agentdialer-quickstart
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
+          # Dynamic addresses come from the upper half; LiveKit (.5) and
+          # Kamailio (.10) keep fixed ones below it.
+          ip_range: 10.20.0.128/25
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ad
+      POSTGRES_PASSWORD: ad
+      POSTGRES_DB: ad
+
+  # kine retries Postgres until it answers.
+  kine:
+    image: rancher/kine:v0.13.17
+    command:
+      - --endpoint=postgres://ad:ad@postgres:5432/ad?sslmode=disable
+      - --listen-address=0.0.0.0:2379
+      - --compact-interval=5m
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./e2e/livekit-cluster.yaml:/etc/livekit.yaml:ro
+    networks:
+      default:
+        ipv4_address: 10.20.0.5
+
+  # A demo LiveKit agent (e2e/agents/livekit). Use your own agent by its
+  # agent name in the campaign instead.
+  agent:
+    build:
+      context: e2e/agents/livekit
+    image: ad-e2e-livekit-agent
+    environment:
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: devsecret_devsecret_devsecret_32b
+      AGENT_NAME: demo
+      STATS_PORT: "8088"
+      MAX_CALL_S: "${DEMO_AGENT_MAX_CALL_S:-30}"
+
+  # The SIP edge: the node sends its INVITEs here; Kamailio stays on each
+  # call's path (Record-Route) and carries no audio.
+  kamailio:
+    image: ghcr.io/kamailio/kamailio:5.8.4-bookworm
+    environment:
+      SHM_MEMORY: "64"
+      PKG_MEMORY: "8"
+    volumes:
+      - ./e2e/kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+    networks:
+      default:
+        ipv4_address: 10.20.0.10
+
+  # Applies the migrations, then exits. It waits for Postgres by itself.
+  migrate:
+    build: .
+    image: agentdialer:local
+    command: ["migrate"]
+    environment:
+      - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
+      - RUST_LOG=info
+    restart: on-failure
+
+  api:
+    build: .
+    image: agentdialer:local
+    command: ["api"]
+    environment:
+      - AD_API_ADDR=0.0.0.0:8080
+      - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
+      - RUST_LOG=info
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  node:
+    build: .
+    image: agentdialer:local
+    command: ["orchestrator"]
+    environment:
+      - HOSTNAME=node-1
+      - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
+      - AD_SIP_TRUNK=${AD_SIP_TRUNK:-}
+      - AD_SIP_PROXY=kamailio:5060
+      - AD_SIP_TRUNK_USER=${AD_SIP_TRUNK_USER:-}
+      - AD_SIP_TRUNK_PASSWORD=${AD_SIP_TRUNK_PASSWORD:-}
+      - AD_SIP_CALLER_ID=${AD_SIP_CALLER_ID:-}
+      - AD_ETCD_ENDPOINTS=http://kine:2379
+      - AD_ROOM_PREFIX=call
+      - AD_NODE_CAPACITY=10
+      - RUST_LOG=info

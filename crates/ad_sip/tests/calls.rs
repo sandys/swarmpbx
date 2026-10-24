@@ -121,6 +121,7 @@ async fn ua() -> SipUa {
         advertise: LOOPBACK,
         proxy: None,
         user: "agentdialer".into(),
+        caller_id: None,
     })
     .await
     .unwrap()
@@ -241,4 +242,31 @@ async fn an_invite_that_cannot_leave_is_not_sent() {
         matches!(outcome, Outcome::NotSent(_)),
         "an INVITE that cannot leave is not a call"
     );
+}
+
+#[tokio::test]
+async fn the_cancel_follows_the_invite_through_the_proxy() {
+    // The callee stands in for the SIP edge (Kamailio). The Request-URI names
+    // a host where nothing listens, so a CANCEL that skipped the proxy would
+    // never reach the callee, and no 487 would come back.
+    let (edge, mut ends) = callee(Script::Ring).await;
+    let ua = SipUa::start(SipConfig {
+        bind: SocketAddr::new(LOOPBACK, 0),
+        advertise: LOOPBACK,
+        proxy: Some(edge),
+        user: "agentdialer".into(),
+        caller_id: None,
+    })
+    .await
+    .unwrap();
+    let mut call = invite(SocketAddr::new(LOOPBACK, 9), Duration::from_millis(500));
+    call.target = "sip:+15550001111@127.0.0.1:9".into();
+    match within(ua.invite(call)).await.unwrap() {
+        Outcome::Rejected { code, .. } => assert_eq!(code, 487),
+        _ => panic!("the CANCEL reached the edge, and the INVITE ended with 487"),
+    }
+    assert!(matches!(
+        within(ends.recv()).await,
+        Some(TerminatedReason::UacCancel)
+    ));
 }

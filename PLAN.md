@@ -111,7 +111,9 @@ cleanly (SIGTERM) first takes no new calls and lets its calls end
 
 **Proof (Docker Compose, no host networking; `e2e/docker-compose.cluster.yml`).**
 One bridge network holds the nodes, Postgres, kine, LiveKit, the test
-agents, and Kamailio. The carrier (SIPp with `-rtp_echo`, which latches) sits
+agents, and Kamailio. The carrier is `e2e/carrier-sim`, a simulator on diago
+that behaves like Twilio Elastic SIP Trunking (407 digest, E.164 and
+caller-ID checks, symmetric RTP, per-number busy/failure/no-answer). It sits
 on the "internet" at 203.0.113.20, held by a NAT container. Traffic from the
 cluster to it is source-NATed with random ports (`SNAT --random-fully`), as
 by the AWS NAT gateway; one-shot sidecars add the route, as a VPC route table
@@ -141,8 +143,31 @@ the carrier cannot be a container on a second network.)
 - (6) `livekit/sip` and Redis are gone from the e2e tests; the LiveKit
   webhook code is still in the api, unused by the new path.
 
-**Open.** The `rustrtc` latching patch; 407 auth and a resent 200 against
-SIPp; session timers and the trunk OPTIONS check (copy from `rustpbx`); the
+**LiveKit Cloud SIP (the primary target).** README.md "Quickstart: place
+calls through LiveKit Cloud SIP" is the supported quickstart
+(`docker-compose.quickstart.yml` with `docker-compose.livekit-cloud.yml`,
+`e2e/livekit-cloud/run.sh setup`). The node calls the project's LiveKit
+number at its SIP URI, as it calls a carrier; a dispatch rule puts each call
+into a room of its own with a callee agent (GAPS.md CARRIER-3). It must never
+break: `e2e/run_twilio_e2e.sh --sim` runs the quickstart stack with the
+simulator in CI, and the live `e2e/run_lkcloud_e2e.sh` runs the quickstart
+against LiveKit Cloud. The live test passed (2026-10-22, again 2026-10-24):
+digest auth, two-way audio through Docker's NAT and a home NAT, and a clean
+BYE. A reference call through a LiveKit outbound trunk reached the same
+number. LiveKit numbers take incoming calls only, so no call went through the
+public phone network.
+
+**Twilio (a supported carrier).** README.md "Call through Twilio" uses the
+same quickstart stack with `e2e/twilio/run.sh setup`, and it reaches real
+phones. `crates/ad_sip/tests/twilio.rs` (407 digest, caller ID, E.164,
+`Max-Forwards: 70`, no auth loop) runs in the test tier. The live
+`e2e/run_twilio_e2e.sh` calls Twilio's free "Play" number; it needs an
+account where Elastic SIP Trunking is available (Twilio refused it for the
+Trial test account) and a number for the caller ID.
+
+**Open.** The `rustrtc` latching patch; the first live Twilio run (blocked on
+the account); a resent 200 against the simulator; session timers and the
+trunk OPTIONS check (copy from `rustpbx`); the
 `public` media mode; DTMF; Kamailio's dialog module to BYE the calls of a
 dead node; a node CPU profile (a node used about half a core at two calls);
 `cargo deny` on the vendored licenses; a staging test on EKS with each target

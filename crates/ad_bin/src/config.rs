@@ -61,6 +61,7 @@ pub const ORCHESTRATOR: &[EnvVar] = &[
     opt("AD_SIP_ADVERTISE_IP"),
     opt("AD_SIP_TRUNK_USER"),
     opt("AD_SIP_TRUNK_PASSWORD"),
+    opt("AD_SIP_CALLER_ID"),
     opt("AD_MEDIA_PUBLIC_IP"),
     req("AD_ETCD_ENDPOINTS"),
     opt("AD_ROOM_PREFIX"),
@@ -190,6 +191,9 @@ pub struct SipSettings {
     pub auth: Option<(String, String)>,
     /// The `public` media mode: the SDP names this address.
     pub media_public_ip: Option<std::net::IpAddr>,
+    /// The E.164 caller ID in our From. Twilio requires a number of the
+    /// account or a verified caller ID.
+    pub caller_id: Option<String>,
 }
 
 impl fmt::Debug for SipSettings {
@@ -201,6 +205,7 @@ impl fmt::Debug for SipSettings {
             .field("advertise_ip", &self.advertise_ip)
             .field("auth_user", &self.auth.as_ref().map(|(u, _)| u))
             .field("media_public_ip", &self.media_public_ip)
+            .field("caller_id", &self.caller_id)
             .finish()
     }
 }
@@ -263,6 +268,14 @@ impl OrchestratorConfig {
             &mut invalid,
         );
         let media_public_ip = parsed(&lookup, "AD_MEDIA_PUBLIC_IP", "an IP address", &mut invalid);
+        let caller_id = value(&lookup, "AD_SIP_CALLER_ID").map(|v| v.trim().to_string());
+        if let Some(c) = &caller_id {
+            if !is_e164(c) {
+                invalid.push(format!(
+                    "AD_SIP_CALLER_ID={c:?} (expected an E.164 number like +15551234567)"
+                ));
+            }
+        }
         let auth = match (
             value(&lookup, "AD_SIP_TRUNK_USER"),
             value(&lookup, "AD_SIP_TRUNK_PASSWORD"),
@@ -310,6 +323,7 @@ impl OrchestratorConfig {
                 advertise_ip,
                 auth,
                 media_public_ip,
+                caller_id,
             },
             batch_limit,
             calls_per_sec,
@@ -350,6 +364,16 @@ impl fmt::Debug for OrchestratorConfig {
             .field("worker", &self.worker)
             .finish_non_exhaustive()
     }
+}
+
+/// `+`, then 7 to 15 digits, the first not 0.
+fn is_e164(s: &str) -> bool {
+    let Some(digits) = s.strip_prefix('+') else {
+        return false;
+    };
+    (7..=15).contains(&digits.len())
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && !digits.starts_with('0')
 }
 
 /// Parse an optional value, or record why it is invalid.

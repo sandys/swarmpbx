@@ -538,8 +538,37 @@ Each gap uses this form:
   - A node finds the agent in the room by asking LiveKit every 250 ms until it joins. At high call rates a room event would cost less: join the room before the dial, or ask LiveKit less often.
   - A node carries the media of its calls (D-9), so a node that dies drops its live calls. They end without a second dial, but the consumer hears the call drop. Kamailio's dialog module could send BYE to the carrier for them.
   - Measured in the cluster e2e (2026-10-21, 8 cores for the whole stack): a node used about half a core with two calls, and about the same with four. Most of that cost does not grow with the calls; profile it before a capacity plan. The Python test agents, one process per runtime, ran out of CPU above about six calls at once.
-  - A failover takes up to the TTL plus a third of it (default 10 s + 3.3 s) before the calls of a dead node move. Calls that were connected keep running in LiveKit during that time.
+  - A failover takes up to the TTL plus a third of it (default 10 s + 3.3 s) before the attempts of a dead node move; its connected calls dropped with it.
 - **Do:** run kine with two or more replicas against the managed Postgres and measure the failover; measure the kine table load; replace the readiness poll with a push signal on the node that owns the call (no webhook).
+
+#### CARRIER-1 Twilio Elastic SIP Trunking, a supported carrier — P1 (new 2026-10-21; it was the primary carrier until 2026-10-24)
+- **Now:** README "Call through Twilio" uses the quickstart stack (`docker-compose.quickstart.yml`) with `e2e/twilio/run.sh setup`. `crates/ad_sip/tests/twilio.rs` and `e2e/run_twilio_e2e.sh --sim` (with the diago carrier simulator) guard it on every change. Twilio reaches real phones; LiveKit Cloud SIP (CARRIER-3) does not.
+- **Not yet proven against Twilio itself:** the live `e2e/run_twilio_e2e.sh` stops at setup. The account is a Trial account, and Twilio's trunks API refuses it ("HTTP 401: This feature is not available on a Trial account", again on 2026-10-22). Twilio's documents do not agree: the Help Center allows one trunk on Trial, and the SIP Trunking limits page requires an upgrade. Twilio gave the same 401 to a Main API key and to the account SID with the auth token, so the account causes it, not the key. Not tested: the Console. The account also has no number and no verified caller ID. On Trial, Twilio calls verified destinations only.
+- **Found by the carrier simulator (2026-10-21), fixed:** (1) Kamailio's Via had no `rport`. Behind a NAT that changes the source port (the AWS NAT gateway), a carrier that follows RFC 3261 sent its 407 to a port with no NAT mapping, and the call timed out. Kamailio now adds `rport` (`add_local_rport()`). (2) rsipstack sends a CANCEL to the Request-URI host, so the ring-timeout CANCEL skipped Kamailio. `ad_sip` now preloads a Route to the SIP edge, and Kamailio removes it. SIPp hid the first fault, because it replies to the source address. The SIPp tests had no ring timeout through Kamailio, so they did not find the second.
+- **Behind NAT (Docker Compose):** Twilio's in-dialog requests (its BYE) go to Kamailio's Record-Route address, which is private; the node's media timeout then ends the call. Give Kamailio a public address (a second listen socket with `advertise`) for production.
+- **Do:** upgrade the account and buy one number, then run `e2e/run_twilio_e2e.sh`; add the repository secrets so CI runs it; add a per-campaign caller ID.
+
+#### CARRIER-3 LiveKit Cloud SIP, the primary target — done (2026-10-22; primary since 2026-10-24)
+- **Now:** README "Quickstart: place calls through LiveKit Cloud SIP" is the supported quickstart, and it must never break. `e2e/run_lkcloud_e2e.sh` runs it live (the tool is `e2e/livekit-cloud/run.sh`); it passed against a real LiveKit Cloud project:
+  - Our node called the project's LiveKit number (+12402319284) at its SIP URI over the internet, through Kamailio, Docker's NAT, and a home NAT.
+  - LiveKit challenged with 407 (realm `LiveKit`). Our digest passed, and LiveKit matched our inbound trunk and the number.
+  - Each agent heard the other's tone, and our BYE ended the call.
+  - LiveKit's own SIP client called the same number through a LiveKit outbound trunk, with the same results.
+- **Learned:**
+  - LiveKit Cloud latches RTP (it sends to the source of our RTP, not to the private address in our SDP).
+  - A LiveKit number routes to a dispatch rule as its id (`PN_...`) in the rule's `trunk_ids`. A rule with no trunks cannot take a number.
+  - LiveKit numbers are inbound only, so the outbound trunk points at the project's own SIP URI.
+- **Not tested:** a call through the public phone network. No call left LiveKit. A call from a phone to the number uses the `PN_...` route of the same rule.
+- **Do:** add the repository secrets so CI runs it (`lkcloud-e2e`).
+
+#### CARRIER-2 Twilio Programmable Voice paths — P2 (new 2026-10-21)
+Elastic SIP Trunking (CARRIER-1) is the dialer's carrier path. Programmable Voice gives two more SIP paths. Neither is built.
+- **SIP Domain, outbound (a test path on a Trial account, if Twilio allows it):** the node sends its INVITE to `<name>.sip.twilio.com` with digest credentials, as it does to a trunk. Twilio then runs the domain's TwiML, for example `<Dial><Number>` to a verified phone, and the phone talks to our agent. It needs no public address, because we start the call. Not confirmed: whether a Trial account can use SIP Domains and dial out from them. A Trial call also plays a trial message, and the callee must press a key. Do: a reusable `setup-domain` command in `e2e/twilio/run.sh` and a `--domain` mode of `e2e/run_twilio_e2e.sh`.
+- **`<Dial><Sip>`, inbound to us ("click-to-call"):** Twilio's Calls API rings a phone and bridges it with `<Dial><Sip>sip:…@our-edge</Sip>`. That is an inbound call to the dialer, and it needs:
+  - a public SIP address on Kamailio (an Elastic IP or an NLB, with `advertise` on its carrier-side socket);
+  - inbound calls in the node. Today the node refuses a new INVITE with 403, on purpose;
+  - a routing rule from the INVITE to an agent and a room.
+  - Do: test it in Docker Compose with the carrier simulator as the caller, and live only where Kamailio has a public address (EKS).
 ---
 
 ## 6. Where AgentDialer can be better than the references
