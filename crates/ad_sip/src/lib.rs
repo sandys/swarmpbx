@@ -6,25 +6,36 @@
 //! drives one outbound call: the INVITE (through the SIP edge, Kamailio, when
 //! a proxy is set), a ring timeout that cancels, and the end of the call.
 //!
-//! The node only places calls. It answers OPTIONS (the edge's health check)
-//! and refuses a new INVITE.
+//! It also answers one kind of inbound call: an INVITE that the node expects
+//! (click-to-call: the provider calls the phone, then calls us). The INVITE
+//! names the call in the [`CALL_HEADER`] header with the token of
+//! [`SipUa::expect`]. Any other new INVITE is refused. The node answers
+//! OPTIONS (the edge's health check).
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rsipstack::dialog::authenticate::Credential;
-use rsipstack::dialog::dialog::{DialogState, DialogStateReceiver, TerminatedReason};
+use rsipstack::dialog::dialog::{Dialog, DialogState, DialogStateReceiver, TerminatedReason};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::dialog::invite_dialog::InviteDialog;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{self, StatusCodeKind};
-use rsipstack::transaction::TransactionReceiver;
+use rsipstack::transaction::key::TransactionRole;
+use rsipstack::transaction::{Transaction, TransactionReceiver};
 use rsipstack::transport::udp::UdpConnection;
 use rsipstack::transport::{SipAddr, TransportLayer};
 use rsipstack::EndpointBuilder;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+
+/// The header of an inbound INVITE that names the call the node expects. A
+/// provider copies it from the SIP URI it dials
+/// (`sip:...?x-ad-call=<token>`).
+pub const CALL_HEADER: &str = "X-AD-Call";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SipError {
@@ -108,6 +119,9 @@ pub struct SipUa {
     inner: Arc<Inner>,
 }
 
+/// The inbound calls that the node expects, by token.
+type Waiters = Mutex<HashMap<String, oneshot::Sender<Incoming>>>;
+
 struct Inner {
     dialogs: Arc<DialogLayer>,
     contact: sip::Uri,
@@ -115,6 +129,9 @@ struct Inner {
     /// The SIP edge as a preloaded Route.
     proxy: Option<sip::typed::Route>,
     local: SocketAddr,
+    /// The address in Via and Contact.
+    external: SocketAddr,
+    waiters: Arc<Waiters>,
     stop: CancellationToken,
 }
 
@@ -151,10 +168,16 @@ impl SipUa {
         };
         let contact = uri(&cfg.user)?;
         let caller = uri(cfg.caller_id.as_deref().unwrap_or(&cfg.user))?;
+        let waiters = Arc::new(Waiters::default());
 
         let serving = endpoint;
         tokio::spawn(async move { serving.serve().await });
-        tokio::spawn(answer_requests(dialogs.clone(), incoming));
+        tokio::spawn(answer_requests(
+            dialogs.clone(),
+            incoming,
+            waiters.clone(),
+            contact.clone(),
+        ));
         Ok(Self {
             inner: Arc::new(Inner {
                 dialogs,
@@ -171,6 +194,8 @@ impl SipUa {
                     None => None,
                 },
                 local,
+                external,
+                waiters,
                 stop,
             }),
         })
@@ -179,6 +204,28 @@ impl SipUa {
     /// The bound SIP socket (useful when the port was 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local
+    }
+
+    /// The address in our Via and Contact: where the SIP edge reaches us.
+    pub fn contact_addr(&self) -> SocketAddr {
+        self.inner.external
+    }
+
+    /// Wait for the inbound INVITE that carries `token` in [`CALL_HEADER`].
+    /// While the returned value lives, that INVITE goes to it. Afterwards,
+    /// and for any other token, an INVITE gets 404.
+    pub fn expect(&self, token: &str) -> Expected {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(token.to_string(), tx);
+        Expected {
+            token: token.to_string(),
+            rx,
+            waiters: self.inner.waiters.clone(),
+        }
     }
 
     /// The address of the Request-URI host that our socket can send to.
@@ -290,7 +337,7 @@ impl SipUa {
             });
         }
         Ok(Outcome::Answered(Call {
-            answer: String::from_utf8_lossy(response.body()).into_owned(),
+            remote_sdp: String::from_utf8_lossy(response.body()).into_owned(),
             dialog,
             states,
             dialogs: self.inner.dialogs.clone(),
@@ -299,10 +346,93 @@ impl SipUa {
     }
 }
 
+/// An inbound call that the node waits for. Dropping it stops the wait.
+pub struct Expected {
+    token: String,
+    rx: oneshot::Receiver<Incoming>,
+    waiters: Arc<Waiters>,
+}
+
+impl Expected {
+    /// The INVITE, when it arrives. `None` when the user agent stopped.
+    pub async fn arrived(&mut self) -> Option<Incoming> {
+        (&mut self.rx).await.ok()
+    }
+}
+
+impl Drop for Expected {
+    fn drop(&mut self) {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.token);
+    }
+}
+
+/// An expected INVITE, not answered yet. Dropping it rejects the call (480).
+pub struct Incoming {
+    /// The caller's SDP offer.
+    pub offer: String,
+    pub call_id: String,
+    headers: Vec<(String, String)>,
+    dialog: Option<InviteDialog>,
+    states: Option<DialogStateReceiver>,
+    dialogs: Arc<DialogLayer>,
+}
+
+impl Incoming {
+    /// The value of a header of the INVITE (the name ignores case).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Answer with 200 OK and our SDP. The caller's ACK confirms the call.
+    pub fn accept(mut self, answer: String) -> Result<Call, SipError> {
+        let (Some(dialog), Some(states)) = (self.dialog.take(), self.states.take()) else {
+            return Err(SipError::Stack("the call was answered already".into()));
+        };
+        let sdp = vec![sip::Header::ContentType("application/sdp".into())];
+        if let Err(e) = dialog.accept(Some(sdp), Some(answer.into_bytes())) {
+            self.dialogs.remove_dialog(&dialog.id());
+            return Err(stack(e));
+        }
+        Ok(Call {
+            remote_sdp: std::mem::take(&mut self.offer),
+            dialog,
+            states,
+            dialogs: self.dialogs.clone(),
+            ended: None,
+        })
+    }
+
+    /// Refuse the call with a final response.
+    pub fn reject(mut self, code: u16) {
+        if let Some(dialog) = self.dialog.take() {
+            dialog.reject(Some(code.into()), None).ok();
+            self.dialogs.remove_dialog(&dialog.id());
+        }
+    }
+}
+
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        if let Some(dialog) = self.dialog.take() {
+            dialog
+                .reject(Some(sip::StatusCode::TemporarilyUnavailable), None)
+                .ok();
+            self.dialogs.remove_dialog(&dialog.id());
+        }
+    }
+}
+
 /// A connected call. Dropping it hangs up.
 pub struct Call {
-    /// The callee's SDP answer.
-    pub answer: String,
+    /// The other side's SDP: the callee's answer to our INVITE, or the
+    /// caller's offer of an inbound call.
+    pub remote_sdp: String,
     dialog: InviteDialog,
     states: DialogStateReceiver,
     dialogs: Arc<DialogLayer>,
@@ -317,7 +447,9 @@ impl Call {
         }
         let end = loop {
             match self.states.recv().await {
-                Some(DialogState::Terminated(_, reason)) => break end_of(reason),
+                Some(DialogState::Terminated(_, reason)) => {
+                    break end_of(reason, self.dialog.role())
+                }
                 Some(_) => {}
                 None => break Ended::Other("the dialog closed".into()),
             }
@@ -354,17 +486,27 @@ impl Drop for Call {
     }
 }
 
-fn end_of(reason: TerminatedReason) -> Ended {
-    match reason {
-        TerminatedReason::UasBye => Ended::RemoteHangup,
-        TerminatedReason::UacBye => Ended::LocalHangup,
-        other => Ended::Other(format!("{other:?}")),
+/// The reason names the side that sent BYE (UAC or UAS); our side is the UAC
+/// of a call we placed and the UAS of an inbound call.
+fn end_of(reason: TerminatedReason, role: TransactionRole) -> Ended {
+    match (reason, role) {
+        (TerminatedReason::UasBye, TransactionRole::Client)
+        | (TerminatedReason::UacBye, TransactionRole::Server) => Ended::RemoteHangup,
+        (TerminatedReason::UacBye, TransactionRole::Client)
+        | (TerminatedReason::UasBye, TransactionRole::Server) => Ended::LocalHangup,
+        (other, _) => Ended::Other(format!("{other:?}")),
     }
 }
 
 /// Requests that reach the node: in-dialog requests go to their dialog (the
-/// callee's BYE ends the call); OPTIONS gets 200; a new INVITE is refused.
-async fn answer_requests(dialogs: Arc<DialogLayer>, mut incoming: TransactionReceiver) {
+/// other side's BYE ends the call); OPTIONS gets 200; an expected INVITE
+/// goes to its waiter; any other new INVITE is refused.
+async fn answer_requests(
+    dialogs: Arc<DialogLayer>,
+    mut incoming: TransactionReceiver,
+    waiters: Arc<Waiters>,
+    contact: sip::Uri,
+) {
     while let Some(mut tx) = incoming.recv().await {
         let in_dialog = tx
             .original
@@ -389,12 +531,79 @@ async fn answer_requests(dialogs: Arc<DialogLayer>, mut incoming: TransactionRec
         }
         let status = match tx.original.method {
             sip::Method::Options => sip::StatusCode::OK,
-            sip::Method::Invite => sip::StatusCode::Forbidden,
+            sip::Method::Invite => {
+                let token = tx
+                    .original
+                    .headers
+                    .iter()
+                    .find(|h| h.name().eq_ignore_ascii_case(CALL_HEADER))
+                    .map(|h| h.value().trim().to_string());
+                let Some(token) = token else {
+                    let _ = tx.reply(sip::StatusCode::Forbidden).await;
+                    continue;
+                };
+                let waiter = waiters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&token);
+                match waiter {
+                    Some(waiter) => {
+                        hand_over(&dialogs, tx, waiter, &contact);
+                        continue;
+                    }
+                    None => sip::StatusCode::NotFound,
+                }
+            }
             sip::Method::Ack => continue,
             _ => sip::StatusCode::MethodNotAllowed,
         };
         let _ = tx.reply(status).await;
     }
+}
+
+/// Give an expected INVITE to its waiter as a server dialog that is not
+/// answered yet.
+fn hand_over(
+    dialogs: &Arc<DialogLayer>,
+    mut tx: Transaction,
+    waiter: oneshot::Sender<Incoming>,
+    contact: &sip::Uri,
+) {
+    let (states_tx, states) = dialogs.new_dialog_state_channel();
+    let dialog =
+        match dialogs.get_or_create_server_invite(&tx, states_tx, None, Some(contact.clone())) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot take the inbound call");
+                tokio::spawn(async move { tx.reply(sip::StatusCode::ServerInternalError).await });
+                return;
+            }
+        };
+    let incoming = Incoming {
+        offer: String::from_utf8_lossy(tx.original.body()).into_owned(),
+        call_id: tx
+            .original
+            .call_id_header()
+            .map(|c| c.value().to_string())
+            .unwrap_or_default(),
+        headers: tx
+            .original
+            .headers
+            .iter()
+            .map(|h| (h.name().to_string(), h.value().to_string()))
+            .collect(),
+        dialog: Some(dialog.clone()),
+        states: Some(states),
+        dialogs: dialogs.clone(),
+    };
+    let mut serving = Dialog::Invite(dialog);
+    tokio::spawn(async move {
+        if let Err(e) = serving.handle(&mut tx).await {
+            tracing::debug!(error = %e, "inbound INVITE failed");
+        }
+    });
+    // A waiter that stopped drops the call, which rejects it.
+    let _ = waiter.send(incoming);
 }
 
 /// A failure before the INVITE left means no call exists; any other failure

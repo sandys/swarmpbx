@@ -23,6 +23,10 @@ contract for anyone (human or agent) editing the code.
   denies.
 - **Pure engines are pure.** `ad_compliance` (and other decision engines) take
   data + a `Clock` and return a decision. No I/O inside decision functions.
+- **Do not trust the OS clock.** A role takes the time from its `Clock`
+  (`ad_db::PgClock`, the Postgres time). Do not call `Utc::now()` in a role.
+  Measure a duration with the monotonic clock (`Instant`), not with two
+  wall-clock times. Inside a call, take the times from its `CallTimes`.
 - **Registry-driven extensibility.** Telephony providers, dial strategies,
   hopper sources, routing actions/functions, and compliance jurisdictions are
   registries. Adding a variant = its own module + a minimal, enumerated set of
@@ -42,8 +46,10 @@ contract for anyone (human or agent) editing the code.
   LiveKit Cloud keys, `e2e/run_lkcloud_e2e.sh` (the quickstart, live). Keep
   the README section "Quickstart: place calls through LiveKit Cloud SIP" true.
 - **Twilio is a supported carrier.** Keep `crates/ad_sip/tests/twilio.rs`
-  (test tier) green, and, when you have the credentials,
-  `e2e/run_twilio_e2e.sh`. Keep the README section "Call through Twilio" true.
+  (test tier) and `e2e/run_twilio_c2c_e2e.sh --sim` (click-to-call) green,
+  and, when you have the credentials, `e2e/run_twilio_e2e.sh`. Keep the
+  README sections "Call through Twilio" and "Click-to-call through Twilio"
+  true.
 - **Test systems, not one-off scripts.** Put each test setup in a reusable,
   committed script or tool (for example `e2e/livekit-cloud/run.sh`,
   `e2e/twilio/run.sh`, the carrier simulator `e2e/carrier-sim` on diago). Do
@@ -145,9 +151,15 @@ framework. Read `agentdialer-overview` first.
 
 Skills:
 - `agentdialer-overview` — the framework map. Read it first.
+- `run-campaigns` — place calls: the stack, a trunk, the API, the results.
+- `connect-an-agent` — the contract between the dialer and a LiveKit or
+  pipecat agent.
 - `vertical-slice` — ship logic + API + tests together, all green.
 - `compliance-engine` — work on the fail-closed compliance engine.
 - `routing-engine` — build the FusionPBX-grade routing rule engine.
+
+When a change alters what a user does (the API, the stack, the agent
+contract), update the skill that teaches it in the same change.
 
 The skills live once in `.agents/skills/`. Each tool finds them through a
 symlink: `.claude/skills`, `.gemini/skills`, and `.codex/skills` all point to

@@ -25,6 +25,18 @@ fn an_ended_attempt_settles_then_dispatches() {
 }
 
 #[test]
+fn an_agent_in_the_room_dispatches() {
+    // The attempt left the pacing window of its pool (GAPS.md DIAL-9).
+    assert_eq!(
+        react(&CampaignEvent::AgentJoined {
+            campaign_id: 4,
+            attempt_id: 9
+        }),
+        ReactorAction::Dispatch { campaign_id: 4 }
+    );
+}
+
+#[test]
 fn records_do_not_dispatch() {
     for e in [
         CampaignEvent::CallCompleted {

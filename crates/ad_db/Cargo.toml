@@ -12,6 +12,8 @@ ad_lead = { path = "../ad_lead" }
 ad_events = { path = "../ad_events" }
 ad_circuit_breaker = { path = "../ad_circuit_breaker" }
 ad_attempt = { path = "../ad_attempt" }
+ad_compliance = { path = "../ad_compliance" }
+ad_pacing = { path = "../ad_pacing" }
 sqlx = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }

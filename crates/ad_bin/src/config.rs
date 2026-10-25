@@ -55,7 +55,8 @@ pub const ORCHESTRATOR: &[EnvVar] = &[
     req("LIVEKIT_URL"),
     req("LIVEKIT_API_KEY"),
     req("LIVEKIT_API_SECRET"),
-    req("AD_SIP_TRUNK"),
+    opt("AD_DIAL_PROVIDER"),
+    opt("AD_SIP_TRUNK"),
     opt("AD_SIP_PROXY"),
     opt("AD_SIP_BIND"),
     opt("AD_SIP_ADVERTISE_IP"),
@@ -63,6 +64,11 @@ pub const ORCHESTRATOR: &[EnvVar] = &[
     opt("AD_SIP_TRUNK_PASSWORD"),
     opt("AD_SIP_CALLER_ID"),
     opt("AD_MEDIA_PUBLIC_IP"),
+    opt("AD_TWILIO_API_URL"),
+    opt("AD_TWILIO_ACCOUNT_SID"),
+    opt("AD_TWILIO_API_KEY"),
+    opt("AD_TWILIO_API_SECRET"),
+    opt("AD_TWILIO_SIP_URI"),
     req("AD_ETCD_ENDPOINTS"),
     opt("AD_ROOM_PREFIX"),
     opt("AD_BATCH_LIMIT"),
@@ -210,12 +216,22 @@ impl fmt::Debug for SipSettings {
     }
 }
 
+/// The telephony provider of the node (`AD_DIAL_PROVIDER`).
+#[derive(Debug, Clone)]
+pub enum DialProvider {
+    /// The node sends the INVITE to `AD_SIP_TRUNK`.
+    SipTrunk,
+    /// Twilio calls the lead, then sends an INVITE to the node.
+    TwilioClickToCall(ad_gateway::TwilioVoice),
+}
+
 /// The validated configuration of the orchestrator role. `Debug` omits the
 /// database URL and the LiveKit secret.
 pub struct OrchestratorConfig {
     pub database_url: String,
     pub gateway: GatewayConfig,
     pub sip: SipSettings,
+    pub provider: DialProvider,
     pub batch_limit: i64,
     pub calls_per_sec: f64,
     /// Interval of the sweep that dials leads that became due (a retry, a
@@ -238,8 +254,61 @@ pub struct OrchestratorConfig {
 
 impl OrchestratorConfig {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let missing = missing_required(ORCHESTRATOR, &lookup);
+        let mut missing = missing_required(ORCHESTRATOR, &lookup);
         let mut invalid = Vec::new();
+        let provider_name =
+            value(&lookup, "AD_DIAL_PROVIDER").unwrap_or_else(|| "sip_trunk".into());
+        let needs: &[&'static str] = match provider_name.trim() {
+            "sip_trunk" => &["AD_SIP_TRUNK"],
+            "twilio_click_to_call" => &[
+                "AD_TWILIO_ACCOUNT_SID",
+                "AD_TWILIO_API_KEY",
+                "AD_TWILIO_API_SECRET",
+                "AD_TWILIO_SIP_URI",
+                "AD_SIP_CALLER_ID",
+            ],
+            other => {
+                invalid.push(format!(
+                    "AD_DIAL_PROVIDER={other:?} (expected one of: {})",
+                    ad_gateway::Telephony::NAMES.join(", ")
+                ));
+                &[]
+            }
+        };
+        missing.extend(needs.iter().filter(|n| value(&lookup, n).is_none()));
+        missing.sort_by_key(|m| ORCHESTRATOR.iter().position(|v| v.name == *m));
+        let click_to_call = provider_name.trim() == "twilio_click_to_call";
+        if click_to_call
+            && value(&lookup, "AD_SIP_PROXY").is_none()
+            && value(&lookup, "AD_SIP_ADVERTISE_IP").is_none()
+        {
+            invalid.push(
+                "AD_DIAL_PROVIDER=twilio_click_to_call needs AD_SIP_PROXY or \
+                 AD_SIP_ADVERTISE_IP (the address that Twilio's INVITE reaches)"
+                    .into(),
+            );
+        }
+        let twilio_url =
+            value(&lookup, "AD_TWILIO_API_URL").unwrap_or_else(|| "https://api.twilio.com".into());
+        if !(twilio_url.starts_with("https://") || twilio_url.starts_with("http://")) {
+            invalid.push(format!(
+                "AD_TWILIO_API_URL={twilio_url:?} (expected an http or https URL)"
+            ));
+        }
+        if let Some(sid) = value(&lookup, "AD_TWILIO_ACCOUNT_SID") {
+            if !sid.trim().starts_with("AC") {
+                invalid.push(format!(
+                    "AD_TWILIO_ACCOUNT_SID={sid:?} (expected an account SID, AC...)"
+                ));
+            }
+        }
+        if let Some(uri) = value(&lookup, "AD_TWILIO_SIP_URI") {
+            if !uri.trim().starts_with("sip:") || uri.contains(char::is_whitespace) {
+                invalid.push(format!(
+                    "AD_TWILIO_SIP_URI={uri:?} (expected a SIP URI like sip:agentdialer@edge.example.com)"
+                ));
+            }
+        }
 
         let batch_limit = positive(&lookup, "AD_BATCH_LIMIT", 20i64, &mut invalid);
         let calls_per_sec = positive(&lookup, "AD_CALLS_PER_SEC", 10.0f64, &mut invalid);
@@ -307,8 +376,21 @@ impl OrchestratorConfig {
         }
 
         // Every required value is present, as checked above.
-        let get = |name: &str| value(&lookup, name).unwrap_or_default();
+        let get = |name: &str| value(&lookup, name).unwrap_or_default().trim().to_string();
+        let provider = if click_to_call {
+            DialProvider::TwilioClickToCall(ad_gateway::TwilioVoice {
+                api_url: twilio_url,
+                account_sid: get("AD_TWILIO_ACCOUNT_SID"),
+                key_sid: get("AD_TWILIO_API_KEY"),
+                key_secret: get("AD_TWILIO_API_SECRET"),
+                sip_uri: get("AD_TWILIO_SIP_URI"),
+                caller_id: caller_id.clone().unwrap_or_default(),
+            })
+        } else {
+            DialProvider::SipTrunk
+        };
         Ok(Self {
+            provider,
             database_url: get("DATABASE_URL"),
             gateway: GatewayConfig {
                 livekit_url: get("LIVEKIT_URL"),
@@ -352,6 +434,7 @@ impl fmt::Debug for OrchestratorConfig {
         f.debug_struct("OrchestratorConfig")
             .field("livekit_url", &self.gateway.livekit_url)
             .field("sip", &self.sip)
+            .field("provider", &self.provider)
             .field("room_prefix", &self.gateway.room_prefix)
             .field("batch_limit", &self.batch_limit)
             .field("calls_per_sec", &self.calls_per_sec)

@@ -24,5 +24,7 @@ spike/livekit/agent.ogg
 # The e2e Twilio trunk credentials (e2e/twilio/run.sh setup).
 .env.twilio
 .env.twilio.tmp
+.env.twilio-c2c
+.env.twilio-c2c.tmp
 .env.lkcloud
 .env.lkcloud.tmp

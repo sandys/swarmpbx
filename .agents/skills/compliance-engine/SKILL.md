@@ -26,6 +26,12 @@ an empty DNC list (COMP-1). No table stores call times, holidays, or DNC
 entries. A lead without an explicit IANA timezone never dials (COMP-2). Counsel
 must also review the rules (decision D-5).
 
+Where production calls the engine: the leader's `gate()` in
+`crates/ad_bin/src/orchestrator/leader.rs`. It re-gates each claimed lead with
+`ad_hopper::select`. It passes `CallWindowSet::uniform(0, 2400)` (set in
+`crates/ad_bin/src/orchestrator/mod.rs`), `DncSet::default()`, and no
+ruleset. COMP-1 replaces these with data from tables.
+
 The VICIdial reference shows how a mature dialer stores this data
 (`_research/vicidial/`, see `GAPS.md` Appendix A). Read it before you add the
 tables.
@@ -38,7 +44,9 @@ tables.
 
 2. Stay pure. A decision function takes data plus a `Clock` and returns a
    `Decision`. It does no I/O. The caller loads DNC data and passes it in. This
-   keeps the engine deterministic and testable.
+   keeps the engine deterministic and testable. In production the `Clock` is
+   `ad_db::PgClock`: the safe hours use the Postgres time, not the OS clock
+   of the node (`GAPS.md` OPS-9).
 
 ## The modules
 
@@ -60,6 +68,22 @@ abandon_rate = answered_by_human_but_no_agent / answered_by_human
 Only human-answered calls are in the denominator. The ledger records
 human-answered events and marks each as abandoned or not. See
 `abandon.rs::AbandonLedger`.
+
+In production, `call_attempts` is the ledger. `ad_db::PgAttemptRepo::abandon_counts`
+returns `AbandonCounts` for a campaign and a window. The leader then calls the
+pure `JurisdictionRule::allows_customer_first`. Keep these rules:
+- No answered call yet: the rate is undefined, and customer first is allowed.
+- A rate above the cap, or a ledger that the leader cannot read: dial agent
+  first. Agent first cannot abandon a call, so this fails closed.
+- `connect_within` (2 s) is the limit from the answer to the agent in the
+  room. A customer-first call past the limit ends as `abandoned`.
+- There is no answering-machine detection yet. Every answer counts as a human
+  answer (`GAPS.md` COMP-10).
+- The join-paced window (`ad_pacing`, `GAPS.md` DIAL-9) is not a compliance
+  gate. It lowers the number of abandoned calls. The governor above stays the
+  hard limit. The window's default target and back-off come from
+  `connect_within`; if you change that limit, saved pool settings can become
+  invalid, and their pools then dial one call at a time (fail closed).
 
 ## Add a jurisdiction (registry pattern)
 
@@ -94,6 +118,7 @@ When you change the engine:
 ## The API
 
 The engine is exposed at `POST /v1/compliance/check` in
-`crates/ad_api/src/compliance.rs`. A malformed window returns HTTP 400. That is
+`crates/ad_api/src/compliance.rs`. `GET /v1/campaigns/:id/abandonment` shows
+the ledger of a campaign and whether customer first is allowed. A malformed window returns HTTP 400. That is
 also fail-closed: the API never returns `allowed: true` for input it cannot
 interpret. Ship API changes with contract tests. See the `vertical-slice` skill.

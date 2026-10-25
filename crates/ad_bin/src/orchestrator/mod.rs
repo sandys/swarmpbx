@@ -20,14 +20,13 @@ use ad_agent::{Agents, LiveKitAccess};
 use ad_circuit_breaker::Config as BreakerConfig;
 use ad_cluster::{encode, keys, Hold, Kine, LeaderInfo, Mirror, NodeInfo};
 use ad_compliance::safe_hours::CallWindowSet;
-use ad_core::time::SystemClock;
 use ad_core::AttemptId;
-use ad_db::{PgAttemptRepo, PgBreakerStore};
-use ad_gateway::{Gateway, LiveKitGateway, SipCaller, SipTrunk};
+use ad_db::{PgAttemptRepo, PgBreakerStore, PgClock};
+use ad_gateway::{ClickToCall, Gateway, LiveKitGateway, SipCaller, SipTrunk, Telephony};
 use ad_orchestrator::RetryPolicy;
 use tokio::task::JoinHandle;
 
-use crate::config::{self, OrchestratorConfig, SipSettings};
+use crate::config::{self, DialProvider, OrchestratorConfig, SipSettings};
 
 mod calls;
 mod leader;
@@ -57,11 +56,13 @@ struct Node {
     attempts: PgAttemptRepo,
     breaker: PgBreakerStore,
     gateway: Gateway<LiveKitGateway>,
-    /// Places and carries the calls of this node.
-    caller: SipCaller,
+    /// Places and carries the calls of this node, through its provider.
+    caller: Telephony,
     agents: Agents,
     kine: Kine,
-    clock: SystemClock,
+    /// The Postgres time plus the monotonic time (`ad_db::clock`), not the OS
+    /// clock.
+    clock: Arc<PgClock>,
     settings: Settings,
     /// The calls this node runs now.
     running: Mutex<HashMap<AttemptId, Running>>,
@@ -128,6 +129,7 @@ pub fn run() -> anyhow::Result<()> {
         attempt_check_ms,
         etcd_endpoints,
         sip,
+        provider,
         node_capacity,
         cluster_ttl_s,
         worker,
@@ -137,8 +139,20 @@ pub fn run() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let db = ad_db::Db::connect_ready(&database_url, None).await?;
+        let clock = PgClock::start(db.pool().clone()).await;
         let kine = Kine::connect_ready(&etcd_endpoints, None).await?;
-        let caller = start_sip(&sip, &worker, &gw).await?;
+        let sip_caller = start_sip(&sip, &worker, &gw).await?;
+        let caller = match provider {
+            DialProvider::SipTrunk => Telephony::SipTrunk(sip_caller),
+            DialProvider::TwilioClickToCall(twilio) => {
+                Telephony::TwilioClickToCall(ClickToCall::new(sip_caller, twilio))
+            }
+        };
+        tracing::info!(
+            node = worker,
+            provider = caller.name(),
+            "node: telephony provider"
+        );
         let node = Arc::new(Node {
             name: worker.clone(),
             attempts: db.attempts(),
@@ -152,7 +166,7 @@ pub fn run() -> anyhow::Result<()> {
                 api_secret: gw.api_secret.clone(),
             }),
             kine: kine.clone(),
-            clock: SystemClock,
+            clock,
             settings: Settings {
                 room_prefix: gw.room_prefix.clone(),
                 batch_limit,

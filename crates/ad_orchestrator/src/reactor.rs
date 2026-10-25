@@ -26,7 +26,8 @@ pub enum ReactorAction {
 /// Decide the action for an event. Pure.
 pub fn react(event: &CampaignEvent) -> ReactorAction {
     match event {
-        CampaignEvent::CampaignRunning { campaign_id } => ReactorAction::Dispatch {
+        CampaignEvent::CampaignRunning { campaign_id }
+        | CampaignEvent::AgentJoined { campaign_id, .. } => ReactorAction::Dispatch {
             campaign_id: *campaign_id,
         },
         CampaignEvent::AttemptEnded {

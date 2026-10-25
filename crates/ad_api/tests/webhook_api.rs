@@ -168,7 +168,7 @@ async fn calls(db: &Db, n: usize, agent: Option<Value>) -> Vec<ClaimedAttempt> {
     db.leads().bulk_create(news).await.unwrap();
     let claimed = db
         .attempts()
-        .claim(c, "test", n as i64, &format!("wh{org}"), Utc::now())
+        .claim(c, "test", n as i64, &format!("wh{org}"), Utc::now(), None)
         .await
         .unwrap();
     for a in &claimed {

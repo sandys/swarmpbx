@@ -62,6 +62,7 @@ pub struct LiveKitSession {
     channels: u32,
     inbound: Option<mpsc::Receiver<AudioFrame>>,
     others_left: tokio::sync::watch::Receiver<bool>,
+    others_joined: tokio::sync::watch::Receiver<Option<String>>,
     _forward_task: tokio::task::JoinHandle<()>,
 }
 
@@ -70,6 +71,12 @@ impl LiveKitSession {
     /// call, so that participant is the agent.
     pub fn others_left(&self) -> tokio::sync::watch::Receiver<bool> {
         self.others_left.clone()
+    }
+
+    /// The identity of the first other participant (the agent) in the room,
+    /// once one is there.
+    pub fn others_joined(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.others_joined.clone()
     }
 }
 
@@ -105,9 +112,12 @@ impl RoomParticipant for LiveKitParticipant {
 
         // Forward each subscribed remote audio track (the agent) into a
         // channel the bridge drains, at our sample rate (libwebrtc resamples).
-        // Report a participant that leaves.
+        // Report the first participant that joins, and a participant that
+        // leaves.
         let (in_tx, in_rx) = mpsc::channel::<AudioFrame>(256);
         let (left_tx, others_left) = tokio::sync::watch::channel(false);
+        let first = room.remote_participants().into_keys().next().map(|id| id.0);
+        let (joined_tx, others_joined) = tokio::sync::watch::channel(first);
         let (rate, channels) = (self.sample_rate, self.channels);
         let forward_task = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -135,6 +145,15 @@ impl RoomParticipant for LiveKitParticipant {
                             }
                         });
                     }
+                    RoomEvent::ParticipantConnected(p) => {
+                        joined_tx.send_if_modified(|joined| {
+                            if joined.is_some() {
+                                return false;
+                            }
+                            *joined = Some(p.identity().0);
+                            true
+                        });
+                    }
                     RoomEvent::ParticipantDisconnected(_) => {
                         let _ = left_tx.send(true);
                     }
@@ -150,6 +169,7 @@ impl RoomParticipant for LiveKitParticipant {
             channels: self.channels,
             inbound: Some(in_rx),
             others_left,
+            others_joined,
             _forward_task: forward_task,
         })
     }

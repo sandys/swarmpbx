@@ -3,11 +3,34 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The default wait for the agent to join the room.
+/// The default wait for the agent to join the room (agent first).
 pub const DEFAULT_JOIN_TIMEOUT_S: u32 = 20;
 
 fn default_join_timeout() -> u32 {
     DEFAULT_JOIN_TIMEOUT_S
+}
+
+/// When the dialer starts the agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialOrder {
+    /// Dial the customer, and start the agent when the customer answers. An
+    /// agent that is not in the room within the abandonment rule's limit
+    /// (two seconds) abandons the call.
+    #[default]
+    CustomerFirst,
+    /// Start the agent, wait until it is in the room (`join_timeout_s`), and
+    /// only then dial. No call is abandoned.
+    AgentFirst,
+}
+
+impl DialOrder {
+    pub fn name(&self) -> &'static str {
+        match self {
+            DialOrder::CustomerFirst => "customer_first",
+            DialOrder::AgentFirst => "agent_first",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +43,8 @@ pub enum AgentSpec {
         /// Free-form data for the agent, in the job metadata.
         #[serde(default)]
         metadata: serde_json::Value,
+        #[serde(default)]
+        dial_order: DialOrder,
         #[serde(default = "default_join_timeout")]
         join_timeout_s: u32,
     },
@@ -29,6 +54,8 @@ pub enum AgentSpec {
         start_url: String,
         #[serde(default)]
         metadata: serde_json::Value,
+        #[serde(default)]
+        dial_order: DialOrder,
         #[serde(default = "default_join_timeout")]
         join_timeout_s: u32,
     },
@@ -68,6 +95,23 @@ impl AgentSpec {
         match self {
             AgentSpec::Livekit { .. } => "livekit",
             AgentSpec::Pipecat { .. } => "pipecat",
+        }
+    }
+
+    pub fn dial_order(&self) -> DialOrder {
+        match self {
+            AgentSpec::Livekit { dial_order, .. } | AgentSpec::Pipecat { dial_order, .. } => {
+                *dial_order
+            }
+        }
+    }
+
+    /// The agent pool: the agents that share one capacity, and so one pacing
+    /// window (GAPS.md DIAL-9).
+    pub fn pool(&self) -> String {
+        match self {
+            AgentSpec::Livekit { agent_name, .. } => format!("livekit:{agent_name}"),
+            AgentSpec::Pipecat { start_url, .. } => format!("pipecat:{start_url}"),
         }
     }
 

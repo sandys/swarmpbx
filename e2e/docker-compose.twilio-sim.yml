@@ -2,7 +2,8 @@
 # (e2e/carrier-sim) stands in for Twilio, with Twilio's 407 challenge, its
 # E.164 and caller-ID checks, and symmetric RTP. e2e/run_twilio_e2e.sh --sim
 # uses it, so the quickstart stack runs on every change, also without
-# credentials. Paths are relative to the repository root (the
+# credentials. It also serves the Twilio Calls API for click-to-call
+# (e2e/run_twilio_c2c_e2e.sh). Paths are relative to the repository root (the
 # directory of the first compose file).
 services:
   twilio-sim:
@@ -18,3 +19,7 @@ services:
       SIM_SYMMETRIC_RTP: "1"
       # The agent ends the call first.
       SIM_HOLD_MS: "120000"
+      # The Twilio Calls API, for click-to-call (e2e/run_twilio_c2c_e2e.sh).
+      SIM_TWILIO_KEY: SKsimulator
+      SIM_TWILIO_SECRET: SimulatorSecret
+      SIM_NUMBERS: "+15550000486=busy,+15550000408=noanswer"

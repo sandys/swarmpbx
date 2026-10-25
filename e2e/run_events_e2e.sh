@@ -100,7 +100,7 @@ wait_for 20 ">=5 setup errors in campaign 1" \
   pg_ge "SELECT count(*) FROM call_attempts WHERE campaign_id=1 AND outcome='setup_error'" 5 || FAIL=1
 OVERLAP=$(PSQL "SELECT count(*) FROM call_attempts a JOIN call_attempts b
                 ON a.campaign_id = 1 AND b.campaign_id = 1 AND a.id < b.id
-               AND b.created_at < a.ended_at")
+               AND b.created_at < $(saved_end a)")
 [ "$OVERLAP" = 0 ] || { echo "FAIL: $OVERLAP attempts overlapped in a campaign with capacity 1"; FAIL=1; }
 SPAN_MS=$(PSQL "SELECT round(extract(epoch FROM max(ended_at) - min(created_at)) * 1000)
                 FROM (SELECT * FROM call_attempts WHERE campaign_id=1 ORDER BY id LIMIT 5) f")

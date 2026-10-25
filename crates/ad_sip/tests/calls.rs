@@ -154,7 +154,11 @@ async fn an_answered_call_ends_when_the_callee_hangs_up() {
     else {
         panic!("the callee answers");
     };
-    assert!(call.answer.contains("m=audio 40000"), "{}", call.answer);
+    assert!(
+        call.remote_sdp.contains("m=audio 40000"),
+        "{}",
+        call.remote_sdp
+    );
     assert_eq!(within(call.ended()).await, Ended::RemoteHangup);
     assert!(matches!(
         within(ends.recv()).await,

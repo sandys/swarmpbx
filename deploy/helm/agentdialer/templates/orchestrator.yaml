@@ -50,8 +50,34 @@ spec:
               value: {{ .Values.cluster.etcdEndpoints | quote }}
             # The node carries its calls (PLAN.md §0.0): its SIP user agent
             # sends through the SIP edge and advertises the pod IP.
+            - name: AD_DIAL_PROVIDER
+              value: {{ .Values.telephony.provider | quote }}
+            {{- if .Values.sip.trunk }}
             - name: AD_SIP_TRUNK
               value: {{ .Values.sip.trunk | quote }}
+            {{- end }}
+            {{- if eq .Values.telephony.provider "twilio_click_to_call" }}
+            {{- with .Values.telephony.twilio }}
+            {{- if .apiUrl }}
+            - name: AD_TWILIO_API_URL
+              value: {{ .apiUrl | quote }}
+            {{- end }}
+            - name: AD_TWILIO_ACCOUNT_SID
+              value: {{ .accountSid | quote }}
+            - name: AD_TWILIO_SIP_URI
+              value: {{ .sipUri | quote }}
+            - name: AD_TWILIO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret | quote }}
+                  key: AD_TWILIO_API_KEY
+            - name: AD_TWILIO_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret | quote }}
+                  key: AD_TWILIO_API_SECRET
+            {{- end }}
+            {{- end }}
             {{- if .Values.sip.callerId }}
             - name: AD_SIP_CALLER_ID
               value: {{ .Values.sip.callerId | quote }}

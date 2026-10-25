@@ -26,6 +26,9 @@ pub enum RetryReason {
     Voicemail,
     Failed,
     Error,
+    /// No agent was in the room in time (customer first). The retry dials
+    /// agent first.
+    Abandoned,
 }
 
 impl RetryReason {
@@ -37,6 +40,7 @@ impl RetryReason {
             RetryReason::Voicemail => "voicemail",
             RetryReason::Failed => "failed",
             RetryReason::Error => "error",
+            RetryReason::Abandoned => "abandoned",
         }
     }
 }
@@ -51,6 +55,9 @@ pub enum CampaignEvent {
     /// A call attempt ended and its outcome is saved. The orchestrator updates
     /// the lead and dials into the freed capacity.
     AttemptEnded { campaign_id: i64, attempt_id: i64 },
+    /// The agent of an attempt is in the room, so the attempt left the pacing
+    /// window of its agent pool, and the campaign can dial again.
+    AgentJoined { campaign_id: i64, attempt_id: i64 },
     /// The lead is updated from an ended attempt that started a dial. The
     /// attempt counts in `called_count`.
     CallCompleted {
@@ -77,6 +84,7 @@ impl CampaignEvent {
         match self {
             CampaignEvent::CampaignRunning { campaign_id }
             | CampaignEvent::AttemptEnded { campaign_id, .. }
+            | CampaignEvent::AgentJoined { campaign_id, .. }
             | CampaignEvent::CallCompleted { campaign_id, .. }
             | CampaignEvent::RetryScheduled { campaign_id, .. }
             | CampaignEvent::CircuitBreakerTripped { campaign_id, .. }
@@ -89,6 +97,7 @@ impl CampaignEvent {
         match self {
             CampaignEvent::CampaignRunning { .. } => "campaign_running",
             CampaignEvent::AttemptEnded { .. } => "attempt_ended",
+            CampaignEvent::AgentJoined { .. } => "agent_joined",
             CampaignEvent::CallCompleted { .. } => "call_completed",
             CampaignEvent::RetryScheduled { .. } => "retry_scheduled",
             CampaignEvent::CircuitBreakerTripped { .. } => "circuit_breaker_tripped",

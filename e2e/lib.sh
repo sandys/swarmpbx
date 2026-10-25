@@ -79,6 +79,49 @@ import sys, urllib.request
 urllib.request.urlopen(sys.argv[1], timeout=2)' "$1" >/dev/null 2>&1
 }
 
+# api_send <method> <url> [json]: send one request; print the HTTP status,
+# a space, and the body on one line.
+api_send() {
+  docker run --rm --network "$E2E_NET" "$E2E_PY_IMAGE" python3 -c '
+import sys, urllib.error, urllib.request
+data = sys.argv[3].encode() if len(sys.argv) > 3 else None
+req = urllib.request.Request(sys.argv[2], data=data, method=sys.argv[1],
+                             headers={"content-type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=5) as r:
+        print(r.status, r.read().decode())
+except urllib.error.HTTPError as e:
+    print(e.code, e.read().decode())
+except Exception as e:
+    print(0, e)
+' "$@" 2>/dev/null
+}
+
+# api_field <url> <python expression over v>: GET the JSON at the URL and
+# print the expression, or nothing.
+api_field() {
+  docker run --rm --network "$E2E_NET" "$E2E_PY_IMAGE" python3 -c '
+import json, sys, urllib.request
+try:
+    v = json.load(urllib.request.urlopen(sys.argv[1], timeout=5))
+    print(eval(sys.argv[2], {}, {"v": v}))
+except Exception:
+    print("")
+' "$1" "$2" 2>/dev/null
+}
+
+# SQL for checks that compare an attempt with a claim (`created_at`, the
+# Postgres time). The node times on a row (`ended_at`, `agent_ready_at`) come
+# from the node's clock, which runs on the monotonic clock between two reads of
+# the Postgres clock (on WSL2 it gains about 0.6 s in 30 s); these use the
+# save times of the events.
+# saved_end <alias>: the save of the attempt's last event (its end, once it ended).
+saved_end() { echo "(SELECT max(e.created_at) FROM attempt_events e WHERE e.attempt_id = $1.id)"; }
+# left_window <alias>: the save of the attempt's agent_ready event, else its end.
+left_window() {
+  echo "COALESCE((SELECT min(e.created_at) FROM attempt_events e WHERE e.attempt_id = $1.id AND e.kind = 'agent_ready'), $(saved_end "$1"))"
+}
+
 # kine_keys <prefix>: the keys under a prefix in kine (127.0.0.1:2379), one per
 # line. kine (v0.13.17) refuses --keys-only, so read whole entries: etcdctl
 # prints each key, then its value, on its own line. A failed read fails here,
@@ -166,3 +209,54 @@ except Exception:
 ' "$1" "$2" 2>/dev/null
 }
 rooms_ge() { local n; n=$(rooms_count "$1" "$2"); [ "${n:-0}" -ge "$3" ] 2>/dev/null; }
+
+# The LiveKit server of the dialer's rooms, for the probes below. They run the
+# LiveKit SDK of the e2e agent image (`ad-e2e-livekit-agent`).
+E2E_LK_URL="${E2E_LK_URL:-ws://livekit:7880}"
+E2E_LK_KEY="${E2E_LK_KEY:-devkey}"
+E2E_LK_SECRET="${E2E_LK_SECRET:-devsecret_devsecret_devsecret_32b}"
+
+lk_py() {
+  docker run --rm --network "$E2E_NET" --entrypoint python3 \
+    -e LK_URL="$E2E_LK_URL" -e LK_KEY="$E2E_LK_KEY" -e LK_SECRET="$E2E_LK_SECRET" \
+    ad-e2e-livekit-agent -c "$1" "${@:2}" 2>/dev/null
+}
+
+# lk_room_gone <room>: LiveKit has no room of this name.
+lk_room_gone() {
+  [ "$(lk_py '
+import asyncio, os, sys
+from livekit import api
+async def main():
+    lk = api.LiveKitAPI(os.environ["LK_URL"].replace("ws", "http", 1), os.environ["LK_KEY"], os.environ["LK_SECRET"])
+    try:
+        rooms = await lk.room.list_rooms(api.ListRoomsRequest(names=[sys.argv[1]]))
+        print(len(rooms.rooms))
+    finally:
+        await lk.aclose()
+asyncio.run(main())
+' "$1")" = 0 ]
+}
+
+# lk_late_join <room>: join the room with a valid token, as an agent that
+# starts late does. Prints "refused" or "joined".
+lk_late_join() {
+  lk_py '
+import asyncio, os, sys
+from livekit import api, rtc
+async def main():
+    token = (api.AccessToken(os.environ["LK_KEY"], os.environ["LK_SECRET"])
+             .with_identity("e2e-late-agent")
+             .with_grants(api.VideoGrants(room_join=True, room=sys.argv[1]))
+             .to_jwt())
+    room = rtc.Room()
+    try:
+        await asyncio.wait_for(room.connect(os.environ["LK_URL"], token), 15)
+    except Exception:
+        print("refused")
+        return
+    print("joined")
+    await room.disconnect()
+asyncio.run(main())
+' "$1"
+}

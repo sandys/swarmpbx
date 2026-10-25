@@ -10,6 +10,7 @@ mod compliance;
 mod dispatch;
 mod hopper;
 mod lead;
+mod pacing;
 mod store;
 mod webhook;
 
@@ -31,6 +32,10 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub campaigns: CampaignStore,
     pub leads: LeadStore,
+    /// The abandonment report answers 503 without it.
+    pub attempts: Option<ad_db::PgAttemptRepo>,
+    /// The pacing endpoints answer 503 without it.
+    pub pacing: Option<ad_db::PgPacingRepo>,
     /// The LiveKit webhook endpoint answers 503 without it.
     pub webhooks: Option<Webhooks>,
 }
@@ -43,6 +48,8 @@ impl AppState {
             clock,
             campaigns: CampaignStore::in_memory(),
             leads: LeadStore::in_memory(),
+            attempts: None,
+            pacing: None,
             webhooks: None,
         }
     }
@@ -53,6 +60,8 @@ impl AppState {
             clock,
             campaigns,
             leads,
+            attempts: None,
+            pacing: None,
             webhooks: None,
         }
     }
@@ -79,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .merge(compliance::routes())
         .merge(campaign::routes())
         .merge(lead::routes())
+        .merge(pacing::routes())
         .merge(hopper::routes())
         .merge(dispatch::routes())
         .merge(webhook::routes())
@@ -109,17 +119,20 @@ impl std::fmt::Debug for ServeConfig {
 /// set (and runs migrations first), else an in-memory store. The LiveKit
 /// webhook endpoint needs both Postgres and the LiveKit keys.
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let state = match &config.database_url {
         Some(url) => {
             let db = ad_db::Db::connect_ready(url, None).await?;
             db.migrate().await?;
             tracing::info!("stores: postgres (migrations applied)");
+            // The same time as the orchestrator and `now()` in SQL.
+            let clock: Arc<dyn Clock> = ad_db::PgClock::start(db.pool().clone()).await;
             let mut state = AppState::with_stores(
                 clock,
                 CampaignStore::Pg(db.campaigns()),
                 LeadStore::Pg(db.leads()),
             );
+            state.attempts = Some(db.attempts());
+            state.pacing = Some(db.pacing());
             if let Some((key, secret)) = &config.livekit_keys {
                 state.webhooks = Some(Webhooks {
                     verifier: ad_gateway::WebhookVerifier::new(key, secret),
@@ -130,7 +143,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         }
         None => {
             tracing::warn!("stores: in-memory (DATABASE_URL unset; data is not durable)");
-            AppState::new(clock)
+            AppState::new(Arc::new(SystemClock))
         }
     };
     if state.webhooks.is_none() {

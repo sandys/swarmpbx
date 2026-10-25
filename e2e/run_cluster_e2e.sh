@@ -4,9 +4,11 @@
 # pipecat bot. No host networking, no livekit/sip, no LiveKit webhook.
 #
 #   (a) every node registers in kine, and exactly one leads;
-#   (b) 24 calls (12 per agent runtime) at a node capacity of 2 spread over all
-#       three nodes, never more than 2 per node. (Six calls at once keep the
-#       Python test agents, one process per runtime, within their CPU.)
+#   (b) 24 calls (12 per agent runtime: the LiveKit campaign dials customer
+#       first, the default; the pipecat campaign agent first) at a node
+#       capacity of 2 spread over all three nodes, never more than 2 per
+#       node. (Six calls at once keep the Python test agents, one process
+#       per runtime, within their CPU.)
 #   (c) each call goes node -> Kamailio -> carrier. The carrier's BYE goes
 #       back through Kamailio to the node that owns the call, and ends it;
 #   (d) the audio crosses the NAT both ways: the agent's tone goes out as RTP,
@@ -16,7 +18,16 @@
 #       end and are never dialed again. The leader dies too; the last node
 #       leads and finishes the work;
 #   (f) every lead is dialed exactly once (Postgres and the carrier agree), and
-#       both campaigns complete.
+#       both campaigns complete;
+#   (g) join-paced dialing (GAPS.md DIAL-9): each agent pool starts at a limit
+#       of 1 and grows it from fast joins; no claim goes above the limit of
+#       its pool, and no call is abandoned because an agent was slow. (Before
+#       DIAL-9, six LiveKit jobs that started at once missed the 2 s limit.)
+#   (h) the nodes take the time from Postgres, not from their OS clock: the
+#       OS clock of node-2 is 3 min behind, of node-3 11 min (a preloaded
+#       shim, e2e/clock-offset). Each node logs its offset, and every event
+#       time that a node saves is within seconds of the time at which
+#       Postgres saved it.
 #
 # The checks treat Postgres and kine as managed services: they go through the
 # database URL and the kine endpoint, never into a container.
@@ -34,6 +45,7 @@ N=24
 export E2E_HOLD_MS=20000
 LK_STATS=http://livekit-agent:8088/stats
 PC_STATS=http://pipecat-bot:8089/stats
+API=http://api:8080
 # A call ended by the carrier: its hangup event names the callee.
 CARRIER_BYE="e.kind = 'hangup' AND e.payload->>'detail' = 'the callee hung up'"
 FAIL=0
@@ -43,7 +55,7 @@ cleanup() {
   agent_stats_json_of "$LK_STATS" > "$E2E_OUT/run_cluster_e2e.livekit-agent.stats.json" 2>/dev/null || true
   agent_stats_json_of "$PC_STATS" > "$E2E_OUT/run_cluster_e2e.pipecat-bot.stats.json" 2>/dev/null || true
   agent_stats_json_of "$E2E_SIM_URL" > "$E2E_OUT/run_cluster_e2e.carrier.calls.json" 2>/dev/null || true
-  for s in node-1 node-2 node-3 kamailio carrier livekit livekit-agent pipecat-bot kine nat; do
+  for s in node-1 node-2 node-3 api kamailio carrier livekit livekit-agent pipecat-bot kine nat; do
     $CL logs "$s" > "$E2E_OUT/run_cluster_e2e.$s.log" 2>&1 || true
   done
   $CL down -v >/dev/null 2>&1 || true
@@ -55,9 +67,19 @@ node_cid() { $CL ps -q "$1"; }
 leader_node() { kine_value /agentdialer/leader | sed -n 's/.*"node":"\([^"]*\)".*/\1/p'; }
 # route_added <service>: the one-shot route sidecar exited with 0.
 route_added() { [ "$($CL ps -a --format '{{.Service}} {{.State}} {{.ExitCode}}' | grep "^$1 " | cut -d' ' -f2-)" = "exited 0" ]; }
+# logged_offset <service>: the OS clock offset (ms) that the node logged at its
+# first read of the Postgres clock.
+logged_offset() {
+  $CL logs "$1" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+    | sed -n 's/.*clock: synced to Postgres.* os_offset_ms=\(-\{0,1\}[0-9]*\).*/\1/p' | head -1
+}
 
 echo "== build images =="
 docker build -q -t agentdialer:e2e .. >/dev/null || { echo "FAIL: image build"; exit 1; }
+for off in 3 11; do
+  docker build -q --build-arg OFFSET_S="-$((off * 60))" -t "agentdialer:e2e-clock-${off}m" clock-offset >/dev/null \
+    || { echo "FAIL: clock image build"; exit 1; }
+done
 $CL build -q livekit-agent pipecat-bot carrier >/dev/null 2>&1 || { echo "FAIL: test image build"; exit 1; }
 rm -f "$E2E_OUT/nat.ready"
 
@@ -76,11 +98,12 @@ echo "== the test agents are ready (their own HTTP endpoints) =="
 wait_for 120 "LiveKit agent worker registered" http_ok http://livekit-agent:8081/ || exit 1
 wait_for 120 "pipecat bot server up" http_ok "$PC_STATS" || exit 1
 
-echo "== start three nodes and their routes through the NAT =="
-$CL up -d node-1 node-2 node-3 node-1-route node-2-route node-3-route 2>&1 | tail -1
+echo "== start three nodes and their routes through the NAT, and the API =="
+$CL up -d node-1 node-2 node-3 node-1-route node-2-route node-3-route api 2>&1 | tail -1
 for n in node-1 node-2 node-3; do
   wait_for 30 "$n routes to the carrier through the NAT" route_added "$n-route" || exit 1
 done
+wait_for 60 "the API answers" http_ok "$API/health" || exit 1
 
 echo "== assert (a): three nodes in kine, one leader =="
 wait_for 60 "three node keys" kine_count /agentdialer/nodes/ 3 || FAIL=1
@@ -93,7 +116,7 @@ echo "== seed: a LiveKit-agent campaign and a pipecat-bot campaign, $N leads =="
 # (it completes a running campaign that has no due work).
 pg "INSERT INTO campaigns (id, org_id, name, state, concurrency_cap, agent, created_at, updated_at) VALUES
     (1, 1, 'cluster-livekit', 'running', 12, '{\"runtime\":\"livekit\",\"agent_name\":\"e2e-livekit\"}', now(), now()),
-    (2, 1, 'cluster-pipecat', 'running', 12, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start\"}', now(), now());
+    (2, 1, 'cluster-pipecat', 'running', 12, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start\",\"dial_order\":\"agent_first\"}', now(), now());
     SELECT setval(pg_get_serial_sequence('campaigns','id'), 2, true);
     INSERT INTO leads (campaign_id, phone_number, timezone, status, called_count, context, created_at, updated_at)
     SELECT 1 + (g % 2), '+1555000' || lpad(g::text, 4, '0'), 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()
@@ -104,9 +127,10 @@ echo "ok: seeded $N leads"
 echo "== assert (b): calls spread over all nodes within the capacity =="
 CAPACITY=2
 wait_for 120 "$((3 * CAPACITY)) calls connected" pg_ge "SELECT count(*) FROM call_attempts WHERE state='connected'" $((3 * CAPACITY)) || FAIL=1
-pg "SELECT node, count(*) FROM call_attempts WHERE state <> 'ended' GROUP BY node ORDER BY node;" | tee "$E2E_OUT/cluster_spread.txt"
-SPREAD=$(pg "SELECT count(DISTINCT node) FROM call_attempts WHERE state <> 'ended'")
-MAXN=$(pg "SELECT coalesce(max(c), 0) FROM (SELECT count(*) c FROM call_attempts WHERE state <> 'ended' GROUP BY node) x")
+pg "SELECT node, count(*) FROM call_attempts WHERE state <> 'ended' AND node IS NOT NULL GROUP BY node ORDER BY node;" | tee "$E2E_OUT/cluster_spread.txt"
+# One snapshot: a call can end between two queries.
+SPREAD=$(grep -c . "$E2E_OUT/cluster_spread.txt")
+MAXN=$(cut -d"|" -f2 "$E2E_OUT/cluster_spread.txt" | sort -n | tail -1)
 [ "$SPREAD" = 3 ] || { echo "FAIL: live calls on $SPREAD nodes, want 3"; FAIL=1; }
 [ "${MAXN:-99}" -le "$CAPACITY" ] || { echo "FAIL: a node ran $MAXN calls, capacity $CAPACITY"; FAIL=1; }
 echo "ok: live calls on $SPREAD nodes, at most $MAXN per node"
@@ -126,8 +150,11 @@ echo "ok: attempt $FIRST_ID ended by the carrier's BYE; the agent heard ${LOUD:-
 
 echo "== assert (e): kill a node that does not lead; its calls end, never dialed again =="
 VICTIM=$(for n in node-1 node-2 node-3; do [ "$n" != "$LEADER" ] && echo "$n" && break; done)
-wait_for 30 "every live call of $VICTIM connected" pg_eq \
-  "SELECT count(*) FROM call_attempts WHERE node='$VICTIM' AND state IN ('pending','dialing','uncertain')" 0 || FAIL=1
+# A node that stops before the agent joins abandons its answered calls; the
+# kills test the cluster, so they wait until each agent is in its room.
+wait_for 30 "every live call of $VICTIM connected, with its agent in the room" pg_eq \
+  "SELECT count(*) FROM call_attempts WHERE node='$VICTIM' AND state <> 'ended'
+     AND (state IN ('pending','dialing','uncertain') OR agent_ready_at IS NULL)" 0 || FAIL=1
 DROPPED=$(pg "SELECT string_agg(id::text, ',') FROM call_attempts WHERE node='$VICTIM' AND state <> 'ended'")
 docker kill "$(node_cid "$VICTIM")" >/dev/null
 echo "ok: killed $VICTIM with live calls ${DROPPED:-none}"
@@ -139,8 +166,9 @@ if [ -n "$DROPPED" ]; then
 fi
 
 echo "== assert (e): kill the leader; the last node leads =="
-wait_for 60 "every live call connected" pg_eq \
-  "SELECT count(*) FROM call_attempts WHERE state IN ('pending','dialing','uncertain')" 0 || FAIL=1
+wait_for 60 "every live call connected, with its agent in the room" pg_eq \
+  "SELECT count(*) FROM call_attempts WHERE state <> 'ended'
+     AND (state IN ('pending','dialing','uncertain') OR agent_ready_at IS NULL)" 0 || FAIL=1
 docker kill "$(node_cid "$LEADER")" >/dev/null
 echo "ok: killed the leader $LEADER"
 SURVIVOR=$(for n in node-1 node-2 node-3; do [ "$n" != "$LEADER" ] && [ "$n" != "$VICTIM" ] && echo "$n"; done)
@@ -180,10 +208,58 @@ else
   FAIL=1
 fi
 wait_for 30 "both campaigns completed" pg_eq "SELECT count(*) FROM campaigns WHERE state='completed'" 2 || FAIL=1
+
+echo "== assert (g): join-paced dialing =="
+SLOW=$(pg "SELECT count(*) FROM call_attempts WHERE outcome='abandoned' AND detail <> 'the call left the room before the agent joined'")
+STOPPED=$(pg "SELECT count(*) FROM call_attempts WHERE outcome='abandoned' AND detail = 'the call left the room before the agent joined'")
+[ "$SLOW" = 0 ] && echo "ok: no call was abandoned because its agent was slow ($STOPPED abandoned because their node stopped)" \
+  || { echo "FAIL: $SLOW calls were abandoned: $(pg "SELECT string_agg(detail, '; ') FROM call_attempts WHERE outcome='abandoned'")"; FAIL=1; }
+pg_eq "SELECT count(*) FROM call_attempts WHERE pool IS NULL OR pool_window > pool_limit" 0 \
+  && echo "ok: no claim went above the limit of its pool" \
+  || { echo "FAIL: a claim went above its limit: $(pg "SELECT string_agg(id || ':' || pool_window || '/' || pool_limit, ' ') FROM call_attempts WHERE pool IS NULL OR pool_window > pool_limit")"; FAIL=1; }
+# The same check from the times alone. 200 ms covers the time from the start
+# of a claim's or a join's transaction to its count or commit; every join
+# takes longer.
+OPEN="(SELECT count(*) FROM call_attempts b WHERE b.pool = a.pool AND b.id < a.id
+         AND $(left_window b) > a.created_at + interval '200 milliseconds')"
+pg_eq "SELECT count(*) FROM call_attempts a WHERE 1 + $OPEN > a.pool_limit" 0 \
+  && echo "ok: the attempt times agree: no claim found a full window" \
+  || { echo "FAIL: the attempt times show a claim into a full window (attempt: open before it/limit): $(pg "SELECT string_agg(a.id || ': ' || $OPEN || '/' || a.pool_limit, ' ') FROM call_attempts a WHERE 1 + $OPEN > a.pool_limit")"; FAIL=1; }
+for c in 1 2; do
+  GREW=$(pg "SELECT max(pool_limit) FROM call_attempts WHERE campaign_id=$c")
+  FIRST_LIMIT=$(pg "SELECT pool_limit FROM call_attempts WHERE campaign_id=$c ORDER BY id LIMIT 1")
+  POOL="$(api_field "$API/v1/campaigns/$c/pacing" "v['pool']['pool'] + ': k=' + str(v['pool']['k']) + ', joins=' + str(v['pool']['samples']) + ', slow=' + str(v['pool']['slow']) + ', p50=' + str(v['pool']['recent']['p50_ms']) + ' ms, p95=' + str(v['pool']['recent']['p95_ms']) + ' ms'")"
+  [ "$FIRST_LIMIT" = 1 ] && [ "${GREW:-0}" -ge 2 ] 2>/dev/null \
+    && echo "ok: campaign $c: the limit started at 1 and grew to $GREW ($POOL)" \
+    || { echo "FAIL: campaign $c: first limit '$FIRST_LIMIT', largest '$GREW'; want 1, then at least 2 ($POOL)"; FAIL=1; }
+done
 wait_for 30 "no call assignment left in kine" kine_none /agentdialer/calls/ || FAIL=1
 
+echo "== assert (h): the nodes take the time from Postgres, not from their OS clock =="
+for n in node-1:0 node-2:-180000 node-3:-660000; do
+  name=${n%%:*}; want=${n#*:}
+  got=$(logged_offset "$name")
+  [ -n "$got" ] && [ "$got" -ge $((want - 2000)) ] && [ "$got" -le $((want + 2000)) ] \
+    && echo "ok: $name logged its OS clock $got ms from Postgres" \
+    || { echo "FAIL: $name logged an OS clock offset of '${got:-none}' ms, want $want ms"; FAIL=1; }
+done
+# An event time comes before its save, by at most the room join or an agent's
+# start request. It can also come after it: a node's clock follows the
+# monotonic clock between two reads of the Postgres clock, and on WSL2 the
+# wall clock (so the Postgres clock) steps back about 0.6 s every 30 s
+# against the monotonic clock. A node that used its OS clock saves times 3 or
+# 11 min early.
+IN_TIME="(payload->>'at')::timestamptz BETWEEN e.created_at - interval '30 seconds' AND e.created_at + interval '5 seconds'"
+EVENTS=$(pg "SELECT count(*) FROM attempt_events WHERE payload ? 'at'")
+LATE_MS=$(pg "SELECT round(max(extract(epoch FROM (payload->>'at')::timestamptz - e.created_at)) * 1000) FROM attempt_events e WHERE payload ? 'at'")
+pg_eq "SELECT count(*) FROM attempt_events e WHERE payload ? 'at' AND NOT ($IN_TIME)" 0 \
+  && echo "ok: the times of all $EVENTS events agree with Postgres (at most $LATE_MS ms after their save)" \
+  || { echo "FAIL: event times that disagree with Postgres: $(pg "SELECT string_agg(e.attempt_id || '/' || e.kind || ':' ||
+         round(extract(epoch FROM (payload->>'at')::timestamptz - e.created_at))::text || ' s', ' ')
+         FROM attempt_events e WHERE payload ? 'at' AND NOT ($IN_TIME)")"; FAIL=1; }
+
 if [ "$FAIL" -eq 0 ]; then
-  echo "CLUSTER E2E: PASS — three nodes carried $N calls themselves through Kamailio and a NAT, with a LiveKit agent and a pipecat bot; the carrier's BYE reached each call's node, the audio crossed both ways, dead nodes' calls ended without a second dial, and every lead was dialed exactly once"
+  echo "CLUSTER E2E: PASS — three nodes carried $N calls themselves through Kamailio and a NAT, with a LiveKit agent and a pipecat bot; the carrier's BYE reached each call's node, the audio crossed both ways, dead nodes' calls ended without a second dial, every lead was dialed exactly once, each agent pool grew its window from its agents' join times with no call abandoned, and two nodes with a wrong OS clock saved true times"
   exit 0
 else
   echo "CLUSTER E2E: FAIL"

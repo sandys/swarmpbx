@@ -22,6 +22,10 @@ fn every_variant(campaign_id: i64) -> Vec<CampaignEvent> {
             campaign_id,
             attempt_id: 11,
         },
+        CampaignEvent::AgentJoined {
+            campaign_id,
+            attempt_id: 11,
+        },
         CampaignEvent::CallCompleted {
             campaign_id,
             lead_id: 1,

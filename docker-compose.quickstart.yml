@@ -75,6 +75,10 @@ services:
     environment:
       SHM_MEMORY: "64"
       PKG_MEMORY: "8"
+      # A tunnel to the TCP socket (click-to-call through ngrok): set only
+      # when a tunnel exists, so the names have no value here.
+      AD_EDGE_TCP_HOST:
+      AD_EDGE_TCP_PORT:
     volumes:
       - ./e2e/kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
     networks:
@@ -112,11 +116,17 @@ services:
       - LIVEKIT_URL=ws://livekit:7880
       - LIVEKIT_API_KEY=devkey
       - LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b
+      - AD_DIAL_PROVIDER=${AD_DIAL_PROVIDER:-sip_trunk}
       - AD_SIP_TRUNK=${AD_SIP_TRUNK:-}
       - AD_SIP_PROXY=kamailio:5060
       - AD_SIP_TRUNK_USER=${AD_SIP_TRUNK_USER:-}
       - AD_SIP_TRUNK_PASSWORD=${AD_SIP_TRUNK_PASSWORD:-}
       - AD_SIP_CALLER_ID=${AD_SIP_CALLER_ID:-}
+      - AD_TWILIO_API_URL=${AD_TWILIO_API_URL:-}
+      - AD_TWILIO_ACCOUNT_SID=${AD_TWILIO_ACCOUNT_SID:-}
+      - AD_TWILIO_API_KEY=${AD_TWILIO_API_KEY:-}
+      - AD_TWILIO_API_SECRET=${AD_TWILIO_API_SECRET:-}
+      - AD_TWILIO_SIP_URI=${AD_TWILIO_SIP_URI:-}
       - AD_ETCD_ENDPOINTS=http://kine:2379
       - AD_ROOM_PREFIX=call
       - AD_NODE_CAPACITY=10

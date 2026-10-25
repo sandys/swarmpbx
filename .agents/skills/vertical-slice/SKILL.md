@@ -27,19 +27,26 @@ Put a `router()` factory in the crate. The factory returns the full
 `axum::Router`. Both production and tests use the same factory. This makes the
 API testable in process, with no network and no ports.
 
-Inject time and other non-deterministic inputs through shared state. The
-compliance endpoints use an injected `Clock` so tests freeze time.
+Take the time from the `Clock` in the shared state (`state.clock`). In
+production, `serve()` gives the API an `ad_db::PgClock` (the Postgres time).
+Tests give it a `FixedClock`. Do not call `Utc::now()` in a handler.
 
-See `crates/ad_api/src/lib.rs` for the `router(AppState)` factory and
-`crates/ad_api/src/compliance.rs` for an endpoint over a pure engine.
+Examples:
+
+- `crates/ad_api/src/lib.rs`: the `router(AppState)` factory.
+- `crates/ad_api/src/compliance.rs`: an endpoint over a pure engine.
+- `crates/ad_api/src/pacing.rs`: an endpoint that needs Postgres. It answers
+  503 without Postgres, and it reads and writes settings at run time.
 
 ## The test pattern (in process)
 
 Test the router with `tower::ServiceExt::oneshot`. Send a `Request`, read the
 `Response`, assert the JSON contract. Use a `FixedClock` for deterministic time.
 
-See `crates/ad_api/tests/compliance_api.rs` for the full pattern. The key
-helper:
+See `crates/ad_api/tests/compliance_api.rs` for the full pattern. A test that
+needs Postgres reads `DATABASE_URL` and skips without it
+(`crates/ad_api/tests/pacing_api.rs`). The test tier sets `DATABASE_URL`, so
+the test runs there. The key helper:
 
 ```rust
 async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
@@ -84,7 +91,14 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
   `POST /v1/campaigns/:id/dispatch/run-batch` returns `experimental: true` and
   names its stub initiator (`crates/ad_api/src/dispatch.rs`).
 - Runtime behavior: if the slice changes how a role runs, run the e2e script
-  that covers the role (`e2e/`).
+  that covers it. The `agentdialer-overview` skill has the table ("The tests
+  that a change must keep green").
+- Time: a role takes the time from its `Clock`, and a call from its
+  `CallTimes`. Measure a duration with `Instant`, not with two wall-clock
+  times.
+- Users: if the slice changes what a user does, change the README and the
+  skill that teaches it (`run-campaigns` for the API and the stack,
+  `connect-an-agent` for the agent contract).
 
 ## Checklist for a slice
 
@@ -103,15 +117,17 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
        --abort-on-container-exit --exit-code-from tests
    docker compose -f docker-compose.test.yml down
    ```
-6. For a user-facing endpoint, boot the server once in its image and send one
-   real request from a container:
+6. For a user-facing endpoint, start the server one time in its image, and
+   send one real request from a container on the same network:
    ```
    docker build -t agentdialer:dev .
-   docker run -d --name ad-api --network host \
-       -e AD_API_ADDR=127.0.0.1:18080 agentdialer:dev api
-   docker run --rm --network host python:3.12-slim python3 -c \
-       'import urllib.request as u; print(u.urlopen("http://127.0.0.1:18080/health").read())'
+   docker network create ad-slice
+   docker run -d --name ad-api --network ad-slice agentdialer:dev api
+   AD_API_NETWORK=ad-slice AD_API_URL=http://ad-api:8080 scripts/api.sh GET /health
    docker rm -f ad-api
+   docker network rm ad-slice
    ```
+   Without `DATABASE_URL`, the API uses in-memory stores. To test with
+   Postgres, use the quickstart stack (the `run-campaigns` skill).
 
 Do not run `cargo`, `curl`, or any other toolchain on the host.

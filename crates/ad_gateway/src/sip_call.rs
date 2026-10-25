@@ -7,13 +7,17 @@
 //! never queues while the phone rings. The call ends when the callee sends
 //! BYE, when the agent leaves the room, or when no RTP arrives for the media
 //! timeout. We send BYE on every other end.
+//!
+//! Customer first, the agent joins the room after the answer: `run` hangs up
+//! when no agent is in the room by its deadline (`CallEnd::NoAgent`).
 
 use std::net::IpAddr;
+use std::time::Instant;
 
 use ad_dispatch::Placement;
 use ad_media::{MediaConfig, MediaOut, RtpLeg, SAMPLE_RATE};
-use ad_sip::{Ended, Invite, Outcome, SipUa, TrunkAuth};
-use tokio::sync::{mpsc, watch};
+use ad_sip::{Ended, Incoming, Invite, Outcome, SipUa, TrunkAuth};
+use tokio::sync::{mpsc, watch, Notify};
 
 use crate::bridge::{
     AudioFrame, BridgeError, MediaBridge, RoomConnection, RoomParticipant, RtpSink, RtpSource,
@@ -38,6 +42,9 @@ pub struct SipDial<'a> {
     pub phone_number: &'a str,
     /// The SIP Call-ID; it names the node.
     pub call_id: String,
+    /// Notified at the answer, before the room join: customer first starts
+    /// the agent then.
+    pub on_answer: Option<&'a Notify>,
 }
 
 /// The result of a dial.
@@ -53,6 +60,8 @@ pub enum CallEnd {
     CalleeHangup,
     AgentLeft,
     MediaTimeout,
+    /// No agent was in the room by the deadline (customer first).
+    NoAgent,
     /// The dialog ended for another reason.
     Other(String),
 }
@@ -119,13 +128,71 @@ impl SipCaller {
             Ok(Outcome::NotSent(detail)) => return Dialed::Failed(Placement::NotSent(detail)),
             Err(e) => return Dialed::Failed(Placement::NotSent(e.to_string())),
         };
-        if let Err(e) = leg.accept(&call.answer).await {
+        let answered = Instant::now();
+        if let Some(n) = req.on_answer {
+            n.notify_one();
+        }
+        if let Err(e) = leg.accept(&call.remote_sdp).await {
             call.hangup().await;
             return Dialed::Failed(Placement::Rejected {
                 sip_code: None,
                 detail: format!("bad SDP answer: {e}"),
             });
         }
+        self.connect(call, leg, req.room, req.identity, answered)
+            .await
+    }
+
+    /// The node's SIP user agent.
+    pub fn ua(&self) -> &SipUa {
+        &self.ua
+    }
+
+    /// Answer an expected inbound call (click-to-call) and connect it to the
+    /// room, as an answered dial.
+    pub async fn answer(
+        &self,
+        incoming: Incoming,
+        room: &str,
+        identity: &str,
+        on_answer: Option<&Notify>,
+    ) -> Dialed {
+        let mut media = MediaConfig::new(self.media_ip);
+        media.external_ip = self.public_ip;
+        let (leg, answer) = match RtpLeg::answer(&media, &incoming.offer).await {
+            Ok(v) => v,
+            Err(e) => {
+                incoming.reject(488);
+                return Dialed::Failed(Placement::Rejected {
+                    sip_code: None,
+                    detail: format!("bad SDP offer: {e}"),
+                });
+            }
+        };
+        let answered = Instant::now();
+        match incoming.accept(answer) {
+            Ok(call) => {
+                if let Some(n) = on_answer {
+                    n.notify_one();
+                }
+                self.connect(call, leg, room, identity, answered).await
+            }
+            Err(e) => Dialed::Failed(Placement::Rejected {
+                sip_code: None,
+                detail: e.to_string(),
+            }),
+        }
+    }
+
+    /// Start the media of a connected call and join the room.
+    async fn connect(
+        &self,
+        mut call: ad_sip::Call,
+        leg: RtpLeg,
+        room: &str,
+        identity: &str,
+        answered: Instant,
+    ) -> Dialed {
         let media = match leg.start() {
             Ok(m) => m,
             Err(e) => {
@@ -136,7 +203,7 @@ impl SipCaller {
                 });
             }
         };
-        let session = match self.join(req.room, req.identity).await {
+        let session = match self.join(room, identity).await {
             Ok(s) => s,
             Err(e) => {
                 call.hangup().await;
@@ -150,6 +217,7 @@ impl SipCaller {
             call,
             media,
             session,
+            answered,
         })
     }
 
@@ -184,21 +252,48 @@ pub struct LiveCall {
     call: ad_sip::Call,
     media: ad_media::Media,
     session: crate::webrtc_participant::LiveKitSession,
+    answered: Instant,
 }
 
 impl LiveCall {
-    /// Carry the audio until the call ends.
-    pub async fn run(self) -> CallEnd {
+    /// When the callee answered (the 200 OK, or our 200 OK to an inbound
+    /// call).
+    pub fn answered(&self) -> Instant {
+        self.answered
+    }
+
+    /// The identity of the agent once it is in the room.
+    pub fn agent_joined(&self) -> watch::Receiver<Option<String>> {
+        self.session.others_joined()
+    }
+
+    /// Carry the audio until the call ends. With `agent_by`, hang up at that
+    /// time if no agent is in the room.
+    pub async fn run(self, agent_by: Option<Instant>) -> CallEnd {
         let LiveCall {
             mut call,
             mut media,
             session,
+            ..
         } = self;
         let Some(from_callee) = media.take_inbound() else {
             call.hangup().await;
             return CallEnd::Other("no inbound audio".into());
         };
         let mut agent_left = session.others_left();
+        let mut joined = session.others_joined();
+        let no_agent = async move {
+            let Some(by) = agent_by else {
+                return std::future::pending().await;
+            };
+            let deadline = tokio::time::Instant::from_std(by);
+            if tokio::time::timeout_at(deadline, joined.wait_for(|j| j.is_some()))
+                .await
+                .is_ok()
+            {
+                std::future::pending::<()>().await;
+            }
+        };
         let (stop, stopped) = watch::channel(false);
         let bridge = MediaBridge::run(
             session,
@@ -218,6 +313,10 @@ impl LiveCall {
             _ = async { let _ = agent_left.wait_for(|left| *left).await; } => {
                 call.hangup().await;
                 CallEnd::AgentLeft
+            }
+            _ = no_agent => {
+                call.hangup().await;
+                CallEnd::NoAgent
             }
             stats = &mut bridge => {
                 // The callee's audio stopped: the media timeout.

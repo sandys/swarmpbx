@@ -13,15 +13,19 @@ use sqlx::{PgPool, Row};
 
 pub mod attempts;
 pub mod breaker;
+pub mod clock;
 pub mod events;
 pub mod leads;
+pub mod pacing;
 pub use attempts::{
-    Applied, AttemptBrief, AttemptError, AttemptRow, ClaimedAttempt, LeadUpdate, LiveAttempt,
-    Owner, PgAttemptRepo, RoomAttempt, SettleInput,
+    Applied, AttemptBrief, AttemptError, AttemptRow, ClaimRequest, ClaimedAttempt, LeadUpdate,
+    LiveAttempt, Owner, PgAttemptRepo, RoomAttempt, SettleInput,
 };
 pub use breaker::PgBreakerStore;
+pub use clock::PgClock;
 pub use events::{PgEventConsumer, PgEventLog};
 pub use leads::PgLeadRepo;
+pub use pacing::{Listed, PaceClaim, PacingError, PgPacingRepo, PoolView, Recent};
 
 use ad_campaign::repo::{CampaignRepo, NewCampaign, RepoError};
 use ad_campaign::{Campaign, CampaignState, Counters, Transition, TransitionError};
@@ -85,6 +89,10 @@ impl Db {
 
     pub fn attempts(&self) -> PgAttemptRepo {
         PgAttemptRepo::new(self.pool.clone())
+    }
+
+    pub fn pacing(&self) -> PgPacingRepo {
+        PgPacingRepo::new(self.pool.clone())
     }
 
     pub fn events(&self) -> PgEventLog {

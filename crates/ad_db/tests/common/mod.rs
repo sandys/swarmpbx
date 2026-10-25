@@ -80,7 +80,7 @@ pub async fn leads(db: &Db, campaign_id: CampaignId, n: usize) -> Vec<Lead> {
 
 pub async fn claim(db: &Db, campaign_id: CampaignId, limit: i64) -> Vec<ClaimedAttempt> {
     db.attempts()
-        .claim(campaign_id, "test-worker", limit, "room", Utc::now())
+        .claim(campaign_id, "test-worker", limit, "room", Utc::now(), None)
         .await
         .unwrap()
 }

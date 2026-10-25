@@ -165,6 +165,17 @@ phones. `crates/ad_sip/tests/twilio.rs` (407 digest, caller ID, E.164,
 account where Elastic SIP Trunking is available (Twilio refused it for the
 Trial test account) and a number for the caller ID.
 
+**Twilio click-to-call (built, simulator only).** With
+`AD_DIAL_PROVIDER=twilio_click_to_call` (the `Telephony` registry in
+`ad_gateway`), Twilio places the call: the node asks the Calls API to call
+the lead, with inline TwiML `<Dial><Sip>` to Kamailio and the call's token.
+When the phone answers, Twilio's INVITE comes to Kamailio, which routes it by
+`x-ad-node` to the node that waits for the token (`ad_sip::SipUa::expect`).
+The node reads the call's status for busy, no answer, and failed, with no
+webhook. `e2e/run_twilio_c2c_e2e.sh --sim` proves it in CI. The live mode
+(an ngrok TCP tunnel to Kamailio) needs an upgraded Twilio account: a Trial
+account blocks `<Dial><Sip>` (GAPS.md CARRIER-2).
+
 **Open.** The `rustrtc` latching patch; the first live Twilio run (blocked on
 the account); a resent 200 against the simulator; session timers and the
 trunk OPTIONS check (copy from `rustpbx`); the
@@ -675,7 +686,20 @@ A **registry of dial strategies** (re-expressing VICIdial's `dial_method` enum,
 reframed for elastic AI agents — see §3.3):
 
 - `Progressive` (**default**): place a call only when a concurrency slot is
-  free. With elastic AI agents this yields **~0% abandonment** mechanically.
+  free. Agent first, this cannot abandon a call. Customer first (the default
+  dial order since 2026-10-24), the claim is also bound by the window of the
+  agent pool (`JoinPaced`, below), because a free slot does not prove that an
+  agent joins within 2 s.
+- `JoinPaced` (BUILT 2026-10-24, `GAPS.md` DIAL-9, decision D-10): the window
+  of an agent pool is its attempts whose agent is not in the room yet. The
+  claim takes a call only while the window is under the pool's limit `k`.
+  `ad_pacing` learns `k` from the join times (AIMD: slow start from
+  `first_k`, +1 per round of fast joins, a halving on a join above the
+  back-off, a failed start, or no agent at the limit). The modes are
+  `adaptive` (`k`) and `strict` (also at most one start more than the pool
+  proved at once). The settings (`agent_pools.settings`) and the mode
+  (`campaigns.pacing`) change at run time through the API. The state
+  (`agent_pools.state`) is in Postgres, so a new leader continues from it.
 - `Power(ratio)`: dial `ratio × free_slots` to absorb no-answers; bounded so the
   abandonment ledger (§9) can never exceed the jurisdiction cap.
 - `Predictive` (optional, later): capacity-aware pacing with the circuit breaker
@@ -909,21 +933,54 @@ reconcile finds the call's participant gone from the room and ends the
 attempt. A dial that was in flight on the dead node becomes `uncertain` and
 is decided by the reconcile (GAPS.md DIAL-4). Neither is dialed again.
 
+**Time (decision D-11, 2026-10-24).** The roles do not trust the OS clock of
+their node. Each role with Postgres takes the time from `ad_db::PgClock`: it
+reads `clock_timestamp()` from Postgres at the start (it does no work before
+the first read) and every 30 s, uses the read with the shortest round trip,
+and adds the monotonic time since that read. So every node and `now()` in SQL
+tell the same time, within the error of a read (half its round trip) and the
+drift until the next read. A node with a wrong OS clock still decides safe
+hours, due times, takeovers, and the reconcile correctly. Checks that compare
+times exactly use only Postgres times (the save time of an event). Each call takes one
+read of that clock at its start and then only the monotonic clock
+(`CallTimes`), so a re-sync during the call cannot change its ring, join, or
+talk time. The OS clock still dates the log lines and the LiveKit tokens
+(`livekit-api` reads it); a node logs an OS clock more than 250 ms from
+Postgres as a warning. We run no time daemon in a pod: setting the clock
+needs `CAP_SYS_TIME` and changes the whole node. On EKS the node keeps its
+clock (chrony and Amazon Time Sync), and RDS keeps the Postgres clock.
+
 **Agents (decision D-2).** `ad_agent` starts the campaign's agent per call:
 `livekit` (explicit dispatch by agent name; the agent joins as `agent-AJ_…`)
 or `pipecat` (a start request with a room token to `start_url`; the bot joins
 as `agent-attempt-{id}` with pipecat's LiveKit transport). Both get the same
-call facts. The attempt statechart has an agent region: the dial waits until
-the agent is in the room; an agent that does not join in `join_timeout_s`
-ends the attempt as `not_dialed: no_agent`; an agent that leaves ends a
-connected call. Rooms are one per attempt (`{prefix}-{attempt id}`).
+call facts. The attempt statechart has an agent region, and the campaign's
+`dial_order` sets its order:
+- `customer_first` (the default): the node dials, and on the 200 OK it
+  sends the agent's start request, while it joins the room itself. The
+  agent must be in the room within
+  `JurisdictionRule::connect_within` (2 s) of the 200 OK. Otherwise the node
+  hangs up, and the outcome is `abandoned`. The statechart enforces the same
+  limit on a late `agent_ready`. The limit also runs during the start
+  request. The LiveKit server of the rooms has `room.auto_create: false`, so
+  an agent that joins after the leader closed the room cannot open it again.
+- `agent_first`: the dial waits until the agent is in the room; an agent
+  that does not join in `join_timeout_s` ends the attempt as
+  `not_dialed: no_agent`.
+
+The leader reads the campaign's abandonment ledger (`call_attempts`, 30
+days) before each claim. Above the cap, or when it cannot read the ledger,
+the claim dials agent first. The retry of an abandoned lead dials agent
+first. An agent that leaves ends a connected call. Rooms are one per attempt
+(`{prefix}-{attempt id}`).
 
 **Proof.** `crates/ad_cluster/tests/kine.rs` runs against a real kine:
 conditional writes, TTL expiry, the mirror, election and takeover, assignment
-load and orphans. `crates/ad_attempt` tests the agent region (property: no
-dial before the agent is ready). `crates/ad_agent/tests/pipecat.rs` tests the
-start request and its token. `e2e/run_e2e.sh` runs one call with a real
-LiveKit agent and one with a real pipecat bot. `e2e/run_cluster_e2e.sh`
+load and orphans. `crates/ad_attempt` tests the agent region (properties: no
+agent-first dial before the agent is ready; no customer-first call carries a
+late agent). `crates/ad_agent/tests/pipecat.rs` tests the start request and
+its token. `e2e/run_e2e.sh` runs a call for each runtime with each dial order
+(real agents), and one abandoned call. `e2e/run_cluster_e2e.sh`
 (`docker-compose.cluster.yml`) runs three nodes with both runtimes, kills a
 node and then the leader, and checks that every lead is dialed exactly once.
 
@@ -965,7 +1022,7 @@ crates/
   ad_routing/     # the FusionPBX-grade rule engine: ruleset/rule/detail model,
                   #   condition/action/anti-action/break/inline/group evaluator,
                   #   variable interpolation + function registry + action registry.
-  ad_pacing/      # dial-strategy registry (progressive/power/predictive).
+  ad_pacing/      # join-paced window controller (built); power/predictive (planned).
   ad_disposition/ # status/disposition model + lead state machine + outcome apply.
   ad_compliance/  # §9 — safe-hours (fail-closed), DNC, abandonment ledger.
   ad_concurrency/ # Postgres SKIP LOCKED claim + per-campaign cap (§0.8).
@@ -1137,7 +1194,7 @@ Cloned/downloaded under `_research/`:
 |---|---|
 | Human agents log into agent screen | **LiveKit agent dispatched per answered call**; agent capacity is elastic (K8s pods). The "remote agent" seam becomes "SIP egress to a LiveKit/pipecat worker." |
 | `vicidial_live_agents` (who's available) | **Concurrency slots** (Postgres rows, decision D-3) = guaranteed-available agent capacity. A call is only placed when a slot is acquired. |
-| Predictive/adaptive pacing to hit <3% abandonment | **Progressive/power dialing**: never dial beyond acquired capacity ⇒ abandonment is mechanically ~0%. Pacing degenerates to "dial as fast as slots free up." |
+| Predictive/adaptive pacing to hit <3% abandonment | **Progressive/power dialing**: never dial beyond acquired capacity. Agent first, abandonment is 0. Customer first, an AI agent still takes time to join, so the claim is also paced by the agents' join time (`JoinPaced`, §0.10.6, `GAPS.md` DIAL-9). |
 | `drop_call_seconds` / `drop_action` / abandonment rate | **Circuit breaker + abandonment ledger**: we still *record* answered-but-not-connected events and compute the regulator's rate (answered-by-human-but-dropped ÷ answered-by-human) over the correct rolling window per jurisdiction. Used for reporting and as a hard safety cap, not as the pacing driver. |
 | Asterisk originate → bridge to agent | **Telephony provider `initiate_call`** over SIP → room/leg → agent attaches. One provider: SIP (with LiveKit as the first concrete egress). |
 | CPD/AMD in Asterisk | **Answer supervisor in the agent** (voicemail/human/screening) — dograh's `AnswerAction` model: `start_opening/release/leave_message/drop/screen_then_rearm/wait_for_screening`. |
@@ -1236,7 +1293,7 @@ agentdialer/
 │   │                               #   alt-dial/api/xth-new/drop-run), ordering, filters.
 │   │                               #   Registry of HopperSource. Pure selection logic
 │   │                               #   over ad_db queries.
-│   ├── ad_pacing/                  # dial strategies: Progressive (default), Power,
+│   ├── ad_pacing/                  # BUILT: the JoinPaced controller (DIAL-9). Planned: Power,
 │   │                               #   (optional) Predictive. Registry of DialStrategy.
 │   ├── ad_concurrency/             # slot manager on Postgres rows (org + campaign scope),
 │   │                               #   acquire/bind/release, stale recovery, fleet count.

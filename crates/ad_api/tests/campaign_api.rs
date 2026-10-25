@@ -211,3 +211,24 @@ async fn create_takes_an_agent_and_rejects_a_bad_one() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_dial_order_is_part_of_the_agent() {
+    let agent = |order: &str| {
+        json!({ "org_id": 7, "name": "x",
+                "agent": {"runtime": "livekit", "agent_name": "sales", "dial_order": order} })
+    };
+    let (status, v) = send(app(), "POST", "/v1/campaigns", Some(agent("agent_first"))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["agent"]["dial_order"], "agent_first");
+    let (status, v) = send(app(), "POST", "/v1/campaigns", Some(agent("agent_last"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(v["error"].as_str().unwrap().contains("agent_last"), "{v}");
+}
+
+#[tokio::test]
+async fn the_abandonment_ledger_needs_postgres() {
+    let (status, v) = send(app(), "GET", "/v1/campaigns/1/abandonment", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(v["error"].as_str().unwrap().contains("Postgres"));
+}

@@ -136,6 +136,17 @@ services:
     volumes:
       - ./.out:/out
 
+  # The API role, for the checks that change values at run time (the pacing
+  # of an agent pool).
+  api:
+    image: agentdialer:e2e
+    command: ["api"]
+    environment:
+      - AD_API_ADDR=0.0.0.0:8080
+      - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
+      - RUST_LOG=info
+    networks: [cluster]
+
   node-1:
     image: agentdialer:e2e
     command: ["orchestrator"]
@@ -160,7 +171,8 @@ services:
     networks: [cluster]
 
   node-2:
-    image: agentdialer:e2e
+    # The OS clock of this node is 3 min behind (assert (h)).
+    image: agentdialer:e2e-clock-3m
     command: ["orchestrator"]
     environment:
       - HOSTNAME=node-2
@@ -183,7 +195,8 @@ services:
     networks: [cluster]
 
   node-3:
-    image: agentdialer:e2e
+    # The OS clock of this node is 11 min behind (assert (h)).
+    image: agentdialer:e2e-clock-11m
     command: ["orchestrator"]
     environment:
       - HOSTNAME=node-3

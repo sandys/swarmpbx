@@ -28,9 +28,21 @@ livekit:
 # The calls. Each node sends its INVITEs through the SIP edge (Kamailio,
 # deployed separately) and puts its pod IP in Via, Contact, and the SDP.
 sip:
-  trunk: ""                 # AD_SIP_TRUNK: the carrier's host:port (required)
+  trunk: ""                 # AD_SIP_TRUNK: the carrier's host:port (required with sip_trunk)
   proxy: ""                 # AD_SIP_PROXY: the SIP edge's host:port, e.g. kamailio:5060
   callerId: ""              # AD_SIP_CALLER_ID: E.164, e.g. a Twilio number of the account
+
+# The telephony provider (AD_DIAL_PROVIDER). sip_trunk: the node sends the
+# INVITE to sip.trunk. twilio_click_to_call: Twilio calls the lead, then sends
+# an INVITE to the SIP edge (README.md, "Click-to-call through Twilio"); it
+# needs sip.callerId and the Twilio values below.
+telephony:
+  provider: "sip_trunk"
+  twilio:
+    apiUrl: ""              # AD_TWILIO_API_URL (default https://api.twilio.com)
+    accountSid: ""          # AD_TWILIO_ACCOUNT_SID: AC...
+    sipUri: ""              # AD_TWILIO_SIP_URI: the public SIP URI of the edge
+    existingSecret: ""      # Secret with AD_TWILIO_API_KEY and AD_TWILIO_API_SECRET
 
 # The API: a normal Deployment + Service + HPA.
 api:

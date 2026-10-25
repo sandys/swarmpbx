@@ -20,6 +20,7 @@ members = [
     "crates/ad_agent",
     "crates/ad_media",
     "crates/ad_sip",
+    "crates/ad_pacing",
     "crates/ad_dispatch",
     "crates/ad_gateway",
     "crates/ad_orchestrator",

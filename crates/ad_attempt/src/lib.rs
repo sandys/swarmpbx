@@ -8,10 +8,15 @@
 //! saved events gives the saved snapshot.
 //!
 //! The attempt has two regions. `leg` is the customer SIP leg. `agent` is the
-//! AI agent (a LiveKit agent or a pipecat bot) in the same room. The dial
-//! starts only when the agent is ready, so no callee answers to an empty room.
-//! A live attempt (any leg state except `Ended`) holds one unit of campaign
-//! capacity.
+//! AI agent (a LiveKit agent or a pipecat bot) in the same room. A live
+//! attempt (any leg state except `Ended`) holds one unit of campaign capacity.
+//!
+//! The campaign's dial order decides when the agent starts:
+//! - agent first (`with_agent`): the dial starts only when the agent is ready,
+//!   so no callee answers to an empty room.
+//! - customer first (`with_agent_on_answer`): the dialer starts the agent when
+//!   the callee answers. An agent that is not in the room within the limit
+//!   (the abandonment rule's two seconds) makes the call `Abandoned`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -65,6 +70,8 @@ pub enum AgentLeg {
     None,
     /// The dialer must start the agent before the dial.
     Wanted,
+    /// The dialer starts the agent when the callee answers.
+    OnAnswer,
     /// The runtime accepted the start request; the agent is not in the room yet.
     Starting { since: DateTime<Utc> },
     /// The agent is in the room.
@@ -80,6 +87,7 @@ impl AgentLeg {
         match self {
             AgentLeg::None => "none",
             AgentLeg::Wanted => "wanted",
+            AgentLeg::OnAnswer => "on_answer",
             AgentLeg::Starting { .. } => "starting",
             AgentLeg::Ready { .. } => "ready",
             AgentLeg::Left { .. } => "left",
@@ -132,6 +140,11 @@ pub enum Outcome {
         sip_code: Option<u16>,
         detail: String,
     },
+    /// The callee answered, and no agent was in the room within the limit.
+    /// The abandonment ledger counts it.
+    Abandoned {
+        detail: String,
+    },
     /// The dial request did not reach the provider. No call exists.
     SetupError {
         detail: String,
@@ -156,6 +169,7 @@ impl Outcome {
             Outcome::Declined { .. } => "declined",
             Outcome::InvalidNumber { .. } => "invalid_number",
             Outcome::Failed { .. } => "failed",
+            Outcome::Abandoned { .. } => "abandoned",
             Outcome::SetupError { .. } => "setup_error",
             Outcome::Uncertain { .. } => "uncertain",
             Outcome::NotDialed { .. } => "not_dialed",
@@ -177,6 +191,7 @@ impl Outcome {
         match self {
             Outcome::Completed { detail }
             | Outcome::Failed { detail, .. }
+            | Outcome::Abandoned { detail }
             | Outcome::SetupError { detail }
             | Outcome::Uncertain { detail }
             | Outcome::NotDialed { detail, .. } => detail,
@@ -206,6 +221,13 @@ pub struct Attempt {
     pub answered_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub agent_ready_at: Option<DateTime<Utc>>,
+    /// When the dialer sent the agent's start request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_started_at: Option<DateTime<Utc>>,
+    /// Customer first: the agent must be in the room this many milliseconds
+    /// after the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_within_ms: Option<u32>,
 }
 
 impl Default for Attempt {
@@ -217,6 +239,8 @@ impl Default for Attempt {
             dialed_at: None,
             answered_at: None,
             agent_ready_at: None,
+            agent_started_at: None,
+            agent_within_ms: None,
         }
     }
 }
@@ -226,6 +250,16 @@ impl Attempt {
     pub fn with_agent() -> Self {
         Attempt {
             agent: AgentLeg::Wanted,
+            ..Attempt::default()
+        }
+    }
+
+    /// A new attempt that dials the customer first: the agent starts on the
+    /// answer and must be in the room within `within_ms`.
+    pub fn with_agent_on_answer(within_ms: u32) -> Self {
+        Attempt {
+            agent: AgentLeg::OnAnswer,
+            agent_within_ms: Some(within_ms),
             ..Attempt::default()
         }
     }
@@ -244,10 +278,19 @@ impl Attempt {
         }
     }
 
-    /// The dial may start: the leg waits, and the agent is ready or not needed.
+    /// The dial may start: the leg waits, and the agent is ready, not needed,
+    /// or starts on the answer.
     pub fn can_dial(&self) -> bool {
         matches!(self.leg, Leg::Pending)
-            && matches!(self.agent, AgentLeg::None | AgentLeg::Ready { .. })
+            && matches!(
+                self.agent,
+                AgentLeg::None | AgentLeg::Ready { .. } | AgentLeg::OnAnswer
+            )
+    }
+
+    /// Customer first: the latest time for the agent to be in the room.
+    pub fn agent_due(&self) -> Option<DateTime<Utc>> {
+        Some(self.answered_at? + chrono::Duration::milliseconds(self.agent_within_ms?.into()))
     }
 }
 
@@ -262,7 +305,8 @@ pub enum AttemptEvent {
         reason: NotDialedReason,
         detail: String,
     },
-    /// The agent runtime accepted the start request.
+    /// The agent runtime accepted the start request. `at` is the time the
+    /// request left, so that the join time includes the request.
     AgentStarting { at: DateTime<Utc>, detail: String },
     /// The agent is in the room.
     AgentReady { at: DateTime<Utc>, identity: String },
@@ -362,11 +406,70 @@ pub fn apply(attempt: &Attempt, event: &AttemptEvent) -> Result<Attempt, Ignored
             },
         )
     };
+    // Customer first. Without an answer time or a limit, every time is late.
+    let late = |at: &DateTime<Utc>| attempt.agent_due().is_none_or(|due| *at > due);
+    let after_answer = |at: &DateTime<Utc>| {
+        attempt
+            .answered_at
+            .map_or(0, |answered| (*at - answered).num_milliseconds())
+    };
+    let limit_ms = attempt.agent_within_ms.unwrap_or(0);
     let mut next = attempt.clone();
     match (&attempt.leg, &attempt.agent, event) {
+        // Customer first: the agent starts on the answer.
+        (L::Connected { .. }, A::OnAnswer, E::AgentStarting { at, .. }) => {
+            next.agent = A::Starting { since: *at };
+            next.agent_started_at = Some(*at);
+        }
+        (L::Connected { .. }, A::Starting { .. }, E::AgentReady { at, .. }) => {
+            next.agent = A::Ready { since: *at };
+            next.agent_ready_at = Some(*at);
+            if late(at) {
+                let detail = format!(
+                    "the agent joined {} ms after the answer; the limit is {limit_ms} ms",
+                    after_answer(at)
+                );
+                next.leg = ended(*at, Outcome::Abandoned { detail });
+            }
+        }
+        (L::Connected { .. }, A::OnAnswer | A::Starting { .. }, E::AgentFailed { at, detail }) => {
+            next.agent = A::Failed {
+                at: *at,
+                detail: detail.clone(),
+            };
+            next.leg = ended(
+                *at,
+                Outcome::Abandoned {
+                    detail: detail.clone(),
+                },
+            );
+        }
+        (L::Connected { .. }, A::OnAnswer | A::Starting { .. }, E::Hangup { at, detail }) => {
+            let outcome = if late(at) {
+                Outcome::Abandoned {
+                    detail: format!("no agent in the room within {limit_ms} ms; then {detail}"),
+                }
+            } else {
+                Outcome::Completed {
+                    detail: format!("{detail} before the agent joined"),
+                }
+            };
+            next.leg = ended(*at, outcome);
+        }
+        // The node that carried the call stopped before the agent joined.
+        (L::Connected { .. }, A::OnAnswer | A::Starting { .. }, E::Absent { at }) => {
+            next.leg = ended(
+                *at,
+                Outcome::Abandoned {
+                    detail: "the call left the room before the agent joined".into(),
+                },
+            );
+        }
+
         // The agent region.
         (L::Pending, A::Wanted, E::AgentStarting { at, .. }) => {
             next.agent = A::Starting { since: *at };
+            next.agent_started_at = Some(*at);
         }
         (L::Pending, A::Starting { .. }, E::AgentReady { at, .. }) => {
             next.agent = A::Ready { since: *at };
@@ -407,7 +510,7 @@ pub fn apply(attempt: &Attempt, event: &AttemptEvent) -> Result<Attempt, Ignored
                 },
             );
         }
-        (L::Pending, A::None | A::Ready { .. }, E::DialStarted { at }) => {
+        (L::Pending, A::None | A::Ready { .. } | A::OnAnswer, E::DialStarted { at }) => {
             next.dialed_at = Some(*at);
             next.leg = L::Dialing { since: *at };
         }

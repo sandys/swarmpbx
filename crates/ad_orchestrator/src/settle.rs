@@ -88,6 +88,7 @@ pub fn settle(
         Outcome::Busy { .. } => retry(RetryReason::Busy),
         Outcome::NoAnswer { .. } => retry(RetryReason::NoAnswer),
         Outcome::Failed { .. } => retry(RetryReason::Failed),
+        Outcome::Abandoned { .. } => retry(RetryReason::Abandoned),
         Outcome::SetupError { .. } | Outcome::Uncertain { .. } => retry(RetryReason::Error),
     }
 }

@@ -92,6 +92,8 @@ async def run_bot(req: dict) -> None:
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)
 
+    # Pipecat also reports the participants already in the room (customer
+    # first) as connected.
     @transport.event_handler("on_participant_connected")
     async def _joined(_transport, participant_id):
         if participant_id == callee:
@@ -118,9 +120,13 @@ async def start(request: web.Request) -> web.Response:
     for field in ("url", "room_name", "token", "identity"):
         if not req.get(field):
             return web.json_response({"error": f"{field} is missing"}, status=400)
-    task = asyncio.create_task(run_bot(req))
-    tasks.add(task)
-    task.add_done_callback(tasks.discard)
+    # Test controls of the start_url: hold_ms delays the answer, join=0 starts
+    # no bot.
+    await asyncio.sleep(int(request.query.get("hold_ms", "0")) / 1000)
+    if request.query.get("join") != "0":
+        task = asyncio.create_task(run_bot(req))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
     return web.json_response({"started": True})
 
 

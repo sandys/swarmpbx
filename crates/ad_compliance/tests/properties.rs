@@ -44,3 +44,18 @@ proptest! {
         prop_assert_eq!(d, Decision::Allowed);
     }
 }
+
+proptest! {
+    // INVARIANT: above the cap, the dialer never starts the agent on the
+    // answer (customer first), so it cannot abandon more calls.
+    #[test]
+    fn customer_first_never_above_the_cap(answered in 0u64..100_000, abandoned in 0u64..100_000) {
+        use ad_compliance::abandon::{AbandonCounts, JurisdictionRule};
+        let counts = AbandonCounts { answered, abandoned };
+        for rule in [JurisdictionRule::UsTsr, JurisdictionRule::UkOfcom, JurisdictionRule::IndiaTrai] {
+            if counts.rate().is_some_and(|r| r > rule.cap()) {
+                prop_assert!(!rule.allows_customer_first(&counts));
+            }
+        }
+    }
+}

@@ -76,6 +76,22 @@ impl AbandonLedger {
     }
 }
 
+/// The answered and abandoned calls of one campaign in a rule's window, as the
+/// store counts them (`call_attempts`). The store treats every answer as a
+/// human answer: there is no answering-machine detection yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AbandonCounts {
+    pub answered: u64,
+    pub abandoned: u64,
+}
+
+impl AbandonCounts {
+    /// The regulator rate, or `None` with no answered call (rate undefined).
+    pub fn rate(&self) -> Option<f64> {
+        (self.answered > 0).then(|| self.abandoned as f64 / self.answered as f64)
+    }
+}
+
 /// Per-jurisdiction abandonment rule. Registry: add a variant + arms below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JurisdictionRule {
@@ -89,6 +105,50 @@ pub enum JurisdictionRule {
 }
 
 impl JurisdictionRule {
+    /// The rule of every campaign until a campaign names its jurisdiction
+    /// (GAPS.md COMP-10).
+    pub const CAMPAIGN: JurisdictionRule = JurisdictionRule::UsTsr;
+
+    /// The stored and reported name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            JurisdictionRule::UsTsr => "us_tsr",
+            JurisdictionRule::UkOfcom => "uk_ofcom",
+            JurisdictionRule::IndiaTrai => "india_trai",
+        }
+    }
+
+    /// The longest time from the answer to an agent on the call. A later
+    /// connection abandons the call. US TSR (16 CFR 310.4(b)(4)(i)) and
+    /// Ofcom: two seconds after the called person's greeting. India TRAI is
+    /// not verified (experimental) and uses the same two seconds. We measure
+    /// from the answer, which is earlier, so the limit is never longer than
+    /// the rule's.
+    pub fn connect_within(&self) -> Duration {
+        match self {
+            JurisdictionRule::UsTsr | JurisdictionRule::UkOfcom | JurisdictionRule::IndiaTrai => {
+                Duration::seconds(2)
+            }
+        }
+    }
+
+    /// `connect_within` in milliseconds, or `None` when it does not fit.
+    pub fn connect_within_ms(&self) -> Option<u32> {
+        u32::try_from(self.connect_within().num_milliseconds()).ok()
+    }
+
+    /// Whether the next calls may risk abandonment (the dialer starts the
+    /// agent on the answer): the rate in the window is at or under the cap.
+    /// An undefined rate (no answered call yet) allows it, as `is_compliant`
+    /// does. Above the cap, the dialer starts the agent before the dial,
+    /// which cannot abandon a call.
+    pub fn allows_customer_first(&self, counts: &AbandonCounts) -> bool {
+        match counts.rate() {
+            None => true,
+            Some(r) => r <= self.cap(),
+        }
+    }
+
     /// Maximum permitted abandonment rate (fraction).
     pub fn cap(&self) -> f64 {
         match self {

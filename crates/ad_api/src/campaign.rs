@@ -6,6 +6,11 @@
 //!   GET    /v1/campaigns/:id             get one (404 if missing)
 //!   POST   /v1/campaigns/:id/transition  apply a lifecycle transition
 //!                                         (404 if missing, 409 if illegal)
+//!   GET    /v1/campaigns/:id/abandonment the abandonment ledger: answered
+//!                                         and abandoned calls in the rule's
+//!                                         window, and whether customer first
+//!                                         is allowed (404 if missing, 503
+//!                                         without Postgres)
 
 use axum::{
     extract::{Path, Query, State},
@@ -18,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use ad_agent::AgentSpec;
 use ad_campaign::repo::{NewCampaign, RepoError};
 use ad_campaign::{Campaign, CampaignState, Counters, Transition, DEFAULT_CONCURRENCY_CAP};
+use ad_compliance::abandon::JurisdictionRule;
 use ad_core::{CampaignId, OrgId};
 
 use crate::AppState;
@@ -27,6 +33,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/campaigns", post(create).get(list))
         .route("/v1/campaigns/:id", get(get_one))
         .route("/v1/campaigns/:id/transition", post(transition))
+        .route("/v1/campaigns/:id/abandonment", get(abandonment))
 }
 
 // ---- DTOs ----
@@ -72,6 +79,26 @@ impl From<Campaign> for CampaignDto {
             updated_at: c.updated_at.to_rfc3339(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AbandonmentDto {
+    pub campaign_id: i64,
+    /// The jurisdiction rule (`us_tsr` for every campaign now).
+    pub rule: &'static str,
+    pub window_days: i64,
+    pub answered: u64,
+    pub abandoned: u64,
+    /// `null` when no call was answered in the window.
+    pub rate: Option<f64>,
+    pub cap: f64,
+    /// Customer first: the longest time from the answer to the agent.
+    pub connect_within_ms: i64,
+    /// The campaign agent's dial order, or `null` without an agent.
+    pub dial_order: Option<&'static str>,
+    /// Whether the rate lets the next calls dial the customer first. When it
+    /// is false, a `customer_first` campaign dials agent first.
+    pub customer_first_allowed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +191,45 @@ async fn transition(
         .map_err(repo_err)?
         .map_err(|e| err(StatusCode::CONFLICT, e.to_string()))?;
     Ok(Json(saved.into()))
+}
+
+async fn abandonment(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<AbandonmentDto>, (StatusCode, Json<ErrorDto>)> {
+    let Some(attempts) = &state.attempts else {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the abandonment ledger needs Postgres (DATABASE_URL)",
+        ));
+    };
+    let campaign = state
+        .campaigns
+        .get(CampaignId(id))
+        .await
+        .map_err(repo_err)?;
+    let rule = JurisdictionRule::CAMPAIGN;
+    let counts = attempts
+        .abandon_counts(campaign.id, state.clock.now_utc() - rule.window())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let dial_order = campaign
+        .agent
+        .as_ref()
+        .and_then(|a| AgentSpec::parse(a).ok())
+        .map(|s| s.dial_order().name());
+    Ok(Json(AbandonmentDto {
+        campaign_id: id,
+        rule: rule.name(),
+        window_days: rule.window().num_days(),
+        answered: counts.answered,
+        abandoned: counts.abandoned,
+        rate: counts.rate(),
+        cap: rule.cap(),
+        connect_within_ms: rule.connect_within().num_milliseconds(),
+        dial_order,
+        customer_first_allowed: rule.allows_customer_first(&counts),
+    }))
 }
 
 /// Map a repository error to an HTTP response.

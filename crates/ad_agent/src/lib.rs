@@ -1,8 +1,10 @@
 //! Agent runtime adapters (PLAN.md §0.10.7a, decision D-2).
 //!
 //! The dialer places the call; the agent never dials. For each attempt the
-//! dialer starts one agent in the attempt's LiveKit room, waits until it is in
-//! the room, and only then dials. Two runtimes:
+//! dialer starts one agent in the attempt's LiveKit room. The campaign's
+//! `dial_order` decides when: `customer_first` (the default) starts it when
+//! the customer answers; `agent_first` starts it, waits until it is in the
+//! room, and only then dials. Two runtimes:
 //!
 //! - `livekit`: a LiveKit Agents worker registered with an `agent_name`. The
 //!   dialer creates an explicit dispatch with the call facts as job metadata.
@@ -30,7 +32,7 @@ use livekit_protocol::CreateAgentDispatchRequest;
 use serde_json::json;
 
 mod spec;
-pub use spec::{AgentSpec, SpecError, DEFAULT_JOIN_TIMEOUT_S};
+pub use spec::{AgentSpec, DialOrder, SpecError, DEFAULT_JOIN_TIMEOUT_S};
 
 /// What the agent learns about the call.
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +199,28 @@ mod tests {
         .unwrap();
         assert_eq!(p.runtime(), "pipecat");
         assert_eq!(p.join_timeout_s(), 5);
+        assert_eq!(s.dial_order(), DialOrder::CustomerFirst);
+        let a = AgentSpec::parse(&json!({
+            "runtime": "pipecat", "start_url": "http://bots:7860/start", "dial_order": "agent_first"
+        }))
+        .unwrap();
+        assert_eq!(a.dial_order(), DialOrder::AgentFirst);
+    }
+
+    #[test]
+    fn the_pool_does_not_depend_on_the_dial_order() {
+        let lk = AgentSpec::parse(&livekit_spec()).unwrap();
+        let lk_af = AgentSpec::parse(&json!({
+            "runtime": "livekit", "agent_name": "dialer-agent", "dial_order": "agent_first"
+        }))
+        .unwrap();
+        assert_eq!(lk.pool(), "livekit:dialer-agent");
+        assert_eq!(lk_af.pool(), lk.pool());
+        let pc = AgentSpec::parse(&json!({
+            "runtime": "pipecat", "start_url": "http://bots:7860/start?bot=slow"
+        }))
+        .unwrap();
+        assert_eq!(pc.pool(), "pipecat:http://bots:7860/start?bot=slow");
     }
 
     #[test]
@@ -207,6 +231,7 @@ mod tests {
             json!({"runtime": "pipecat", "start_url": "http://x", "join_timeout_s": 0}),
             json!({"runtime": "vapi", "url": "x"}),
             json!({"runtime": "livekit", "agent_name": "a", "typo": 1}),
+            json!({"runtime": "livekit", "agent_name": "a", "dial_order": "agent_last"}),
             json!({"agent_name": "a"}),
         ] {
             assert!(AgentSpec::parse(&bad).is_err(), "{bad}");

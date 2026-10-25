@@ -10,6 +10,7 @@
 //!   attempt's `settled_at`.
 
 use ad_attempt::{Attempt, AttemptEvent, Ignored, Outcome};
+use ad_compliance::abandon::AbandonCounts;
 use ad_core::{AttemptId, CampaignId, LeadId};
 use ad_events::CampaignEvent;
 use ad_lead::{Lead, LeadStatus};
@@ -18,6 +19,7 @@ use sqlx::{PgPool, Row};
 
 use crate::events::publish_in;
 use crate::leads::{row_to_lead, COLS as LEAD_COLS};
+use crate::pacing::{lock_limit, PaceClaim};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttemptError {
@@ -40,6 +42,18 @@ pub struct ClaimedAttempt {
     pub participant_identity: String,
     /// The agent of the campaign (`campaigns.agent`), or `None`.
     pub agent: Option<serde_json::Value>,
+}
+
+/// What a claim asks for.
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimRequest<'a> {
+    pub worker: &'a str,
+    pub limit: i64,
+    pub room_prefix: &'a str,
+    pub now: DateTime<Utc>,
+    pub agent_on_answer: Option<u32>,
+    /// The pacing window of the campaign's agent pool (GAPS.md DIAL-9).
+    pub pace: Option<&'a PaceClaim>,
 }
 
 /// A live attempt, for the reconcile.
@@ -145,6 +159,11 @@ impl PgAttemptRepo {
     /// capacity. Each claimed lead becomes `in_call` with a new `pending`
     /// attempt. The campaign row lock makes the capacity check and the insert
     /// one step; `SKIP LOCKED` keeps concurrent claims disjoint.
+    ///
+    /// With an agent, `agent_on_answer: Some(ms)` dials the customer first:
+    /// the agent starts on the answer and must join within `ms`. `None`
+    /// starts the agent before the dial. The retry of an abandoned call
+    /// always starts the agent before the dial.
     pub async fn claim(
         &self,
         campaign_id: CampaignId,
@@ -152,7 +171,38 @@ impl PgAttemptRepo {
         limit: i64,
         room_prefix: &str,
         now: DateTime<Utc>,
+        agent_on_answer: Option<u32>,
     ) -> Result<Vec<ClaimedAttempt>, AttemptError> {
+        self.claim_paced(
+            campaign_id,
+            &ClaimRequest {
+                worker,
+                limit,
+                room_prefix,
+                now,
+                agent_on_answer,
+                pace: None,
+            },
+        )
+        .await
+    }
+
+    /// `claim`, also within the pacing window of the agent pool
+    /// (`req.pace`): the claim locks the pool row, so the window count and
+    /// the insert are one step for every campaign of the pool.
+    pub async fn claim_paced(
+        &self,
+        campaign_id: CampaignId,
+        req: &ClaimRequest<'_>,
+    ) -> Result<Vec<ClaimedAttempt>, AttemptError> {
+        let ClaimRequest {
+            worker,
+            limit,
+            room_prefix,
+            now,
+            agent_on_answer,
+            ..
+        } = *req;
         let mut tx = self.pool.begin().await.map_err(err)?;
         let Some(row) = sqlx::query(
             "SELECT state, concurrency_cap, agent FROM campaigns WHERE id = $1 FOR UPDATE",
@@ -177,13 +227,22 @@ impl PgAttemptRepo {
         .fetch_one(&mut *tx)
         .await
         .map_err(err)?;
-        let take = limit.min(i64::from(cap) - live);
+        let mut take = limit.min(i64::from(cap) - live);
         if take <= 0 {
             return Ok(Vec::new());
         }
+        let mut paced = None;
+        if let (Some(p), Some(_)) = (req.pace, &agent) {
+            let (pool_limit, window) = lock_limit(&mut tx, p).await.map_err(err)?;
+            take = take.min(i64::from(pool_limit) - window);
+            if take <= 0 {
+                return Ok(Vec::new());
+            }
+            paced = Some((p.pool.as_str(), window, pool_limit as i32));
+        }
 
         let sql = format!(
-            "SELECT {LEAD_COLS} FROM leads \
+            "SELECT {LEAD_COLS}, retry_reason FROM leads \
              WHERE campaign_id = $1 AND status IN ('new', 'queued') \
                AND (next_eligible_at IS NULL OR next_eligible_at <= $2) \
              ORDER BY called_count, id LIMIT $3 FOR UPDATE SKIP LOCKED"
@@ -196,15 +255,18 @@ impl PgAttemptRepo {
             .await
             .map_err(err)?;
 
-        let first = if agent.is_some() {
-            Attempt::with_agent()
-        } else {
-            Attempt::default()
-        };
-        let snapshot = serde_json::to_value(&first).map_err(err)?;
         let mut claimed = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for (i, row) in rows.iter().enumerate() {
             let lead = row_to_lead(row).map_err(err)?;
+            let prior: Option<String> = row.try_get("retry_reason").map_err(err)?;
+            let first = match (&agent, agent_on_answer) {
+                (None, _) => Attempt::default(),
+                (Some(_), Some(ms)) if prior.as_deref() != Some("abandoned") => {
+                    Attempt::with_agent_on_answer(ms)
+                }
+                (Some(_), _) => Attempt::with_agent(),
+            };
+            let snapshot = serde_json::to_value(&first).map_err(err)?;
             sqlx::query(
                 "UPDATE leads SET status = 'in_call', next_eligible_at = NULL, \
                  retry_reason = NULL, updated_at = now() WHERE id = $1",
@@ -216,8 +278,10 @@ impl PgAttemptRepo {
             let row = sqlx::query(
                 "WITH n AS (SELECT nextval(pg_get_serial_sequence('call_attempts', 'id')) AS id) \
                  INSERT INTO call_attempts (id, campaign_id, lead_id, phone_number, room, \
-                     participant_identity, worker, state, snapshot, agent_state) \
-                 SELECT n.id, $1, $2, $3, $4 || '-' || n.id, 'sip-attempt-' || n.id, $5, 'pending', $6, $7 \
+                     participant_identity, worker, state, snapshot, agent_state, \
+                     pool, pool_window, pool_limit) \
+                 SELECT n.id, $1, $2, $3, $4 || '-' || n.id, 'sip-attempt-' || n.id, $5, 'pending', $6, $7, \
+                     $8, $9, $10 \
                  FROM n RETURNING id, room, participant_identity",
             )
             .bind(campaign_id.0)
@@ -227,6 +291,9 @@ impl PgAttemptRepo {
             .bind(worker)
             .bind(&snapshot)
             .bind(first.agent.name())
+            .bind(paced.map(|(pool, _, _)| pool))
+            .bind(paced.map(|(_, window, _)| (window + i as i64 + 1) as i32))
+            .bind(paced.map(|(_, _, limit)| limit))
             .fetch_one(&mut *tx)
             .await
             .map_err(err)?;
@@ -319,7 +386,7 @@ impl PgAttemptRepo {
                  sip_code = $6, detail = $7, failure = $8, dialed_at = $9, answered_at = $10, \
                  ended_at = $11, checked_at = CASE WHEN $12 THEN $13 ELSE checked_at END, \
                  agent_state = $14, agent_identity = COALESCE($15, agent_identity), \
-                 updated_at = now() \
+                 agent_started_at = $16, agent_ready_at = $17, updated_at = now() \
              WHERE id = $1",
         )
         .bind(attempt_id.0)
@@ -337,20 +404,28 @@ impl PgAttemptRepo {
         .bind(event.at())
         .bind(next.agent.name())
         .bind(agent_identity)
+        .bind(next.agent_started_at)
+        .bind(next.agent_ready_at)
         .execute(&mut *tx)
         .await
         .map_err(err)?;
 
-        if !next.leg.is_live() {
-            publish_in(
-                &mut tx,
-                &[CampaignEvent::AttemptEnded {
-                    campaign_id,
-                    attempt_id: attempt_id.0,
-                }],
-            )
-            .await
-            .map_err(err)?;
+        // Both events free a place in the pacing window of the agent pool.
+        let freed = if !next.leg.is_live() {
+            Some(CampaignEvent::AttemptEnded {
+                campaign_id,
+                attempt_id: attempt_id.0,
+            })
+        } else if agent_identity.is_some() {
+            Some(CampaignEvent::AgentJoined {
+                campaign_id,
+                attempt_id: attempt_id.0,
+            })
+        } else {
+            None
+        };
+        if let Some(event) = freed {
+            publish_in(&mut tx, &[event]).await.map_err(err)?;
         }
         tx.commit().await.map_err(err)?;
         Ok(Applied::Changed(next))
@@ -587,6 +662,33 @@ impl PgAttemptRepo {
         .fetch_one(&self.pool)
         .await
         .map_err(err)
+    }
+
+    /// The abandonment ledger of a campaign: the answered calls that ended
+    /// since `since`, and how many of them were abandoned.
+    pub async fn abandon_counts(
+        &self,
+        campaign_id: CampaignId,
+        since: DateTime<Utc>,
+    ) -> Result<AbandonCounts, AttemptError> {
+        let row = sqlx::query(
+            "SELECT count(*) AS answered, \
+                    count(*) FILTER (WHERE outcome = 'abandoned') AS abandoned \
+             FROM call_attempts \
+             WHERE campaign_id = $1 AND ended_at >= $2 AND answered_at IS NOT NULL",
+        )
+        .bind(campaign_id.0)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(err)?;
+        let count = |name: &str| -> Result<u64, AttemptError> {
+            Ok(row.try_get::<i64, _>(name).map_err(err)?.max(0) as u64)
+        };
+        Ok(AbandonCounts {
+            answered: count("answered")?,
+            abandoned: count("abandoned")?,
+        })
     }
 
     /// The saved snapshot of an attempt.

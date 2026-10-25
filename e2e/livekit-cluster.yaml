@@ -12,3 +12,8 @@ keys:
   devkey: devsecret_devsecret_devsecret_32b
 logging:
   level: info
+# The node creates each call room through the API. A late agent (for example
+# one that joins after a customer-first call was abandoned) must not create
+# the deleted room again and wait in it.
+room:
+  auto_create: false

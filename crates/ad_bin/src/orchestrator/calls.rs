@@ -1,26 +1,29 @@
 //! Every node: run the calls that the leader assigns to this node.
 //!
-//! A call runs as one task: start the agent, wait until it is in the room,
-//! dial, carry the call until it ends, and save each result. Every write
-//! carries the node and the assignment
-//! generation (`apply_owned`), so a node that lost the call changes nothing.
+//! A call runs as one task, in the campaign's dial order. Agent first: start
+//! the agent, wait until it is in the room, and dial. Customer first: dial,
+//! and on the answer start the agent, which must be in the room within the
+//! abandonment limit. Then carry the call until it ends, and save each
+//! result. Every write carries the node and the assignment generation
+//! (`apply_owned`), so a node that lost the call changes nothing.
 //! The reconcile checks the live calls of this node that no task runs: a call
 //! that a stopped node left, a lost dial result, or a lost end event.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ad_agent::{AgentSpec, CallFacts};
-use ad_attempt::{AgentLeg, Attempt, AttemptEvent, Leg};
+use ad_attempt::{AgentLeg, Attempt, AttemptEvent, Leg, NotDialedReason};
 use ad_cluster::{decode, keys, Assignment, Snapshot};
 use ad_core::time::Clock;
 use ad_core::AttemptId;
 use ad_db::{Applied, AttemptRow, LiveAttempt, Owner};
 use ad_dispatch::Placement;
-use ad_gateway::{CallEnd, Dialed, SipDial, DIAL_TIMEOUT};
+use ad_gateway::{CallEnd, Dialed, LiveCall, SipDial, DIAL_TIMEOUT};
 use chrono::{DateTime, Utc};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 use super::{Node, Running};
 
@@ -79,23 +82,54 @@ async fn run_call(node: Arc<Node>, id: AttemptId, gen: i32) {
     }
 }
 
-/// Take the call as far as this node can: agent, then dial.
+/// Take the call as far as this node can: agent first, then dial; or dial
+/// first, and the agent on the answer.
 async fn drive(node: &Node, id: AttemptId, owner: &Owner) -> anyhow::Result<()> {
     let row = node.attempts.get(id).await?;
     if row.node.as_deref() != Some(owner.node.as_str()) || row.assign_gen != owner.gen {
         return Ok(());
     }
+    let times = CallTimes::new(node.clock.as_ref());
     let mut attempt = row.attempt.clone();
-    if matches!(attempt.agent, AgentLeg::Wanted | AgentLeg::Starting { .. }) {
-        match prepare_agent(node, &row, owner, attempt).await? {
-            Some(next) => attempt = next,
-            None => return Ok(()),
+    if let Leg::Pending = attempt.leg {
+        match attempt.agent {
+            AgentLeg::Wanted | AgentLeg::Starting { .. } => {
+                match prepare_agent(node, &row, owner, attempt, &times).await? {
+                    Some(next) => attempt = next,
+                    None => return Ok(()),
+                }
+            }
+            AgentLeg::OnAnswer => {
+                if let Err(e) = node.gateway.create_room(&row.room).await {
+                    let event = AttemptEvent::NotDialed {
+                        at: times.now(),
+                        reason: NotDialedReason::NoAgent,
+                        detail: format!("room: {e}"),
+                    };
+                    step(node, id, owner, &event).await?;
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
     }
     if attempt.can_dial() {
-        dial(node, &row, owner).await?;
+        dial(node, &row, owner, &times).await?;
     }
     Ok(())
+}
+
+/// What the agent learns about the call.
+fn call_facts(row: &AttemptRow) -> CallFacts<'_> {
+    CallFacts {
+        attempt_id: row.attempt_id.0,
+        campaign_id: row.campaign_id.0,
+        lead_id: row.lead_id.0,
+        room: &row.room,
+        callee_identity: &row.participant_identity,
+        phone_number: &row.phone_number,
+        lead_context: &row.lead_context,
+    }
 }
 
 /// Apply an owned event. `None` when another node owns the call now.
@@ -122,9 +156,10 @@ async fn prepare_agent(
     row: &AttemptRow,
     owner: &Owner,
     mut attempt: Attempt,
+    times: &CallTimes,
 ) -> anyhow::Result<Option<Attempt>> {
     let id = row.attempt_id;
-    let now = || node.clock.now_utc();
+    let now = || times.now();
     let fail = |detail: String| AttemptEvent::AgentFailed { at: now(), detail };
 
     let spec = match row.agent.as_ref().map(AgentSpec::parse) {
@@ -136,17 +171,9 @@ async fn prepare_agent(
         if let Err(e) = node.gateway.create_room(&row.room).await {
             return step(node, id, owner, &fail(format!("room: {e}"))).await;
         }
-        let call = CallFacts {
-            attempt_id: id.0,
-            campaign_id: row.campaign_id.0,
-            lead_id: row.lead_id.0,
-            room: &row.room,
-            callee_identity: &row.participant_identity,
-            phone_number: &row.phone_number,
-            lead_context: &row.lead_context,
-        };
-        let event = match node.agents.start(&spec, &call).await {
-            Ok(detail) => AttemptEvent::AgentStarting { at: now(), detail },
+        let sent = now();
+        let event = match node.agents.start(&spec, &call_facts(row)).await {
+            Ok(detail) => AttemptEvent::AgentStarting { at: sent, detail },
             Err(e) => fail(e.to_string()),
         };
         match step(node, id, owner, &event).await? {
@@ -194,27 +221,46 @@ async fn prepare_agent(
 
 /// Place the call, carry it until it ends, and save each result. The
 /// capacity stays taken until the attempt ends.
-async fn dial(node: &Node, row: &AttemptRow, owner: &Owner) -> anyhow::Result<()> {
+async fn dial(
+    node: &Node,
+    row: &AttemptRow,
+    owner: &Owner,
+    times: &CallTimes,
+) -> anyhow::Result<()> {
     let id = row.attempt_id;
     // Save the dial start before the INVITE leaves, so a stopped node leaves a
     // `dialing` attempt for the reconcile, never a silent call.
-    let started = AttemptEvent::DialStarted {
-        at: node.clock.now_utc(),
-    };
-    match step(node, id, owner, &started).await? {
-        Some(a) if a.leg.name() == "dialing" => {}
+    let started = AttemptEvent::DialStarted { at: times.now() };
+    let customer_first = match step(node, id, owner, &started).await? {
+        Some(a) if a.leg.name() == "dialing" => matches!(a.agent, AgentLeg::OnAnswer),
         _ => return Ok(()),
-    }
+    };
+    // Customer first: the agent starts at the answer, while the call joins the
+    // room, because the abandonment limit counts from the answer.
+    let answer = Notify::new();
+    let start = async {
+        answer.notified().await;
+        start_agent(node, row, times).await
+    };
+    tokio::pin!(start);
+    let mut agent_started = None;
     let t = Instant::now();
-    let dialed = node
-        .caller
-        .dial(SipDial {
-            room: &row.room,
-            identity: &row.participant_identity,
-            phone_number: &row.phone_number,
-            call_id: format!("attempt-{}-{}@{}", id.0, owner.gen, owner.node),
-        })
-        .await;
+    let dial = node.caller.dial(SipDial {
+        room: &row.room,
+        identity: &row.participant_identity,
+        phone_number: &row.phone_number,
+        call_id: format!("attempt-{}-{}@{}", id.0, owner.gen, owner.node),
+        on_answer: customer_first.then_some(&answer),
+    });
+    tokio::pin!(dial);
+    let dialed = loop {
+        tokio::select! {
+            dialed = &mut dial => break dialed,
+            event = &mut start, if customer_first && agent_started.is_none() => {
+                agent_started = Some(event);
+            }
+        }
+    };
     let (placement, live) = match dialed {
         Dialed::Answered(live) => (Placement::Answered, Some(live)),
         Dialed::Failed(placement) => (placement, None),
@@ -236,19 +282,43 @@ async fn dial(node: &Node, row: &AttemptRow, owner: &Owner) -> anyhow::Result<()
         setup_ms = t.elapsed().as_millis() as u64,
         "call attempt"
     );
+    // The answer time is the 200 OK, not the end of the room join: the
+    // abandonment limit counts from it.
+    let event = match &live {
+        Some(live) => AttemptEvent::Answered {
+            at: times.at(live.answered()),
+        },
+        None => placement.into_event(times.now()),
+    };
     // A fenced step drops `live`, which hangs up: the call is not ours.
-    if step(node, id, owner, &placement.into_event(node.clock.now_utc()))
-        .await?
-        .is_none()
-    {
+    let Some(attempt) = step(node, id, owner, &event).await? else {
         return Ok(());
-    }
+    };
     let Some(live) = live else {
         return Ok(());
     };
-    let end = live.run().await;
-    let at = node.clock.now_utc();
+    let end = match attempt.agent {
+        AgentLeg::OnAnswer => {
+            let started = match agent_started {
+                Some(event) => Started::Done(event),
+                None => Started::Pending(start.as_mut()),
+            };
+            match agent_on_answer(node, row, owner, &attempt, live, started, times).await? {
+                Some(end) => end,
+                None => return Ok(()),
+            }
+        }
+        _ => live.run(None).await,
+    };
+    let at = times.now();
     let event = match &end {
+        CallEnd::NoAgent => AttemptEvent::AgentFailed {
+            at,
+            detail: format!(
+                "no agent in the room {} ms after the answer",
+                attempt.agent_within_ms.unwrap_or(0)
+            ),
+        },
         CallEnd::CalleeHangup => AttemptEvent::Hangup {
             at,
             detail: "the callee hung up".into(),
@@ -266,6 +336,88 @@ async fn dial(node: &Node, row: &AttemptRow, owner: &Owner) -> anyhow::Result<()
     tracing::info!(attempt = id.0, node = owner.node, end = ?end, "call ended");
     step(node, id, owner, &event).await?;
     Ok(())
+}
+
+/// The agent's start request, as `AgentStarting` or `AgentFailed`.
+async fn start_agent(node: &Node, row: &AttemptRow, times: &CallTimes) -> AttemptEvent {
+    let failed = |detail: String| AttemptEvent::AgentFailed {
+        at: times.now(),
+        detail,
+    };
+    let sent = times.now();
+    match row.agent.as_ref().map(AgentSpec::parse) {
+        Some(Ok(spec)) => match node.agents.start(&spec, &call_facts(row)).await {
+            Ok(detail) => AttemptEvent::AgentStarting { at: sent, detail },
+            Err(e) => failed(e.to_string()),
+        },
+        Some(Err(e)) => failed(e.to_string()),
+        None => failed("the campaign has no agent".into()),
+    }
+}
+
+/// The start request of a customer-first agent: done during the dial, or
+/// still in flight.
+enum Started<F> {
+    Done(AttemptEvent),
+    Pending(F),
+}
+
+/// Customer first: carry the call while the agent starts. The call hangs up
+/// when no agent is in the room by the attempt's deadline, also while the
+/// start request is in flight. `None` when the attempt ended or moved here;
+/// dropping the call hangs up.
+async fn agent_on_answer<F: Future<Output = AttemptEvent> + Unpin>(
+    node: &Node,
+    row: &AttemptRow,
+    owner: &Owner,
+    attempt: &Attempt,
+    live: LiveCall,
+    started: Started<F>,
+    times: &CallTimes,
+) -> anyhow::Result<Option<CallEnd>> {
+    let id = row.attempt_id;
+    let answered = live.answered();
+    let by = answered + Duration::from_millis(attempt.agent_within_ms.unwrap_or(0).into());
+    let joined = live.agent_joined();
+    let run = live.run(Some(by));
+    tokio::pin!(run);
+    let started = match started {
+        Started::Done(event) => event,
+        Started::Pending(start) => tokio::select! {
+            end = &mut run => return Ok(Some(end)),
+            event = start => event,
+        },
+    };
+    match step(node, id, owner, &started).await? {
+        Some(a) if a.leg.is_live() => {}
+        _ => return Ok(None),
+    }
+    let identity = tokio::select! {
+        end = &mut run => return Ok(Some(end)),
+        Some(identity) = agent_identity(joined) => identity,
+    };
+    tracing::info!(
+        attempt = id.0,
+        agent = identity,
+        after_answer_ms = answered.elapsed().as_millis() as u64,
+        "agent in the room after the answer"
+    );
+    let ready = AttemptEvent::AgentReady {
+        at: times.now(),
+        identity,
+    };
+    match step(node, id, owner, &ready).await? {
+        Some(a) if a.leg.is_live() => Ok(Some(run.await)),
+        _ => Ok(None),
+    }
+}
+
+async fn agent_identity(mut joined: watch::Receiver<Option<String>>) -> Option<String> {
+    joined
+        .wait_for(|j| j.is_some())
+        .await
+        .ok()
+        .and_then(|j| j.clone())
 }
 
 /// Check this node's live calls that no task runs.
@@ -346,6 +498,35 @@ fn age(since: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
     (now - since).to_std().unwrap_or_default()
 }
 
+/// The times of one call: one read of the node clock, then only the
+/// monotonic clock. A re-sync of the node clock during the call cannot change
+/// a duration of the call: the ring, the join time (a pacing sample and the
+/// abandonment test), or the talk time.
+#[derive(Debug, Clone, Copy)]
+struct CallTimes {
+    start: DateTime<Utc>,
+    mono: Instant,
+}
+
+impl CallTimes {
+    fn new(clock: &dyn Clock) -> Self {
+        Self {
+            start: clock.now_utc(),
+            mono: Instant::now(),
+        }
+    }
+
+    fn at(&self, mono: Instant) -> DateTime<Utc> {
+        self.start
+            + chrono::Duration::from_std(mono.saturating_duration_since(self.mono))
+                .unwrap_or_default()
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.at(Instant::now())
+    }
+}
+
 /// Whether a live call without a task is ready for a check.
 fn due_for_check(node: &Node, live: &LiveAttempt, now: DateTime<Utc>) -> bool {
     match &live.attempt.leg {
@@ -356,5 +537,45 @@ fn due_for_check(node: &Node, live: &LiveAttempt, now: DateTime<Utc>) -> bool {
             age(live.checked_at.unwrap_or(*since), now) >= node.settings.attempt_check
         }
         Leg::Ended { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A node clock that steps back one hour after its first read.
+    struct Stepping {
+        start: DateTime<Utc>,
+        reads: AtomicU32,
+    }
+
+    impl Clock for Stepping {
+        fn now_utc(&self) -> DateTime<Utc> {
+            match self.reads.fetch_add(1, Ordering::SeqCst) {
+                0 => self.start,
+                _ => self.start - chrono::Duration::hours(1),
+            }
+        }
+    }
+
+    #[test]
+    fn a_step_of_the_node_clock_does_not_change_the_times_of_a_call() {
+        let start: DateTime<Utc> = "2030-01-01T00:00:00Z".parse().unwrap();
+        let clock = Stepping {
+            start,
+            reads: AtomicU32::new(0),
+        };
+        let times = CallTimes::new(&clock);
+        assert_eq!(clock.now_utc(), start - chrono::Duration::hours(1));
+        let answered = times.mono + Duration::from_millis(1250);
+        assert_eq!(
+            times.at(answered),
+            start + chrono::Duration::milliseconds(1250)
+        );
+        let earlier = times.mono.checked_sub(Duration::from_millis(5)).unwrap();
+        assert_eq!(times.at(earlier), start, "never before the first read");
+        assert!(times.now() >= start);
     }
 }

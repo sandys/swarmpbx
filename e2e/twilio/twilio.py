@@ -9,6 +9,10 @@ Commands:
   inspect   the account's numbers, verified caller IDs, and trunks (read only)
   setup     create or reuse the e2e trunk, its credential list and credential,
             and write .env.twilio (git-ignored) for the dialer
+  setup-c2c click-to-call: find the account and the caller ID, and write
+            .env.twilio-c2c (git-ignored) for the dialer. It creates
+            nothing at Twilio: the Calls API needs no trunk. It stops on a
+            Trial account, which blocks <Dial><Sip>.
   calls     Twilio's record of the e2e calls to a number since a time
   teardown  delete the e2e trunk and credential list, and .env.twilio
 
@@ -31,6 +35,14 @@ TRUNKING = "https://trunking.twilio.com/v1"
 NAME = "agentdialer-e2e"
 SIP_USER = "agentdialer"
 OUT = os.environ.get("TWILIO_E2E_OUT", "/repo/.env.twilio")
+C2C_OUT = os.environ.get("TWILIO_C2C_OUT", "/repo/.env.twilio-c2c")
+NO_CALLER = (
+    "Twilio calls a phone only from a number of the account or a verified "
+    "caller ID, and the account has neither. Get a number (Twilio Console, "
+    "Phone Numbers, Buy a number; a Trial account can get one trial number), "
+    "or verify a caller ID (Phone Numbers, Verified Caller IDs), or set "
+    "TWILIO_CALLER_ID in .env."
+)
 
 
 class TwilioError(Exception):
@@ -126,6 +138,12 @@ TRIAL = (
     "It can call only verified numbers, and the caller ID must be the "
     "account's number or a verified caller ID."
 )
+TRIAL_C2C = (
+    "Click-to-call needs an upgraded account (Twilio Console, Billing > "
+    "Upgrade). On a Trial account, Twilio blocks <Dial><Sip>, and its Calls "
+    "API takes only To, a Twilio template URL, and StatusCallback (Twilio "
+    "docs, Try out Voice, Custom TwiML during trial)."
+)
 TRIAL_REFUSED = (
     "Twilio refused Elastic SIP Trunking for this Trial account. If you used "
     "an API key, try the account SID and the auth token (TWILIO_SID2 and "
@@ -197,6 +215,16 @@ def inspect():
     if kind == "Trial":
         print(f"note: {TRIAL}")
     try:
+        domains = pages(f"{API}/Accounts/{acct}/SIP/Domains.json", "domains")
+        print(f"SIP domains: {len(domains)}")
+        for d in domains:
+            print(
+                f"  {d.get('friendly_name')!r} {d.get('domain_name')} "
+                f"registration={d.get('sip_registration')} voice_url={'set' if d.get('voice_url') else '-'}"
+            )
+    except TwilioError as e:
+        print(f"SIP domains: refused: {e}")
+    try:
         trunks = trunks_or_explain(kind)
     except TwilioError as e:
         print(f"trunks: refused: {e}")
@@ -222,16 +250,43 @@ def read_out():
     return values
 
 
-def write_out(values):
-    lines = [
-        "# Written by e2e/twilio/run.sh setup. Git-ignored. Holds the e2e trunk's",
-        "# SIP digest password: do not commit or share it.",
-    ] + [f"{k}={v}" for k, v in values.items()]
-    tmp = OUT + ".tmp"
+def write_out(values, path=OUT, header=(
+    "# Written by e2e/twilio/run.sh setup. Git-ignored. Holds the e2e trunk's",
+    "# SIP digest password: do not commit or share it.",
+)):
+    lines = list(header) + [f"{k}={v}" for k, v in values.items()]
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(tmp, 0o600)
-    os.replace(tmp, OUT)
+    os.replace(tmp, path)
+
+
+def setup_c2c():
+    acct, kind = whoami()
+    if kind == "Trial":
+        raise TwilioError(TRIAL_C2C)
+    nums = numbers(acct) or verified(acct)
+    caller = os.environ.get("TWILIO_CALLER_ID", "").strip() or (nums[0] if nums else "")
+    if not caller:
+        raise TwilioError(NO_CALLER)
+    print(f"caller ID: {mask(caller)}")
+    sid, secret = credentials()
+    write_out(
+        {
+            "TWILIO_ACCOUNT_TYPE": kind,
+            "AD_TWILIO_ACCOUNT_SID": acct,
+            "AD_TWILIO_API_KEY": sid,
+            "AD_TWILIO_API_SECRET": secret,
+            "AD_SIP_CALLER_ID": caller,
+        },
+        C2C_OUT,
+        (
+            "# Written by e2e/twilio/run.sh setup-c2c. Git-ignored. Holds the Twilio",
+            "# API secret: do not commit or share it.",
+        ),
+    )
+    print(f"wrote {os.path.basename(C2C_OUT)} (git-ignored)")
 
 
 def new_password():
@@ -372,6 +427,8 @@ def main(argv):
             inspect()
         elif cmd == "setup":
             setup()
+        elif cmd == "setup-c2c":
+            setup_c2c()
         elif cmd == "calls":
             calls(argv[2], argv[3])
         elif cmd == "teardown":

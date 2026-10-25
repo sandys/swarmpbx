@@ -23,6 +23,8 @@
 // GET /calls on SIM_HTTP_ADDR returns what the carrier saw, per call:
 // the INVITEs, the auth result, the status, the RTP counts, and how many
 // received packets carried a tone (loud). POST /reset clears it.
+//
+// twilio_api.go adds the Twilio Calls API, for click-to-call.
 package main
 
 import (
@@ -86,7 +88,13 @@ type sim struct {
 	numbers   map[string]string
 	fallback  string
 
+	// The Twilio Calls API (twilio_api.go).
+	twilioKey    string
+	twilioSecret string
+	dg           *diago.Diago
+
 	mu     sync.Mutex
+	api    map[string]*APICall
 	calls  map[string]*Call
 	nonces map[string]digest.Challenge
 }
@@ -100,14 +108,17 @@ func env(name, def string) string {
 
 func load() *sim {
 	s := &sim{
-		realm:     env("SIM_REALM", "sip.twilio.com"),
-		user:      os.Getenv("SIM_AUTH_USER"),
-		password:  os.Getenv("SIM_AUTH_PASSWORD"),
-		callerIDs: map[string]bool{},
-		numbers:   map[string]string{},
-		fallback:  env("SIM_DEFAULT", "echo"),
-		calls:     map[string]*Call{},
-		nonces:    map[string]digest.Challenge{},
+		realm:        env("SIM_REALM", "sip.twilio.com"),
+		user:         os.Getenv("SIM_AUTH_USER"),
+		password:     os.Getenv("SIM_AUTH_PASSWORD"),
+		callerIDs:    map[string]bool{},
+		numbers:      map[string]string{},
+		fallback:     env("SIM_DEFAULT", "echo"),
+		calls:        map[string]*Call{},
+		nonces:       map[string]digest.Challenge{},
+		api:          map[string]*APICall{},
+		twilioKey:    os.Getenv("SIM_TWILIO_KEY"),
+		twilioSecret: os.Getenv("SIM_TWILIO_SECRET"),
 	}
 	for _, c := range strings.Split(os.Getenv("SIM_CALLER_IDS"), ",") {
 		if c = strings.TrimSpace(c); c != "" {
@@ -390,6 +401,8 @@ func peak(lpcm, payload []byte, pt uint8) int {
 func (s *sim) serveHTTP(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/2010-04-01/Accounts/", s.serveCalls)
+	mux.HandleFunc("/twilio/calls", s.listAPICalls)
 	mux.HandleFunc("/calls", func(w http.ResponseWriter, _ *http.Request) {
 		s.mu.Lock()
 		out := make([]Call, 0, len(s.calls))
@@ -408,6 +421,7 @@ func (s *sim) serveHTTP(addr string) {
 		}
 		s.mu.Lock()
 		s.calls = map[string]*Call{}
+		s.api = map[string]*APICall{}
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -431,7 +445,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("agentdialer-carrier-sim"))
-	dg := diago.NewDiago(ua, diago.WithTransport(diago.Transport{Transport: "udp", BindHost: host, BindPort: p}))
+	// TCP too: Twilio's <Dial><Sip> can use ;transport=tcp (through a tunnel).
+	dg := diago.NewDiago(ua,
+		diago.WithTransport(diago.Transport{Transport: "udp", BindHost: host, BindPort: p}),
+		diago.WithTransport(diago.Transport{Transport: "tcp", BindHost: host, BindPort: p}))
+	s.dg = dg
 	slog.Info("carrier-sim ready", "sip", env("SIM_SIP_ADDR", "0.0.0.0:5080"),
 		"auth", s.user != "", "caller_ids", len(s.callerIDs), "symmetric_rtp", s.nat == media.RTPNATSymetric,
 		"numbers", len(s.numbers), "default", s.fallback)

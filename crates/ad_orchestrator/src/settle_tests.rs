@@ -46,6 +46,23 @@ fn busy_and_no_answer_retry_after_their_own_interval() {
 }
 
 #[test]
+fn an_abandoned_call_counts_and_retries() {
+    let p = RetryPolicy::default();
+    let s = settle(
+        &Outcome::Abandoned {
+            detail: "no agent".into(),
+        },
+        0,
+        &p,
+        now(),
+    );
+    assert_eq!(s.status, LeadStatus::Queued);
+    assert!(s.counts_as_call);
+    assert_eq!(s.retry, Some((now() + p.abandoned, RetryReason::Abandoned)));
+    assert_eq!(s.wait_reason, Some("abandoned"));
+}
+
+#[test]
 fn the_retry_cap_dispositions_the_lead() {
     let p = RetryPolicy::default();
     let last = settle(

@@ -19,6 +19,7 @@ ad_db = { path = "../ad_db" }
 ad_attempt = { path = "../ad_attempt" }
 ad_gateway = { path = "../ad_gateway" }
 ad_agent = { path = "../ad_agent" }
+ad_pacing = { path = "../ad_pacing" }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -648,3 +648,144 @@ async fn a_campaign_with_an_agent_gets_rooms_per_attempt_and_waits_for_the_agent
     let found = db.attempts().live_in_room(&a.room).await.unwrap();
     assert_eq!(found[0].agent_identity.as_deref(), Some("agent-AJ_1"));
 }
+
+async fn with_agent(db: &Db, c: CampaignId) {
+    sqlx::query("UPDATE campaigns SET agent = $2 WHERE id = $1")
+        .bind(c.0)
+        .bind(serde_json::json!({"runtime": "livekit", "agent_name": "sales"}))
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
+async fn claim_on_answer(db: &Db, c: CampaignId) -> ad_db::ClaimedAttempt {
+    db.attempts()
+        .claim(c, "test-worker", 1, "room", Utc::now(), Some(2000))
+        .await
+        .unwrap()
+        .remove(0)
+}
+
+#[tokio::test]
+async fn customer_first_dials_first_and_the_retry_of_an_abandoned_call_waits_for_the_agent() {
+    let Some(db) = common::db().await else {
+        return;
+    };
+    let c = running_campaign(&db, 10).await;
+    with_agent(&db, c).await;
+    leads(&db, c, 1).await;
+    let a = claim_on_answer(&db, c).await;
+    let s = db.attempts().snapshot(a.attempt_id).await.unwrap();
+    assert_eq!(s.agent.name(), "on_answer");
+    assert_eq!(s.agent_within_ms, Some(2000));
+    assert!(s.can_dial(), "customer first dials before the agent starts");
+    let state: String = sqlx::query_scalar("SELECT agent_state FROM call_attempts WHERE id = $1")
+        .bind(a.attempt_id.0)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "on_answer");
+
+    apply_all(
+        &db,
+        a.attempt_id,
+        &[
+            AttemptEvent::DialStarted { at: t0() },
+            AttemptEvent::Answered { at: t0() },
+            AttemptEvent::AgentStarting {
+                at: t0(),
+                detail: "dispatch".into(),
+            },
+            AttemptEvent::AgentFailed {
+                at: t0() + Duration::seconds(2),
+                detail: "no agent in the room 2000 ms after the answer".into(),
+            },
+        ],
+    )
+    .await;
+    let rule = |input: &SettleInput<'_>| {
+        assert_eq!(input.outcome.class(), "abandoned");
+        (
+            LeadUpdate {
+                status: LeadStatus::Queued,
+                counts_as_call: true,
+                next_eligible_at: None,
+                wait_reason: Some("abandoned"),
+            },
+            Vec::new(),
+        )
+    };
+    db.attempts().settle(a.attempt_id, rule).await.unwrap();
+
+    let retry = claim_on_answer(&db, c).await;
+    assert_eq!(retry.lead.id, a.lead.id);
+    let s = db.attempts().snapshot(retry.attempt_id).await.unwrap();
+    assert_eq!(s.agent.name(), "wanted", "the retry starts the agent first");
+}
+
+#[tokio::test]
+async fn the_ledger_counts_the_answered_calls_in_the_window() {
+    let Some(db) = common::db().await else {
+        return;
+    };
+    let c = running_campaign(&db, 10).await;
+    with_agent(&db, c).await;
+    leads(&db, c, 3).await;
+    let claimed = db
+        .attempts()
+        .claim(c, "test-worker", 3, "room", Utc::now(), Some(2000))
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let answered = [
+        AttemptEvent::DialStarted { at: now },
+        AttemptEvent::Answered { at: now },
+    ];
+    let ends = [
+        AttemptEvent::Hangup {
+            at: now,
+            detail: "the callee hung up".into(),
+        },
+        AttemptEvent::AgentFailed {
+            at: now,
+            detail: "no agent".into(),
+        },
+    ];
+    for (a, end) in claimed.iter().zip(ends) {
+        apply_all(&db, a.attempt_id, &answered).await;
+        apply_all(&db, a.attempt_id, &[end]).await;
+    }
+    apply_all(
+        &db,
+        claimed[2].attempt_id,
+        &[
+            AttemptEvent::DialStarted { at: now },
+            AttemptEvent::Rejected {
+                at: now,
+                sip_code: Some(486),
+                detail: "busy".into(),
+            },
+        ],
+    )
+    .await;
+    let counts = db
+        .attempts()
+        .abandon_counts(c, now - Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        (counts.answered, counts.abandoned),
+        (2, 1),
+        "a busy call is no answer"
+    );
+    let later = db
+        .attempts()
+        .abandon_counts(c, now + Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        (later.answered, later.abandoned),
+        (0, 0),
+        "outside the window"
+    );
+}

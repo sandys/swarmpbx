@@ -4,6 +4,9 @@
 //!   (`ad_sip`) places it, our RTP leg (`ad_media`) carries its audio, and
 //!   our WebRTC participant (`LiveKitParticipant`) brings the audio into the
 //!   attempt's LiveKit room, where the agent is.
+//! - `telephony`: the providers that a dial goes through: a SIP trunk, or
+//!   Twilio click-to-call (`click_to_call`), where Twilio calls the phone and
+//!   then calls the node.
 //! - `Gateway`: the room operations of a call (create, list, close) and the
 //!   presence check of the reconcile, behind a `GatewayClient` trait so unit
 //!   tests use a fake.
@@ -21,9 +24,13 @@ pub use bridge::{
     RoomSession, RtpSink, RtpSource,
 };
 
+pub mod click_to_call;
 pub mod sip_call;
+pub mod telephony;
 mod webrtc_participant;
+pub use click_to_call::{ClickToCall, TwilioVoice};
 pub use sip_call::{CallEnd, Dialed, LiveCall, SipCaller, SipDial, SipTrunk};
+pub use telephony::Telephony;
 pub use webrtc_participant::{mint_token, LiveKitParticipant, LiveKitSession};
 
 /// How to reach LiveKit.

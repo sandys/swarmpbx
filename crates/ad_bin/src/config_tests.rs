@@ -129,6 +129,98 @@ fn the_caller_id_must_be_e164() {
     }
 }
 
+/// The required variables, with Twilio click-to-call in place of the trunk.
+fn click_to_call() -> Vec<(&'static str, &'static str)> {
+    let mut pairs = all_required();
+    pairs.retain(|(k, _)| *k != "AD_SIP_TRUNK");
+    pairs.extend([
+        ("AD_DIAL_PROVIDER", "twilio_click_to_call"),
+        ("AD_SIP_PROXY", "kamailio:5060"),
+        ("AD_SIP_CALLER_ID", "+15550001000"),
+        ("AD_TWILIO_ACCOUNT_SID", "AC0123"),
+        ("AD_TWILIO_API_KEY", "SK0123"),
+        ("AD_TWILIO_API_SECRET", "s3cret"),
+        (
+            "AD_TWILIO_SIP_URI",
+            "sip:agentdialer@edge.example:5060;transport=tcp",
+        ),
+    ]);
+    pairs
+}
+
+#[test]
+fn the_trunk_provider_is_the_default() {
+    let cfg = OrchestratorConfig::from_lookup(lookup_from(&all_required())).unwrap();
+    assert!(matches!(cfg.provider, DialProvider::SipTrunk));
+}
+
+#[test]
+fn click_to_call_needs_the_twilio_settings_and_no_trunk() {
+    let cfg = OrchestratorConfig::from_lookup(lookup_from(&click_to_call())).unwrap();
+    let DialProvider::TwilioClickToCall(twilio) = &cfg.provider else {
+        panic!("click-to-call: {:?}", cfg.provider);
+    };
+    assert_eq!(twilio.api_url, "https://api.twilio.com");
+    assert_eq!(twilio.account_sid, "AC0123");
+    assert_eq!(twilio.key_sid, "SK0123");
+    assert_eq!(twilio.key_secret, "s3cret");
+    assert_eq!(twilio.caller_id, "+15550001000");
+    assert!(twilio.sip_uri.ends_with(";transport=tcp"));
+    let shown = format!("{cfg:?}");
+    assert!(
+        !shown.contains("s3cret"),
+        "Debug shows the Twilio secret: {shown}"
+    );
+
+    let pairs: Vec<_> = click_to_call()
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with("AD_TWILIO_") && *k != "AD_SIP_CALLER_ID")
+        .collect();
+    let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
+    assert_eq!(
+        err.missing,
+        vec![
+            "AD_SIP_CALLER_ID",
+            "AD_TWILIO_ACCOUNT_SID",
+            "AD_TWILIO_API_KEY",
+            "AD_TWILIO_API_SECRET",
+            "AD_TWILIO_SIP_URI",
+        ]
+    );
+}
+
+#[test]
+fn click_to_call_settings_are_checked() {
+    let with = |k: &'static str, v: &'static str| {
+        let mut pairs = click_to_call();
+        pairs.retain(|(n, _)| *n != k);
+        if !v.is_empty() {
+            pairs.push((k, v));
+        }
+        OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err()
+    };
+    for (k, v) in [
+        ("AD_DIAL_PROVIDER", "carrier-pigeon"),
+        ("AD_TWILIO_ACCOUNT_SID", "SK0123"),
+        ("AD_TWILIO_SIP_URI", "agentdialer@edge.example"),
+        ("AD_TWILIO_API_URL", "api.twilio.com"),
+    ] {
+        let err = with(k, v);
+        assert!(
+            err.invalid.iter().any(|i| i.starts_with(&format!("{k}="))),
+            "{k}={v}: {:?}",
+            err.invalid
+        );
+    }
+    // Twilio's INVITE must reach the node: through the edge, or at its address.
+    let err = with("AD_SIP_PROXY", "");
+    assert!(
+        err.invalid[0].contains("AD_SIP_PROXY or AD_SIP_ADVERTISE_IP"),
+        "{:?}",
+        err.invalid
+    );
+}
+
 #[test]
 fn the_sip_settings_have_defaults_and_are_checked() {
     let cfg = OrchestratorConfig::from_lookup(lookup_from(&all_required())).unwrap();

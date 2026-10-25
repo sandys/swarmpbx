@@ -2,7 +2,7 @@
 //! fail without the logic and pass with it, and cover the gnarly cases
 //! (DST, half-hour offsets, midnight wrap, holidays, fail-closed).
 
-use ad_compliance::abandon::{AbandonLedger, JurisdictionRule};
+use ad_compliance::abandon::{AbandonCounts, AbandonLedger, JurisdictionRule};
 use ad_compliance::dnc::{DncScope, DncSet};
 use ad_compliance::safe_hours::{self, CallWindowSet, DayWindow, LeadLocation};
 use ad_compliance::{Decision, DenyReason};
@@ -225,4 +225,34 @@ fn jurisdiction_flags() {
     assert!(JurisdictionRule::UkOfcom.is_experimental());
     assert!(JurisdictionRule::IndiaTrai.is_experimental());
     assert_eq!(JurisdictionRule::IndiaTrai.cap(), 0.02);
+}
+
+#[test]
+fn customer_first_stops_above_the_cap() {
+    let rule = JurisdictionRule::UsTsr;
+    let counts = |answered, abandoned| AbandonCounts {
+        answered,
+        abandoned,
+    };
+    assert!(rule.allows_customer_first(&counts(0, 0)), "no answers yet");
+    assert!(rule.allows_customer_first(&counts(100, 3)), "3% is the cap");
+    assert!(!rule.allows_customer_first(&counts(100, 4)));
+    assert!(!rule.allows_customer_first(&counts(1, 1)));
+    assert_eq!(counts(200, 3).rate(), Some(0.015));
+}
+
+#[test]
+fn an_agent_must_join_within_two_seconds() {
+    for rule in [
+        JurisdictionRule::UsTsr,
+        JurisdictionRule::UkOfcom,
+        JurisdictionRule::IndiaTrai,
+    ] {
+        assert_eq!(
+            rule.connect_within(),
+            chrono::Duration::seconds(2),
+            "{rule:?}"
+        );
+    }
+    assert_eq!(JurisdictionRule::CAMPAIGN, JurisdictionRule::UsTsr);
 }

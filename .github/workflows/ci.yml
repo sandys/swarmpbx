@@ -69,6 +69,16 @@ jobs:
       - name: run the quickstart stack against the simulator
         run: ./e2e/run_twilio_e2e.sh --sim
 
+  twilio-c2c-sim-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Click-to-call (README.md, "Click-to-call through Twilio"): the
+      # simulator is Twilio's Calls API and the phones, and its INVITE comes
+      # to the node through Kamailio over TCP. The script always tears down.
+      - name: run click-to-call against the simulator
+        run: ./e2e/run_twilio_c2c_e2e.sh --sim
+
   twilio-e2e:
     runs-on: ubuntu-latest
     env:

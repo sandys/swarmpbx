@@ -59,7 +59,11 @@ embed Lua. Do not shell out.
 
 Actions are free strings. The engine itself runs only the inline `set`,
 `export`, and `unset`. The hopper honors `skip`, `hangup`, and `add_dnc`.
-Production passes no ruleset yet (`GAPS.md` ROUT-2).
+Production passes no ruleset yet (`GAPS.md` ROUT-2). The place to wire it
+is the leader's `gate()` in `crates/ad_bin/src/orchestrator/leader.rs`: it
+calls `ad_hopper::select` with `ruleset: None`. `POST
+/v1/campaigns/:id/hopper/preview` runs the hopper with a ruleset now, so use
+it to try a ruleset.
 
 ## What is not built (the target)
 

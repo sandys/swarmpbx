@@ -32,6 +32,7 @@ dependencies = [
  "ad_hopper",
  "ad_lead",
  "ad_orchestrator",
+ "ad_pacing",
  "ad_routing",
  "anyhow",
  "axum 0.7.9",
@@ -77,6 +78,7 @@ dependencies = [
  "ad_hopper",
  "ad_lead",
  "ad_orchestrator",
+ "ad_pacing",
  "ad_sip",
  "anyhow",
  "chrono",
@@ -148,9 +150,11 @@ dependencies = [
  "ad_attempt",
  "ad_campaign",
  "ad_circuit_breaker",
+ "ad_compliance",
  "ad_core",
  "ad_events",
  "ad_lead",
+ "ad_pacing",
  "anyhow",
  "chrono",
  "serde_json",
@@ -198,6 +202,8 @@ dependencies = [
  "livekit",
  "livekit-api",
  "livekit-protocol",
+ "rand 0.8.8",
+ "reqwest",
  "serde",
  "sha2 0.10.9",
  "tokio",
@@ -254,6 +260,17 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "tokio",
+]
+
+[[package]]
+name = "ad_pacing"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1980,6 +1997,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -3690,6 +3708,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

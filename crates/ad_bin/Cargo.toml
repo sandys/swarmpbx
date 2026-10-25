@@ -13,6 +13,7 @@ path = "src/main.rs"
 ad_core = { path = "../ad_core" }
 ad_api = { path = "../ad_api" }
 ad_db = { path = "../ad_db" }
+ad_pacing = { path = "../ad_pacing" }
 ad_campaign = { path = "../ad_campaign" }
 ad_lead = { path = "../ad_lead" }
 ad_compliance = { path = "../ad_compliance" }

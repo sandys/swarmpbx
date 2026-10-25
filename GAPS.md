@@ -4,6 +4,7 @@
 |---|---|
 | Status | Assessment. Not a plan of record. `PLAN.md` stays authoritative. |
 | Date | 2026-10-20 |
+| Last update | 2026-10-24: dial order, abandonment ledger, DIAL-9 built |
 | Code baseline | commit `b19ad3a` |
 | Method | Full read of `PLAN.md`, `README.md`, and every crate. Targeted read of the nine sources in `_research/` that `PLAN.md` cites, plus the FreeSWITCH dialplan evaluator (`_research/freeswitch/`). |
 | Legal note | This document is not legal advice. Verify every legal item with counsel before you claim compliance. |
@@ -37,10 +38,10 @@ These constraints remove large parts of the references and change other parts:
 | Reference concept | Status for AgentDialer | Reason |
 |---|---|---|
 | Agent screen, login, pause codes, hotkeys, manual dial | Not needed | No humans. |
-| Predictive pacing to keep humans busy (`AST_VDadapt.pl`) | Not needed as the primary mode | Agent capacity is elastic. We dial against reserved capacity. |
+| Adaptive pacing (`AST_VDadapt.pl`) | Keep the idea, change the signal | VICIdial tunes the dial level to the idle humans. Our agents start for each call, so the pace follows the measured time that an agent takes to join (DIAL-9). |
 | AMD in the switch | Moves to the agent | The agent hears the answer and classifies it. |
 | IVR, call menus, prerecorded broadcast | Moves to the agent | The agent speaks and listens. |
-| Abandonment control | Keep, and make it provable | The rules still apply. Elastic agents make it near zero by construction. |
+| Abandonment control | Keep, and make it provable | The rules still apply. Agent first makes abandonment zero by construction. Customer first (the default) abandons a call when the agent joins late; the 2 s limit, the join-paced controller (DIAL-9), and the 3% governor (COMP-10) keep it under the cap. |
 | Compliance data model (call times, DNC, limits) | Keep in full | This is legal exposure. AI voice adds rules (see COMP-6). |
 | Campaign brain (lists, hopper, recycle, callbacks, dispositions) | Keep in full | This is the product. |
 
@@ -67,8 +68,9 @@ Each gap uses this form:
 
 - `ad_compliance` is pure, deterministic, and fails closed. Property tests cover
   DST, half-hour zones, midnight wrap, and holidays.
-- The orchestrator is a singleton by Postgres advisory lock, not by
-  `replicas: 1`.
+- One leader schedules for the cluster: a key in kine with a TTL, and Postgres
+  fences a node that lost a call (D-8). It is not `replicas: 1`. (Until
+  2026-10-21 this was a Postgres advisory lock.)
 - The hopper claim uses `FOR UPDATE SKIP LOCKED`.
 - Outcome write-back is idempotent (`UNIQUE (lead_id, attempt_at)`).
 - The SIP↔WebRTC bridge (`ad_gateway` `LiveKitParticipant` + `MediaBridge`) carries
@@ -89,11 +91,12 @@ Each gap uses this form:
 | DIAL-2 | Capacity was not held for the length of the call. Fixed 2026-10-21: a live call attempt is the unit of capacity. |
 | DIAL-3 | The orchestrator dialed one call at a time. Fixed 2026-10-21: calls run in parallel, paced by `AD_CALLS_PER_SEC`. |
 | DIAL-4 | A timeout after the INVITE could cause a second dial. Fixed 2026-10-21: the attempt becomes `uncertain` and is reconciled first. |
+| DIAL-9 | Customer first (the default dial order) has no pacing from the agents' join time. A burst of answers starts more agents than the workers can bring into the rooms in 2 s, and those calls are abandoned. New 2026-10-24. Built 2026-10-24: the claim stays within a window for each agent pool, learned from the join times; item 7 (the agent breaker) is open. |
 | LEAD-1 | Nothing filled the hopper. Fixed 2026-10-21: the claim reads the due leads directly. |
 | LEAD-2 | Retries lived only in Redis. Fixed 2026-10-20: the due time is on the lead row. |
 | LEAD-3 | Claims never released. Fixed 2026-10-21: the call attempt is the claim, and settlement updates the lead once. |
 | ORCH-1 | Campaign state never became paused or completed. Fixed 2026-10-21: both are saved with their events. |
-| AGNT-1 | No agent was dispatched. Fixed 2026-10-21: a LiveKit agent or a pipecat bot joins each attempt room before the dial. |
+| AGNT-1 | No agent was dispatched. Fixed 2026-10-21: a LiveKit agent or a pipecat bot joins each attempt room. Since 2026-10-24 the campaign's `dial_order` decides when: on the answer (`customer_first`, the default) or before the dial (`agent_first`). |
 | AGNT-2 | There is no outcome contract from the agent to the dialer. |
 | API-1 | The API has no authentication and no tenant isolation. |
 | OPS-1 | The orchestrator cannot start from Helm or `e2e/run_e2e.sh` (no `REDIS_URL`). Fixed 2026-10-20. |
@@ -123,14 +126,15 @@ Each gap uses this form:
 | Consent records | — | — | Missing | COMP-6 |
 | In-call opt-out to DNC | Human action | VICIdial adapter | Missing | COMP-7 |
 | DNC lists | Yes | Via VICIdial | Engine only | COMP-8 |
-| Abandonment ledger | Yes | Breaker only | Engine only | COMP-10 |
-| Capacity-bound pacing | Human-based | Yes (slots) | Missing in production | DIAL-2, DIAL-3 |
-| Dial-rate limit (CPS) | — | Yes | One global gap | DIAL-3 |
+| Abandonment ledger | Yes | Breaker only | Built for customer first, one jurisdiction | COMP-10 |
+| Capacity-bound pacing | Human-based | Yes (slots) | Built (a live attempt is the slot) | DIAL-2 |
+| Adaptive pacing | Yes (idle humans, drop rate) | No (fixed rate, offline load test) | Built (by agent join time) | DIAL-9 |
+| Dial-rate limit (CPS) | — | Yes | One rate for the cluster | DIAL-3 |
 | Caller-ID pools | Yes | Yes | Missing | DIAL-6 |
 | Trunk selection and failover | Partial | Yes | Missing | DIAL-7 |
 | Circuit breaker | — | Yes | Partial | DIAL-8 |
 | Voicemail / machine policy | Asterisk AMD | Answer supervisor | Missing | AGNT-5 |
-| Agent dispatch per call | n/a | Pipeline per run | Missing | AGNT-1 |
+| Agent dispatch per call | n/a | Pipeline per run | Built (LiveKit, pipecat) | AGNT-1 |
 | Agent outcome contract | Human UI | Status + LLM disposition | Missing | AGNT-2 |
 | Transfer | Yes | Yes | Missing | AGNT-4 |
 | A/B agent split | — | Yes | Missing | AGNT-6 |
@@ -140,8 +144,8 @@ Each gap uses this form:
 | Management API | Non-agent API | REST | Partial | API-2 |
 | Auth and tenancy | User groups | Org scoping | Missing | API-1 |
 | Outbound webhooks | — | Yes | Missing | API-4 |
-| Own SIP↔WebRTC bridge | n/a | n/a | Proven, not used | MEDIA-1..5 |
-| Singleton leader | One cron server | `replicas: 1` | Built, no fencing | ORCH-5 |
+| Own SIP and media leg | n/a | n/a | Built: the node carries the call (D-9) | MEDIA-1 |
+| Singleton leader | One cron server | `replicas: 1` | Built, fenced (kine, D-8) | ORCH-5 |
 
 ---
 
@@ -196,10 +200,19 @@ Each gap uses this form:
 - **Now:** `dnc::normalize` keeps digits only. Area codes work only for NANP numbers of 10 or 11 digits. The API accepts any non-empty phone string.
 - **Do:** Normalize every number to E.164 at load time, with a default country per list. Reject invalid numbers with a report. Use E.164 for DNC keys, frequency counters, and timezone lookup.
 
-#### COMP-10 The abandonment ledger has no source — P1
-- **Now:** `ad_compliance::abandon::AbandonLedger` is in memory, and nothing records into it. `UkOfcom` uses the US formula.
+#### COMP-10 The abandonment ledger — partly done (2026-10-24) — P1
+- **Done (2026-10-24), with customer first:** a customer-first call whose agent is not in the room 2 s after the 200 OK ends as `abandoned` (`ad_attempt`; the pure statechart also turns a late `agent_ready` into `abandoned`). `call_attempts` is the ledger: `PgAttemptRepo::abandon_counts` counts the answered and abandoned calls that ended in the rule's window. The leader reads it before each claim: above the cap (`JurisdictionRule::allows_customer_first`), or when it cannot read it, the claim dials agent first. The retry of an abandoned lead dials agent first. `GET /v1/campaigns/:id/abandonment` reports the ledger.
+- **Still open:**
+  - Every campaign uses `us_tsr` (`JurisdictionRule::CAMPAIGN`); a campaign cannot name its jurisdiction. `UkOfcom` uses the US formula.
+  - Every answer counts as a human answer: there is no answering-machine detection (AGNT-5). VICIdial removes machine answers from the denominator.
+  - The TSR safe harbor also needs a recorded message (the seller's name and a phone number) within 2 s on an abandoned call (16 CFR 310.4(b)(4)(iii)). The dialer hangs up and plays nothing.
+  - The limit counts from the 200 OK, not from the end of the callee's greeting. This is stricter than the rule.
+  - The ledger query counts 30 days of attempts on each claim of a customer-first campaign. A large campaign needs a rolling counter.
+  - "In the room" is the agent's join, not its first audio (`agent_first_audio_at`).
+  - Click-to-call: the limit counts from the node's answer of Twilio's INVITE. The phone answered earlier, at Twilio.
+  - The margin is small: a burst of answers on a cold agent pool abandoned calls. DIAL-9 has the measurements and the fix (a window for each agent pool, learned from the join times, built 2026-10-24).
+  - The governor counts only ended calls. Without DIAL-9, every call of a burst could abandon before the governor saw the first one. With DIAL-9, at most the window `K` can.
 - **Reference:** VICIdial counts drops (DROP, XDROP) over human-answered statuses. Its UK mode removes the estimated answering-machine share of drops (`bin/AST_VDadapt.pl` ~line 3946). `drop_call_seconds` defines a drop.
-- **Do:** Persist an answer event per attempt with `human_answered`, `answered_at`, and `agent_first_audio_at`. Compute the rate per jurisdiction. Feed the pacing governor and the reports.
 - **Open question:** Does an AI agent count as a "live sales representative" for the 2-second rule? Ask counsel (D-5).
 
 #### COMP-11 Deny reasons and experimental status — P2
@@ -233,7 +246,7 @@ Each gap uses this form:
 - **Do:** Launch attempts at the same time, bounded by free capacity. Pace launches with a token bucket per campaign and per trunk. Never block the scheduler on ring time.
 - **Measured (SIPp benchmark, 2026-10-20, all in Docker):** the dial rate does not follow `AD_CALLS_PER_SEC`. With a 300 ms ring, 30 calls at a configured 10/s ran at 1.29 attempts/s, and 100 calls at 50/s ran at 1.08 attempts/s. With a 3 s ring the rate fell to 0.34/s: each call waits for its answer. Answered setup took 328–386 ms (p50 333 ms). Each failed setup stalled the loop for 5.7–8.1 s. Peak live calls: 11. Harness: `_research/scratch/sip-bench/`.
 - **Measured again after OPS-6, OPS-7, and D-3 (2026-10-20):** every call of the three tiers was answered (140 of 140). The failed-setup stalls are gone. The rate is still serial: 2.12 attempts/s at a configured 10/s, and 2.71 attempts/s at a configured 50/s. Each attempt waits for its answer (about 310 ms) and then for the spacer. With a 3 s ring the rate stays at 0.34/s.
-- **Status (2026-10-21):** fixed. Each dial runs in a task of its own, so the scheduler never waits for a ring. A `Pacer` (`ad_dispatch`) spaces the call starts at `AD_CALLS_PER_SEC`. Open: the pacer is one per orchestrator, not one per campaign or per trunk.
+- **Status (2026-10-21):** fixed. Each dial runs in a task of its own, so the scheduler never waits for a ring. A `Pacer` (`ad_dispatch`) spaces the call starts at `AD_CALLS_PER_SEC`. Open: the pacer is one for the cluster (in the leader, since D-8), not one per campaign or per trunk (DIAL-7). The window of DIAL-9 (built 2026-10-24) also limits the claims by the agents' join time.
 - **Measured after the fix (SIPp benchmark, 2026-10-21, all in Docker):** the dial rate follows `AD_CALLS_PER_SEC`. 30 calls at a configured 10/s ran at 10.0 attempts/s (before: 2.12). 100 calls at 50/s ran at 50.0 attempts/s (before: 2.71), with 84 live calls at the peak. With a 3 s ring, 10 calls at 50/s ran at 50.0 attempts/s (before: 0.34): the ring no longer stops the dialing. With `concurrency_cap` 5, 40 calls never had more than 5 live, and the rate fell to 1.6 attempts/s, as the cap requires. All 180 calls completed. The LiveKit webhook ended every call, and every campaign completed in Postgres.
 
 #### DIAL-4 An uncertain initiation can dial twice — P0
@@ -243,8 +256,9 @@ Each gap uses this form:
 - **Status (2026-10-21):** fixed. A connect error before the request leaves is a setup error: no call exists. Any other transport error is "no response": the attempt becomes `uncertain` and keeps its capacity. The reconcile (`AD_ATTEMPT_CHECK_MS`) then asks LiveKit whether the call is in its room. If it is, the attempt connects. If it is not, the attempt ends as `uncertain`, and only then can a retry follow. The dial start is saved before the request leaves, so a stopped dialer leaves a `dialing` attempt, and the reconcile decides it after the longest dial time.
 
 #### DIAL-5 No call timers — P1
+- **Now:** one fixed ring timeout of 30 s for all campaigns (`ad_gateway::RING_TIMEOUT`). No maximum call duration and no silence timeout.
 - **Reference:** VICIdial `dial_timeout` (default 60 seconds).
-- **Do:** Add a ring timeout, a maximum call duration, and a silence timeout per campaign.
+- **Do:** Add a ring timeout, a maximum call duration, and a silence timeout per campaign. With DIAL-9, a ringing call holds a place in the window of its agent pool, so the ring timeout also sets the throughput of the pool.
 
 #### DIAL-6 No caller-ID management — P1
 - **Reference:** dograh selects a from-number and derives the trunk from the number (`services/telephony/base.py` `select_trunk`). VICIdial has `campaign_cid` and CID groups.
@@ -262,6 +276,106 @@ Each gap uses this form:
 - **Also:** When the orchestrator cannot read the breaker (a database error), it treats the breaker as closed and keeps dialing. Since 2026-10-20 it logs this as a warning. Decide whether this path must fail closed.
 - **Seen in the SIPp benchmark (2026-10-20):** 19 calls that never sent an INVITE (a local media error) counted as call failures and tripped the breaker. Our own misconfiguration paused the campaign. BETTER-7 separates these classes.
 - **Status (2026-10-21), partial:** a trip pauses the campaign in Postgres, with one `circuit_breaker_tripped` event in the same transaction. A resume through the API sets `campaigns.breaker_reset_at`, and the window counts only attempts that ended after it. `e2e/run_events_e2e.sh` proves both. The breaker counts only attempts that started a dial; `failed`, `setup_error`, and `uncertain` are failures, and busy and no answer are normal results. Open: the comparison, a trunk breaker, and the read-error path.
+
+#### DIAL-9 The pace does not follow the agents' join time — built 2026-10-24 (item 7 open)
+The user's goal for the product: the dialer sets the call rate from the pace at which the agents join. This is the main difference from other dialers (BETTER-6).
+
+- **Now:**
+  - The leader starts calls at one fixed rate for the cluster (`AD_CALLS_PER_SEC`, default 10, `ad_dispatch::Pacer`). The only other limit is `campaigns.concurrency_cap`. No limit knows how fast the agents join.
+  - Customer first is the default dial order. The node starts the agent at the 200 OK, and the agent must be in the room 2 s after it. If it is not, the node hangs up and the call ends as `abandoned` (COMP-10).
+  - The governor (COMP-10) decides at the claim, before the answer, and it counts only ended calls. So the leader can claim every call of a burst customer first before the first abandoned call is in the ledger.
+  - Each attempt keeps its join time: `answered_at` and `snapshot.agent_ready_at`. An agent-first attempt keeps its start time only in `attempt_events` (`agent_starting`). The attempt does not keep its agent pool.
+- **Measured (2026-10-24, one machine, all in Docker):**
+  - One call at a time: a LiveKit agent joined 332–620 ms after the answer, and a pipecat bot 147–233 ms after it.
+  - `e2e/run_cluster_e2e.sh` (3 nodes, 24 calls, one Python LiveKit worker, no warm processes): the first 6 LiveKit customer-first calls answered at almost the same time. Their agents joined 810, 1256, 1390, 1497, and 1822 ms after the answer. The sixth agent did not join in 2 s, and that call was abandoned. Each extra agent that started at the same time added about 0.1–0.5 s.
+  - After that abandoned call, the governor dialed campaign 1 agent first. The abandoned lead waits 15 min for its retry, so the script fails at its deadline. The cluster e2e fails now because of this gap.
+  - Before the start request moved to the 200 OK, all 6 agents missed 2 s by about 0.2 s.
+- **Cause:** the join time depends on the load of the agent pool. A burst of answers starts many agents at once, and each start waits for the ones before it. A fixed rate cannot know the speed of the pool: the same rate is safe for a warm pool and abandons calls on a cold pool.
+- **Reference:**
+  - VICIdial tunes its pace by itself. `bin/AST_VDadapt.pl` `calculate_dial_level` (~lines 6813–7090) sets the dial level (lines for each agent) from the last minute: the average number of READY agents minus the average number of calls that wait for an agent (~line 2763). `adaptive_intensity` scales the change, `adaptive_maximum_level` is the top, and 1.0 is the bottom. Drop rules come on top: more than 20 calls and more than 50% drops in the last minute halve the level. When the drop rate of the day is above `adaptive_dropped_percentage`, the level goes to 1.0 (`HARD_LIMIT`), halves (`AVERAGE`), or tapers to the end of the day (`TAPERED`). Its agents are humans who stay connected, so it never measures a join time.
+  - dograh does not tune at run time. `api/services/call_concurrency/rate_limiter.py` is a fixed token bucket for each campaign (`rate_limit_per_second`, a 1 s window in Redis, fails closed). Org and campaign slots limit the live calls. KEDA scales the pods on the active calls of each pod, and an offline load test finds the calls for each pod (`api/services/observability/loop_lag.py`). Its bot runs in the process of the call, so it has no join step.
+  - LiveKit agents (`livekit_agents/livekit-agents/livekit/agents/worker.py`): a worker above `load_threshold` (0.7 in production) gets no new jobs, and `num_idle_processes` keeps warm processes (the CPU count in production, 0 in development). This back-pressure stays inside LiveKit. The dialer gets no signal from it.
+  - Commercial predictive dialers (Genesys, Five9, NICE) adjust the pace from the answer rate and the handle times, with a target abandonment rate as the limit. This comes from their public product descriptions, not from code that we read.
+  - TCP congestion control learns a capacity that nobody announces. Slow start and AIMD (RFC 5681) react to loss. Delay-based control (TCP Vegas, BBR) reacts to the time of each reply before a loss occurs. The join time is our "time of each reply", and an abandoned call is our "loss".
+- **Gap:** no reference paces by the agents' join time, because their agents are connected before the call. Our agents start for each call. The join time tells how many answers the agent pool can take at once. We measured it for each call, and we did not use it.
+- **Status (2026-10-24): built**, as items 1–6 and 8–10 below, with the decisions of D-10 (both modes for each campaign, every limit value settable at run time). Item 7 is open.
+  - `ad_pacing` is the pure controller: `observe` (one sample in, the next state out) and `limit` (the window limit for a mode). Unit tests and property tests cover it.
+  - `ad_db`: migration 0008 adds `agent_pools` (settings and state for each pool), `campaigns.pacing` (the mode), and on `call_attempts` the pool, the window and limit at the claim, `agent_started_at`, `agent_ready_at`, and `paced_at`. `claim_paced` locks the pool row, reads the limit, counts the window, and inserts in one transaction. Settings that do not read give a limit of 1 (fail closed). `ingest` learns from each ended or joined attempt once.
+  - The leader learns before each claim and on each sweep. An agent in the room publishes `agent_joined`, so the next claim does not wait for the sweep.
+  - The node takes the time of the start request before it sends it, so the join time includes the request.
+  - The node takes the join time from the monotonic clock. In one `e2e/run_e2e.sh` run, the wall clock of the WSL2 machine stepped back about 0.56 s during a call, and a join of 781 ms read as 207 ms from the wall-clock times. The abandonment test on the join uses the same time. Since OPS-9, every time of a call comes from one read of the Postgres clock plus the monotonic clock.
+  - API: `GET` and `PUT /v1/campaigns/:id/pacing`, `GET /v1/agent-pools`.
+  - Proven: `e2e/run_e2e.sh` (a slow pool goes from a limit of 2 to 1, with no abandoned call and no claim above its limit) and `e2e/run_cluster_e2e.sh` (the burst on the cold LiveKit worker ends with no abandoned call; each pool started at 1 and grew to 3 and 4). The mutation check (no window limit in the claim) failed 5 of the 9 `pg_pacing` tests and both e2e runs.
+
+**Do: a join-paced controller.** Built 2026-10-24 as below; the notes "Built:" give the differences.
+
+1. **One controller for each agent pool.**
+   - A pool is a LiveKit `agent_name` (on the dialer's LiveKit server), or a pipecat `start_url`. All the campaigns that use the pool share its controller. Built: the pool keeps the query of the `start_url` (`AgentSpec::pool()`), because a query can select a different bot.
+   - The leader owns all the controllers, so the nodes need no coordination. Built: the claim locks the pool's row, so two claims of one pool cannot both take its last place.
+   - Save the pool key on each attempt at the claim (OBS-1). Then a change of the campaign's agent does not move live attempts to a different pool.
+2. **A window, not a rate.**
+   - The window of a pool counts its attempts that can still start an agent or are starting one:
+     - customer-first attempts that are dialing or ringing,
+     - customer-first attempts that are answered and have no agent in the room yet,
+     - agent-first attempts whose agent is starting.
+   - The leader claims a call for the pool only while the window is below the pool's limit `K`.
+   - A ringing call counts, because it can answer at any time. So at most `K` agents start at once, even when all ringing calls answer at the same instant.
+   - A rate cannot give this bound: at any rate, a burst of answers can come.
+   - The throughput of a pool is about `K` ÷ the average time in the window (ring time plus join time). Example: `K` = 10 and 15 s of ring give about 0.67 dials per second. The controller raises `K` until the joins get slow, so it finds this throughput by itself. With a low answer rate, few ringing calls answer at once, the joins stay fast, and `K` grows.
+3. **One sample for each agent start.**
+   - A sample is the time from the start request to the agent in the room. For customer first, the start is the 200 OK. For agent first, it is `agent_starting`. Add `agent_started_at` to the snapshot.
+   - A sample also records the window at its start.
+   - These samples are slow samples: a start that the runtime refuses, an agent that does not join in time, and an abandoned call. Built: an abandoned call is a slow sample only when no agent was in the room at the limit. A call that a stopped node abandoned, or that the callee ended before the limit, says nothing about the pool.
+   - A pipecat pool and a LiveKit pool have different speeds. Each pool learns only from its own samples.
+4. **Learn `K` from the samples (AIMD).**
+   - The two limits come from the rule's limit (`JurisdictionRule::connect_within`, 2 s for `us_tsr`). The target is half of it (1.0 s). The back-off is three quarters of it (1.5 s). Both are below the hang-up, so the controller slows down before a call is abandoned.
+   - Slow start: start at `K` = 1. After each round of `K` fast samples, double `K`. The first sample above the target ends the slow start.
+   - After the slow start, each sample at or below the target adds 1/`K`, so `K` grows by 1 for each round.
+   - A sample between the target and the back-off does not change `K`.
+   - A slow sample sets `K` to `max(1, K ÷ 2)`. A second slow sample from the same round does not halve `K` again. A round is the samples that started before the last halving.
+   - Raise `K` only when the window was full (at least `K` − 1) at the start of the sample. A quiet hour must not raise `K`, because a later burst then finds a limit that nobody proved.
+   - `K` never goes above the sum of the concurrency caps of the pool's campaigns. Built differently: `K` grows only when a claim found the window full (window + 1 ≥ `K`), and the caps and the cluster capacity limit the window, so `K` stops near them (at most one doubling above). `max_k` is a hard top that the operator sets at run time.
+5. **The other limits stay.** `AD_CALLS_PER_SEC` still spaces the call starts, and `concurrency_cap` still limits each campaign. The leader uses the smallest limit (BETTER-6). Trunk limits come with DIAL-7.
+6. **Keep `K` across a leader change.** Save `K`, the phase (slow start or not), and the time of the last halving in Postgres, one row for each pool. The leader writes the row when `K` changes, and a new leader reads it. Without the row, a new leader starts again at `K` = 1. That is safe, but the ramp can take minutes when few calls answer. Built: `agent_pools.state`, written by each `ingest`.
+7. **Agent failures (from AGNT-3). Open.** A start that the runtime refuses is a slow sample (built). If `K` = 1 and 5 starts in a row fail, pause the pool's campaigns with the reason and the attempt ids, as the campaign breaker does (DIAL-8). Count these failures apart from the call failures.
+8. **The governor stays.** COMP-10 is still the hard net above the cap. The window also limits a burst: at most `K` calls can abandon before the governor sees the first one.
+9. **Show it.** `GET /v1/campaigns/:id/pacing` shows the pool key, `K`, the phase, the window now, and the join times of the last 50 samples (p50, p95, and the number of slow samples). Export the join times and `K` as metrics (OBS-4). Built, without the metrics. Also built (D-10): `PUT` changes the mode and the pool's settings (target, back-off, first `K`, largest `K`) at run time, and `reset` starts the pool again; `GET /v1/agent-pools` lists the pools. The leader also logs each learning step.
+10. **Put it where `PLAN.md` puts pacing.** Built. `PLAN.md` §0.10.6 names a registry of dial strategies in a crate `ad_pacing`. That crate does not exist yet. Make the controller a pure engine in `ad_pacing`: it takes the samples and returns `K`, with no I/O. Make it the strategy for customer first. Correct §0.10.6 in the same change. It says now that `Progressive` gives about 0% abandonment, which is not true for customer first.
+
+**Tests (all in the same change):**
+- Unit tests of the pure controller:
+  - the slow start doubles `K` after each round,
+  - the first sample above the target ends the slow start,
+  - a fast sample adds 1/`K`,
+  - a sample between the target and the back-off changes nothing,
+  - a refused start, a missing agent, and an abandoned call halve `K`,
+  - one round halves `K` one time only,
+  - `K` does not grow when the window was not full,
+  - `K` stays between 1 and the ceiling.
+- Property tests: `K` is always 1 or more. A slow sample never raises `K`. Fast samples only never lower `K`. The same samples always give the same `K`.
+- Postgres tests (`ad_db`):
+  - the window counts the four kinds of attempts in item 2,
+  - it does not count an attempt with an agent in the room or an ended attempt,
+  - two campaigns of one pool share one window,
+  - the claim takes no call for a full pool,
+  - a new leader reads `K` back.
+- API contract test of `/pacing`: 503 without Postgres, 404 for an unknown campaign, and the values from Postgres.
+- `e2e/run_e2e.sh`: add a slow pipecat pool through the bot's test control (`start_url` with `hold_ms=1600`, so each bot joins in about 1.8 s: slower than the back-off, faster than the hang-up). Give it 4 leads. The test passes when no call is abandoned and no two attempts of the pool overlap in the window, from their times in Postgres. Built differently: `hold_ms=700` and 6 leads, with the target (300 ms), the back-off (600 ms), and the first `K` (2) set through the API at run time. This also tests the run-time settings, and the joins stay far from the 2 s hang-up.
+- `e2e/run_cluster_e2e.sh`: the burst on the cold LiveKit worker must end with no abandoned call. Check that `K` started at 1 and grew.
+- Mutation check: remove the window check from the claim. Then the slow-pool test and the cluster test must fail. After the mutant run, touch the changed files in the real tree (the build cache shares `/src/target`).
+- Later, with BETTER-8: a simulator with a pool model (join time grows with the starts in progress) and a carrier with an answer rate. Assert that almost no call is abandoned and that `K` settles near the capacity of the pool.
+
+**Alternatives, and why they are not the default:**
+- Start the agent at 180 Ringing (a third dial order). This gives the agent the ring time as a head start. But it starts an agent for each call that does not answer, and the user decided that an agent starts only for an answered call.
+- Warm agent workers (LiveKit `num_idle_processes`, a pool of started pipecat processes). They make the joins faster and `K` larger. They are the operator's setup, and they do not tell the dialer the pace. Document them in the README for operators.
+- A fixed cap for each pool, set by the operator. This needs a load test for each pool, as dograh does. It cannot follow a pool that scales or gets slower.
+- A predictive mode that counts a ringing call at its measured chance to answer, tuned by the ledger as VICIdial does. The controller above already lets `K` grow when few calls answer, so this mode is not necessary to start.
+
+**Open (decide before the build, D-10):**
+- The target and the back-off (1.0 s and 1.5 s, from the 2 s rule).
+- A strict mode for each campaign: `K` never goes above the largest number of starts at once that all joined fast. Then no call is abandoned by construction, but the throughput is lower.
+- A first `K` for each pool in the agent JSON (data, no migration), so a known pool does not start at 1.
+- The slow-start round for a pool with few answers.
 
 ### 5.3 Lead lifecycle and selection (LEAD)
 
@@ -385,9 +499,8 @@ Each gap uses this form:
 - **Reference:** dograh answer actions (`START_OPENING`, `RELEASE`, `LEAVE_MESSAGE`, `DROP`, `SCREEN_THEN_REARM`, `WAIT_FOR_SCREENING`), machine subtypes, and post-call disposition extraction. The LiveKit sample tools `end_call`, `transfer_call`, `detected_answering_machine`.
 - **Do:** Define a versioned outcome schema: answer class, disposition code, callback time and zone, DNC request and scope, transfer request, summary, disclosures spoken. Carry it on the gRPC session stream (decision D-6). Make it idempotent by attempt id. Validate it against the campaign catalog.
 
-#### AGNT-3 No agent-capacity signal — P1
-- **Do:** Use agent capacity as a pacing input: worker availability from LiveKit or a configured pool cap. Fail fast when no worker accepts a dispatch.
-- **Status (2026-10-21), partial:** a start that the runtime refuses, or an agent that does not join in time, ends the attempt without a dial and does not count as a call. Open: a capacity signal before the claim, and a breaker on agent failures.
+#### AGNT-3 No agent-capacity signal — merged into DIAL-9 (2026-10-24)
+- LiveKit gives the dialer no worker availability; it keeps the worker load inside its dispatch. The measured join time is the capacity signal, and DIAL-9 uses it before each claim. The breaker on agent failures is DIAL-9 item 7. Still true from 2026-10-21: a start that the runtime refuses, or an agent that does not join in time, ends the attempt without a dial and does not count as a call.
 
 #### AGNT-4 Hangup, transfer, and orphan cleanup — P1
 - **Reference:** `delete_room` for hangup and `transfer_sip_participant` for transfer (LiveKit sample). Alexor-Brain `_cleanup_paused_campaigns` ends live calls of a stopped campaign.
@@ -460,6 +573,7 @@ Each gap uses this form:
 - **Now:** `call_outcomes` stores outcome, answered, and attempt time.
 - **Do:** Store per attempt: SIP code and reason, trunk, caller ID, ring, answer, and end times, answer class, disposition, agent and variant, room, recording reference, and the decision record (BETTER-2).
 - **Status (2026-10-21), partial:** `call_attempts` stores the SIP code and detail, the dial, answer, and end times, the room, the participant identity, and the worker. `attempt_events` keeps every state change in order. Open: trunk, caller ID, answer class, disposition, agent, variant, recording, and the decision record (BETTER-2).
+- **Update (2026-10-24):** the snapshot also keeps `agent_ready_at`, and the row keeps the agent identity and state. DIAL-9 added (2026-10-24) the agent pool key (`call_attempts.pool`), the agent start time (`agent_started_at`), and the window and limit at the claim.
 
 #### OBS-2 No reports — P1
 - **Do:** Add real-time campaign stats, per list, status, and disposition, funnels, an abandonment report per jurisdiction, a carrier report (answer rate, average duration, post-dial delay, SIP code mix), and per-variant results.
@@ -534,12 +648,21 @@ Each gap uses this form:
   - kine v0.13.17 is not etcd: no lease KeepAlive (keys stay alive by rewrite), no Election or Lock, a racy plain Put, no `keys_only` reads, and a delete that cannot say whether the key existed. `ad_cluster` uses only the supported transactions, and the tests run against kine itself.
   - One kine replica is a single point of failure. Several kine replicas can share one Postgres, but a write through one replica reaches the watchers of another up to 1 s later.
   - kine adds a row per key write (node and leader rewrites every third of the TTL) to its `kine` table in the app database. Compaction is on (`--compact-interval`), but the table load on a managed Postgres is not measured yet.
-  - The leader paces all call starts (`AD_CALLS_PER_SEC`); there is no rate per campaign or per trunk (DIAL-7).
-  - A node finds the agent in the room by asking LiveKit every 250 ms until it joins. At high call rates a room event would cost less: join the room before the dial, or ask LiveKit less often.
+  - The leader paces all call starts (`AD_CALLS_PER_SEC`); there is no rate per campaign or per trunk (DIAL-7), The DIAL-9 window (built 2026-10-24) limits the claims by the agents' join time. Its controller runs in the leader, and its state is in Postgres.
+  - With agent first, a node finds the agent in the room by asking LiveKit every 250 ms (`AGENT_POLL`) until it joins. At high call rates a room event would cost less. With customer first, the node joins the room at the answer, and its own participant sees the agent join, with no poll.
   - A node carries the media of its calls (D-9), so a node that dies drops its live calls. They end without a second dial, but the consumer hears the call drop. Kamailio's dialog module could send BYE to the carrier for them.
-  - Measured in the cluster e2e (2026-10-21, 8 cores for the whole stack): a node used about half a core with two calls, and about the same with four. Most of that cost does not grow with the calls; profile it before a capacity plan. The Python test agents, one process per runtime, ran out of CPU above about six calls at once.
+  - Measured in the cluster e2e (2026-10-21, 8 cores for the whole stack): a node used about half a core with two calls, and about the same with four. Most of that cost does not grow with the calls; profile it before a capacity plan. The Python test agents, one process per runtime, ran out of CPU above about six calls at once. On 2026-10-24 the same limit made the agents of a burst join late (DIAL-9).
   - A failover takes up to the TTL plus a third of it (default 10 s + 3.3 s) before the attempts of a dead node move; its connected calls dropped with it.
 - **Do:** run kine with two or more replicas against the managed Postgres and measure the failover; measure the kine table load; replace the readiness poll with a push signal on the node that owns the call (no webhook).
+
+#### OPS-9 The roles trusted the OS clock — P1 (fixed 2026-10-24)
+- **Was:** each role took the time from the OS clock of its node (`SystemClock`). Two nodes compared times that came from two clocks: the takeover of an agent start, the reconcile of a live call (`created_at` is the Postgres `now()`), and the claim's due time against `now()` in SQL. A node with a wrong clock decided the safe hours from a wrong local time. Inside one call, a step of the wall clock changed the measured join (see DIAL-9: 781 ms read as 207 ms).
+- **Now (decision D-11):** the roles with Postgres take the time from `ad_db::PgClock`: the Postgres time (`clock_timestamp()`, the read with the shortest round trip of three, at most 500 ms) plus the monotonic time since that read. A role waits for its first read before it does work, and reads again every 30 s. Each call takes one read at its start and then only the monotonic clock (`CallTimes` in the node). The API without Postgres keeps the OS clock (no other node shares its data).
+- **Still on the OS clock:** the log lines and the LiveKit tokens (`livekit-api` dates the `nbf` and `exp` claims with `SystemTime`). LiveKit refuses a token from a node whose clock is ahead by more than its leeway, so that node's calls fail; they do not dial wrong. A node logs `the OS clock is off` when its OS clock is more than 250 ms from Postgres.
+- **Proven:** `ad_db` unit tests (the anchor arithmetic, the read choice) and `tests/pg_clock.rs` (the clock tells the Postgres time; a sync corrects a clock that is 1 h off); the node's `CallTimes` test (a step of the node clock after the first read changes no time of the call); `e2e/run_cluster_e2e.sh` assert (h): node-2 and node-3 run with an OS clock 3 min and 11 min behind (an `LD_PRELOAD` shim that moves only the wall clock, `e2e/clock-offset`; libfaketime did the same, but it made a dial take 0.7–7 s instead of 0.1–0.6 s, and the slow nodes abandoned calls), each logs its offset, and every saved event time is within 30 s before and 5 s after the time at which Postgres saved it.
+- **Found on the WSL2 dev machine (2026-10-24):** the wall clock steps back about 0.6 s every 30 s against the monotonic clock (a probe in a plain container: -603 ms at 20 s, -1189 ms at 50 s, -1796 ms at 80 s). Postgres uses that wall clock. So a role's clock runs up to about one step ahead of `now()` until its next read, and the times of one call keep the drift of the call. Before this change, the e2e checks that compared a node time (`ended_at`, `agent_ready_at`) with `created_at` were exact only because every container read the same kernel clock. They now compare only Postgres times (the save times of the events, `e2e/lib.sh` `saved_end` and `left_window`). The same machine once paused for about 3 min during a run (node-3's clock stepped +173 s at its next read).
+- **Mutation checks:** a `PgClock` that tells the OS time fails `a_sync_corrects_a_clock_that_is_one_hour_off` (the other `pg_clock` test passes, because the OS clock and Postgres share one kernel clock in Docker); calls that take their times from the OS clock fail assert (h) of `e2e/run_cluster_e2e.sh` (the events of node-2 and node-3 show -180 s and -660 s), and no other assert.
+- **Do:** date the LiveKit tokens with the role's clock (a patch to `livekit-api`, or our own token signer), so that the OS clock dates only the logs.
 
 #### CARRIER-1 Twilio Elastic SIP Trunking, a supported carrier — P1 (new 2026-10-21; it was the primary carrier until 2026-10-24)
 - **Now:** README "Call through Twilio" uses the quickstart stack (`docker-compose.quickstart.yml`) with `e2e/twilio/run.sh setup`. `crates/ad_sip/tests/twilio.rs` and `e2e/run_twilio_e2e.sh --sim` (with the diago carrier simulator) guard it on every change. Twilio reaches real phones; LiveKit Cloud SIP (CARRIER-3) does not.
@@ -561,14 +684,16 @@ Each gap uses this form:
 - **Not tested:** a call through the public phone network. No call left LiveKit. A call from a phone to the number uses the `PN_...` route of the same rule.
 - **Do:** add the repository secrets so CI runs it (`lkcloud-e2e`).
 
-#### CARRIER-2 Twilio Programmable Voice paths — P2 (new 2026-10-21)
-Elastic SIP Trunking (CARRIER-1) is the dialer's carrier path. Programmable Voice gives two more SIP paths. Neither is built.
-- **SIP Domain, outbound (a test path on a Trial account, if Twilio allows it):** the node sends its INVITE to `<name>.sip.twilio.com` with digest credentials, as it does to a trunk. Twilio then runs the domain's TwiML, for example `<Dial><Number>` to a verified phone, and the phone talks to our agent. It needs no public address, because we start the call. Not confirmed: whether a Trial account can use SIP Domains and dial out from them. A Trial call also plays a trial message, and the callee must press a key. Do: a reusable `setup-domain` command in `e2e/twilio/run.sh` and a `--domain` mode of `e2e/run_twilio_e2e.sh`.
-- **`<Dial><Sip>`, inbound to us ("click-to-call"):** Twilio's Calls API rings a phone and bridges it with `<Dial><Sip>sip:…@our-edge</Sip>`. That is an inbound call to the dialer, and it needs:
-  - a public SIP address on Kamailio (an Elastic IP or an NLB, with `advertise` on its carrier-side socket);
-  - inbound calls in the node. Today the node refuses a new INVITE with 403, on purpose;
-  - a routing rule from the INVITE to an agent and a room.
-  - Do: test it in Docker Compose with the carrier simulator as the caller, and live only where Kamailio has a public address (EKS).
+#### CARRIER-2 Twilio Programmable Voice paths — click-to-call built (2026-10-24); SIP Domain outbound P2
+Elastic SIP Trunking (CARRIER-1) is the trunk path. Programmable Voice gives two more SIP paths. On 2026-10-24, the SIP Domains API answered for the Trial account (no 401), where the trunking API refuses it. But no Twilio SIP path works on a Trial account: Twilio's "Custom TwiML during trial" (docs, Try out Voice) blocks `<Dial><Sip>` and `<Dial><Number>`, and a Trial Calls API request takes only `To`, a Twilio template URL, and `StatusCallback`. Every path below needs an upgraded account.
+- **`<Dial><Sip>`, inbound to us ("click-to-call"): built, proven with the simulator only.** `AD_DIAL_PROVIDER=twilio_click_to_call` (`ad_gateway::click_to_call`, a variant of the `Telephony` registry):
+  - The node asks the Calls API to call the lead, with inline TwiML `<Dial><Sip>{AD_TWILIO_SIP_URI}?x-ad-call=<token>&x-ad-node=<node></Sip></Dial>`. No webhook: the node reads the call's status (busy, no answer, failed) until the INVITE arrives, and it cancels the call at the ring timeout or when the dial task stops (RAII).
+  - Kamailio routes an INVITE with `x-ad-call` to the node in `x-ad-node`, only inside the cluster network (`route[INBOUND]`), over UDP or TCP.
+  - The node answers only an INVITE with the token of one of its dials (`ad_sip::SipUa::expect`, 128 random bits); any other INVITE gets 404, and an INVITE without the header gets 403.
+  - Proven: `e2e/run_twilio_c2c_e2e.sh --sim` (the simulator is the Calls API and the phones; the INVITE comes over TCP; both BYE directions; busy and no answer) and `crates/ad_sip/tests/inbound.rs`.
+  - **Not tested against Twilio:** the live mode of the same script needs an upgraded Twilio account. On 2026-10-24 the ngrok TCP tunnel came up (after a card was added to the ngrok account), and Twilio refused the Trial account's request: "Invalid or disallowed parameters provided - trial accounts have limited parameter access" (code 0, HTTP 400). Twilio's magic numbers (`+15005550006`) work only with test credentials, which place no call, so no INVITE comes from them. Unknown until a live run: whether Twilio sends the RTP of `<Dial><Sip>` to the address that our RTP comes from (we are behind NAT; ngrok carries no UDP).
+  - **Do:** the live run; Kamailio's public address on EKS (an NLB, `advertise` on the carrier side); store the Twilio call SID on the attempt so that the reconcile can end a call whose node died; answering-machine detection (`MachineDetection`); a per-campaign caller ID.
+- **SIP Domain, outbound (needs an upgraded account; a Trial account blocks `<Dial><Number>`):** the node sends its INVITE to `<name>.sip.twilio.com` with digest credentials, as it does to a trunk. Twilio then runs the domain's TwiML, for example `<Dial><Number>` to the phone, and the phone talks to our agent. It needs no public address, because we start the call. Do: a reusable `setup-domain` command in `e2e/twilio/run.sh` and a `--domain` mode of `e2e/run_twilio_e2e.sh`.
 ---
 
 ## 6. Where AgentDialer can be better than the references
@@ -579,6 +704,7 @@ cron. A fresh Rust dialer for agents can do better.
 #### BETTER-1 Zero abandonment by construction, with proof
 - **Weakness in references:** VICIdial over-dials and then limits drops with statistics. We did not find an abandonment model in dograh.
 - **Build:** Reserve an agent before the dial. Start the agent session before the INVITE, as the LiveKit sample does. Record `answered_at` and `agent_first_audio_at` for every call. The abandonment rate is then measured, not estimated.
+- **Now (2026-10-24):** this is `"dial_order": "agent_first"`. The default is `customer_first` (the user's choice: an agent starts only for an answered call). Customer first keeps the cap by its 2 s limit and by the fall back to agent first above the cap (COMP-10). It is not zero by construction. The join-paced window (DIAL-9, built 2026-10-24) limits a burst to `K` agent starts.
 
 #### BETTER-2 A decision record for every dial
 - **Weakness:** We did not find a reference that keeps evidence of why a call was allowed.
@@ -598,9 +724,10 @@ cron. A fresh Rust dialer for agents can do better.
 - **Weakness:** VICIdial relies on a human click. dograh extracts the disposition with an LLM after the call.
 - **Build:** A versioned schema that the agent fills during the call (answer class, disposition from the campaign catalog, callback, opt-out, transfer). The dialer validates it. An agent SDK helper makes the correct use the easy use.
 
-#### BETTER-6 Capacity-aware pacing for elastic agents
-- **Weakness:** VICIdial pacing models human idle time. dograh caps concurrency but ignores carriers.
-- **Build:** Compute the launch rate from agent capacity, campaign cap, org quota, trunk concurrency and CPS, and the abandonment governor. Use the smallest limit.
+#### BETTER-6 Pacing from the agents' join time
+- **Weakness:** VICIdial tunes its pace to the idle humans and the drop rate. dograh uses a fixed rate and a cap from an offline load test, and it ignores carriers. LiveKit keeps its worker load inside its dispatch. No reference measures how fast an agent joins, because their agents are connected before the call.
+- **Build:** Learn the capacity of each agent pool from the join time of each call, and claim calls only inside that window (DIAL-9). Then use the smallest of these limits: the window of the agent pool, the campaign cap (built, DIAL-2), the org quota (API-1), the trunk concurrency and CPS (DIAL-7), `AD_CALLS_PER_SEC`, and the abandonment governor (COMP-10).
+- **Status (2026-10-24):** the window of the agent pool (DIAL-9) is built, with the campaign cap, `AD_CALLS_PER_SEC`, and the governor. Open: the org quota (API-1) and the trunk limits (DIAL-7).
 
 #### BETTER-7 SIP intelligence
 - **Weakness:** dograh maps a small set of normalized statuses (completed, failed, busy, no-answer, canceled, error). VICIdial maps a fixed status list.
@@ -641,13 +768,14 @@ real numbers yet. Do not dial real numbers before step 2 is done.
 2. **Make dialing legal.** COMP-1, COMP-2, COMP-6, COMP-7, COMP-9, BETTER-2.
 3. **Make the attempt real.** DIAL-1, DIAL-2, DIAL-3, DIAL-4, AGNT-1, AGNT-2, BETTER-4. The gateway stops returning "answered". Capacity is held for the call.
    **Progress (2026-10-21):** DIAL-2, DIAL-3, and DIAL-4 are done. DIAL-1 and BETTER-4 are partial. AGNT-1 and AGNT-2 are open: the agent adapters (D-2) and the session stream (D-6).
+   **Progress (2026-10-24):** AGNT-1 is done, with both dial orders. DIAL-9 is done (item 7 open), and `e2e/run_cluster_e2e.sh` passes with it.
 4. **Make scheduling durable.** LEAD-1, LEAD-3, ORCH-1, ORCH-2, ORCH-4, ORCH-5, BETTER-3. Postgres holds all state; there is no Redis (D-3). LEAD-2 is done.
    **Progress (2026-10-21):** LEAD-1, LEAD-3, ORCH-1, and ORCH-4 are done. ORCH-2 and BETTER-3 are partial. ORCH-5 is open.
 5. **Secure the API.** API-1, API-2.
 6. **Complete the campaign brain.** LEAD-4 to LEAD-10, COMP-3, COMP-4, COMP-5, COMP-8, COMP-10, DIAL-5 to DIAL-8, AGNT-4, AGNT-5.
 7. **Wire the routing engine.** D-1, then ROUT-1 to ROUT-4.
 8. **Own the media leg.** MEDIA-2, MEDIA-3, MEDIA-4, MEDIA-5, then MEDIA-1.
-9. **Close parity and differentiate.** OBS-1 to OBS-5, AGNT-6, API-4, API-5, BETTER-6 to BETTER-8.
+9. **Close parity and differentiate.** OBS-1 to OBS-5, AGNT-6, API-4, API-5, BETTER-6 (after DIAL-9 and DIAL-7), BETTER-7, BETTER-8.
 
 ---
 
@@ -664,6 +792,8 @@ real numbers yet. Do not dial real numbers before step 2 is done.
 | D-7 | When do we remove `livekit/sip`? | **Superseded by D-9 (2026-10-21):** remove it when the node carries the call through Kamailio and passes the same e2e tests. Old answer: After the drachtio and rtpengine path passes the same e2e tests (MEDIA-1). |
 | D-8 | How do the dialer nodes share the calls when Kubernetes runs several? | **Decided and built 2026-10-21:** through kine, the etcd API on Postgres. Each orchestrator replica is a node with a key in kine; one node holds the leader key and assigns each call to a node with free capacity; Postgres fences a node that lost a call (`PLAN.md` §0.10.8b). Postgres and kine are managed services (for example RDS): the product reaches them only by URL and waits for them with backoff, with no host checks. |
 | D-9 | Who carries the call (SIP and RTP)? | **Decided and built 2026-10-21 (proven in Docker Compose, see MEDIA-1):** agentdialer itself, inside the node process, with vendored libraries (`rsipstack`, `rustrtc`, `audio-codec`, parts of `rustpbx`). No Asterisk, FreeSWITCH, drachtio, rtpengine, or `livekit/sip` under it. Kamailio is the SIP edge (signaling load balancer, `Record-Route`). RTP goes straight between the carrier and the node, one socket per call, in `latching` or `public` (Elastic IP per pod) mode. No host networking (`PLAN.md` §0.0). Supersedes D-7. |
+| D-10 | How does the dialer pace customer-first calls, so that the agents join in time? | **Decided 2026-10-24:** a join-paced window for each agent pool, learned with AIMD from the join time of each call (DIAL-9). Both modes exist, as a setting of each campaign: `adaptive` (the default) and `strict`. Every limit value can change at run time through the API, with no restart: the target, the back-off, the first `K`, the largest `K`, and the mode. The defaults come from the 2 s rule: a target of 1.0 s and a back-off of 1.5 s. Built 2026-10-24 (DIAL-9 status). |
+| D-11 | Do we run a time server (chrony, ntpd) for the dialer? | **Decided and built 2026-10-24:** no. A pod cannot set the clock without `CAP_SYS_TIME`, and a change moves the clock of the whole node. On EKS the node keeps its clock (chrony, Amazon Time Sync), and the managed Postgres keeps its own. The roles take the time from Postgres plus the monotonic clock and do not depend on the OS clock (OPS-9). |
 
 ---
 
@@ -673,7 +803,9 @@ real numbers yet. Do not dial real numbers before step 2 is done.
 |---|---|---|
 | dograh | `dograh/api/services/campaign/` (`campaign_orchestrator.py`, `campaign_call_dispatcher.py`, `circuit_breaker.py`, `traffic_split.py`), `dograh/api/db/campaign_client.py`, `dograh/api/services/telephony/status_processor.py`, `dograh/api/services/call_concurrency/`, `dograh/api/services/telephony/providers/AGENTS.md` | Orchestrator, dispatch, slots, durable retries, terminal status, breaker, A/B, provider registry |
 | dograh agent side | `dograh/api/services/pipecat/answer_classification.py`, `processors/answer_supervisor.py`, `dograh/api/services/workflow/answer_handling.py`, `disposition_extraction.py` | Answer classes and actions, disposition extraction |
-| VICIdial | `vicidial/2026-06-15/bin/AST_VDhopper.pl`, `AST_VDauto_dial.pl`, `AST_VDadapt.pl`, `www/vicidial/functions.php` (`lookup_gmt`), `extras/MySQL_AST_CREATE_tables.sql` | Hopper, call times, holidays, recycle, DNC, timezone lookup, pacing, drop rate |
+| VICIdial | `vicidial/2026-06-15/bin/AST_VDhopper.pl`, `AST_VDauto_dial.pl`, `AST_VDadapt.pl` (`calculate_dial_level`), `www/vicidial/functions.php` (`lookup_gmt`), `extras/MySQL_AST_CREATE_tables.sql` | Hopper, call times, holidays, recycle, DNC, timezone lookup, adaptive pacing, drop rate |
+| dograh pacing | `dograh/api/services/call_concurrency/rate_limiter.py`, `dograh/api/services/observability/loop_lag.py`, `active_calls.py` | Fixed rate, slots, KEDA scaling from an offline load test |
+| LiveKit agents | `livekit_agents/livekit-agents/livekit/agents/worker.py` | Worker load threshold, warm processes |
 | FusionPBX | `fusionpbx/app/dialplans/resources/classes/dialplan.php`, `app/dialplans/resources/switch/conf/dialplan/*.xml`, `app/time_conditions/` | Dialplan model, reference dialplans, time conditions |
 | FreeSWITCH | `freeswitch/src/mod/dialplans/mod_dialplan_xml/mod_dialplan_xml.c` | Exact condition, break, anti-action, and continue semantics |
 | Alexor-Brain | `Alexor-Brain/campaign_worker.py`, `services/call_service.py`, `app.py` (LiveKit webhook), `postgresql_notifier.sql` | Eligibility, orphan cleanup, agent dispatch, terminal webhook |

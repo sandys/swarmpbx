@@ -1,0 +1,14 @@
+# An override for docker-compose.quickstart.yml: an ngrok TCP tunnel to
+# Kamailio's TCP socket, so that Twilio's <Dial><Sip> reaches the stack from
+# the internet without a public address (click-to-call,
+# e2e/run_twilio_c2c_e2e.sh). ngrok carries no UDP: the RTP goes straight
+# through the NAT, and Twilio must send it back to the address that it comes
+# from. The tunnel's address is on the ngrok API, http://ngrok:4040/api/tunnels
+# (the image's own config sets web_addr 0.0.0.0:4040).
+# An ngrok TCP endpoint needs a payment method on the ngrok account.
+services:
+  ngrok:
+    image: ngrok/ngrok:3.36.0-alpine
+    command: ["tcp", "10.20.0.10:5060", "--log", "stdout"]
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?set NGROK_AUTHTOKEN in .env}

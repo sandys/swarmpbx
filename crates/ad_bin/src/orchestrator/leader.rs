@@ -1,8 +1,11 @@
 //! The leader: one node schedules for the whole cluster while it holds
 //! `/agentdialer/leader`.
 //!
-//! - Dispatch: claim the due leads of a campaign, within the campaign cap and
-//!   the free capacity of the cluster, and re-gate them on compliance.
+//! - Dispatch: claim the due leads of a campaign, within the campaign cap, the
+//!   free capacity of the cluster, and the pacing window of the campaign's
+//!   agent pool, and re-gate them on compliance. The claim dials the customer
+//!   first only while the campaign's abandonment rate is at or under the cap;
+//!   else it starts the agent first.
 //! - Assign: one queue gives each new call to the node with the most free
 //!   capacity, at `AD_CALLS_PER_SEC`. The generation goes to Postgres first,
 //!   then the key to kine, so the old owner is fenced before a new one starts.
@@ -17,17 +20,21 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ad_agent::{AgentSpec, DialOrder};
 use ad_attempt::{AttemptEvent, NotDialedReason, Outcome};
+use ad_campaign::repo::CampaignRepo;
 use ad_cluster::{decode, keys, placement, Assignment, Mirror, NodeLoad};
+use ad_compliance::abandon::JurisdictionRule;
 use ad_compliance::dnc::DncSet;
 use ad_compliance::DenyReason;
 use ad_core::time::Clock;
 use ad_core::{AttemptId, CampaignId, LeadId};
-use ad_db::{ClaimedAttempt, LeadUpdate, PgEventConsumer};
+use ad_db::{ClaimRequest, ClaimedAttempt, LeadUpdate, PaceClaim, PgEventConsumer};
 use ad_dispatch::Pacer;
 use ad_events::{BreakerStore, CampaignEvent, Consumer, EventError};
 use ad_hopper::{select, ExcludeReason, Order, SelectionInput};
 use ad_orchestrator::{react, settle, ReactorAction};
+use ad_pacing::Mode;
 use tokio::sync::{mpsc, watch};
 
 use super::{every, warn_err, AbortOnDrop, Node};
@@ -56,6 +63,13 @@ pub(super) async fn serve(node: Arc<Node>, mut leading: watch::Receiver<bool>) {
             "leader: leadership lost; scheduling stopped"
         );
     }
+}
+
+/// How the next claims of a campaign dial: the dial order, and the pacing
+/// window of its agent pool (GAPS.md DIAL-9).
+struct Plan {
+    agent_on_answer: Option<u32>,
+    pace: Option<PaceClaim>,
 }
 
 /// A call to place on a node. `from` is the node that held it before.
@@ -242,13 +256,17 @@ impl Scheduler {
         }
     }
 
-    /// Claim the due leads of a campaign within the free capacity, gate them,
-    /// and queue them for a node. Complete the campaign when it is idle.
+    /// Claim the due leads of a campaign within the free capacity and the
+    /// pacing window of its agent pool, gate them, and queue them for a node.
+    /// Complete the campaign when it is idle.
     async fn dispatch(&self, campaign_id: CampaignId) -> anyhow::Result<()> {
         let node = &self.node;
         if self.pause_if_breaker_open(campaign_id).await? {
             return Ok(());
         }
+        let Some(plan) = self.plan(campaign_id).await else {
+            return Ok(());
+        };
         loop {
             let limit = node.settings.batch_limit.min(self.free());
             if limit <= 0 {
@@ -256,12 +274,16 @@ impl Scheduler {
             }
             let claimed = node
                 .attempts
-                .claim(
+                .claim_paced(
                     campaign_id,
-                    &node.name,
-                    limit,
-                    &node.settings.room_prefix,
-                    node.clock.now_utc(),
+                    &ClaimRequest {
+                        worker: &node.name,
+                        limit,
+                        room_prefix: &node.settings.room_prefix,
+                        now: node.clock.now_utc(),
+                        agent_on_answer: plan.agent_on_answer,
+                        pace: plan.pace.as_ref(),
+                    },
                 )
                 .await?;
             if claimed.is_empty() {
@@ -276,6 +298,83 @@ impl Scheduler {
                 return Ok(());
             }
         }
+    }
+
+    /// How the next claims of a campaign dial. `None` claims nothing: the
+    /// campaign cannot be read.
+    async fn plan(&self, campaign_id: CampaignId) -> Option<Plan> {
+        let node = &self.node;
+        let campaign = match node.db.campaigns().get(campaign_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(campaign = campaign_id.0, error = %e, "campaign read failed; no claim");
+                return None;
+            }
+        };
+        let Some(spec) = campaign
+            .agent
+            .as_ref()
+            .and_then(|a| AgentSpec::parse(a).ok())
+        else {
+            return Some(Plan {
+                agent_on_answer: None,
+                pace: None,
+            });
+        };
+        // 0 fails closed: the settings do not resolve, and the limit is 1.
+        let connect_within_ms = JurisdictionRule::CAMPAIGN.connect_within_ms().unwrap_or(0);
+        // A mode that cannot be read is the smaller window.
+        let mode = match node.db.pacing().mode(campaign_id).await {
+            Ok(m) => m?,
+            Err(e) => {
+                tracing::warn!(campaign = campaign_id.0, error = %e, "pacing mode read failed; strict");
+                Mode::Strict
+            }
+        };
+        let pool = spec.pool();
+        // The claim still uses the saved limit when this fails.
+        if let Err(e) = node.db.pacing().ingest(&pool, connect_within_ms).await {
+            tracing::warn!(pool, error = %e, "pacing samples not read");
+        }
+        Some(Plan {
+            agent_on_answer: self.agent_on_answer(campaign_id, &spec).await,
+            pace: Some(PaceClaim {
+                pool,
+                mode,
+                connect_within_ms,
+            }),
+        })
+    }
+
+    /// The agent's limit in milliseconds when the campaign dials the customer
+    /// first, or `None` for agent first. Fail closed: above the abandonment
+    /// cap, or when the ledger cannot be read, the dialer starts the agent
+    /// before the dial, which cannot abandon a call.
+    async fn agent_on_answer(&self, campaign_id: CampaignId, spec: &AgentSpec) -> Option<u32> {
+        let node = &self.node;
+        if spec.dial_order() != DialOrder::CustomerFirst {
+            return None;
+        }
+        let rule = JurisdictionRule::CAMPAIGN;
+        let since = node.clock.now_utc() - rule.window();
+        let counts = match node.attempts.abandon_counts(campaign_id, since).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(campaign = campaign_id.0, error = %e, "ledger read failed; agent first");
+                return None;
+            }
+        };
+        if !rule.allows_customer_first(&counts) {
+            tracing::warn!(
+                campaign = campaign_id.0,
+                rule = rule.name(),
+                answered = counts.answered,
+                abandoned = counts.abandoned,
+                "abandonment rate above the cap; agent first"
+            );
+            return None;
+        }
+        rule.connect_within_ms()
     }
 
     async fn pause_if_breaker_open(&self, campaign_id: CampaignId) -> anyhow::Result<bool> {
@@ -315,7 +414,7 @@ impl Scheduler {
         let node = &self.node;
         let dnc = DncSet::default();
         let selection = select(
-            &node.clock,
+            node.clock.as_ref(),
             SelectionInput {
                 leads: claimed.iter().map(|c| c.lead.clone()).collect(),
                 windows: &node.settings.windows,
@@ -444,6 +543,17 @@ impl Scheduler {
         let node = &self.node;
         for id in node.attempts.unsettled(PASS_LIMIT).await? {
             warn_err(self.settle(id).await, "settle");
+        }
+        // Keep the state of every pool current, also of a campaign that
+        // stopped (the API shows it).
+        let connect_within_ms = JurisdictionRule::CAMPAIGN.connect_within_ms().unwrap_or(0);
+        for pool in warn_err(node.db.pacing().pools_with_samples().await, "pacing pools")
+            .unwrap_or_default()
+        {
+            warn_err(
+                node.db.pacing().ingest(&pool, connect_within_ms).await,
+                "pacing ingest",
+            );
         }
         self.repair().await?;
         for campaign in node.db.campaigns().list_running().await? {

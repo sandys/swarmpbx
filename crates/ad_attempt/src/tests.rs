@@ -276,6 +276,7 @@ fn the_dial_waits_for_the_agent() {
 
     let ready = with_agent_ready();
     assert!(ready.can_dial());
+    assert_eq!(ready.agent_started_at, Some(t(0)));
     assert_eq!(ready.agent_ready_at, Some(t(1)));
     let dialing = apply(&ready, &AttemptEvent::DialStarted { at: t(2) }).unwrap();
     assert_eq!(dialing.leg.name(), "dialing");
@@ -387,6 +388,141 @@ fn agent_events_do_not_apply_without_an_agent() {
     }
 }
 
+/// A customer-first attempt that the callee answered at t(5), with a 2 s limit.
+fn answered_customer_first() -> Attempt {
+    replay(
+        Attempt::with_agent_on_answer(2000),
+        &[
+            AttemptEvent::DialStarted { at: t(0) },
+            AttemptEvent::Answered { at: t(5) },
+            AttemptEvent::AgentStarting {
+                at: t(5),
+                detail: "dispatch".into(),
+            },
+        ],
+    )
+    .unwrap()
+}
+
+fn ms(s: i64, ms: i64) -> DateTime<Utc> {
+    t(s) + Duration::milliseconds(ms)
+}
+
+#[test]
+fn customer_first_dials_before_the_agent_starts() {
+    let a = Attempt::with_agent_on_answer(2000);
+    assert!(a.can_dial());
+    let starting = AttemptEvent::AgentStarting {
+        at: t(0),
+        detail: "".into(),
+    };
+    assert!(apply(&a, &starting).is_err(), "no agent before the answer");
+    let dialing = apply(&a, &AttemptEvent::DialStarted { at: t(0) }).unwrap();
+    assert!(
+        apply(&dialing, &starting).is_err(),
+        "no agent while it rings"
+    );
+}
+
+#[test]
+fn customer_first_agent_in_time_carries_the_call() {
+    let ready = apply(
+        &answered_customer_first(),
+        &AttemptEvent::AgentReady {
+            at: ms(7, 0),
+            identity: "agent-1".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(ready.leg.name(), "connected");
+    assert_eq!(ready.agent_started_at, Some(t(5)));
+    assert_eq!(ready.agent_ready_at, Some(t(7)));
+    let ended = apply(&ready, &AttemptEvent::AgentLeft { at: t(60) }).unwrap();
+    assert_eq!(ended.outcome().unwrap().class(), "completed");
+}
+
+#[test]
+fn customer_first_late_agent_abandons_the_call() {
+    let late = apply(
+        &answered_customer_first(),
+        &AttemptEvent::AgentReady {
+            at: ms(7, 1),
+            identity: "agent-1".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        late.outcome(),
+        Some(&Outcome::Abandoned {
+            detail: "the agent joined 2001 ms after the answer; the limit is 2000 ms".into()
+        })
+    );
+}
+
+#[test]
+fn customer_first_no_agent_abandons_the_call() {
+    for start in [
+        answered_customer_first(),
+        replay(
+            Attempt::with_agent_on_answer(2000),
+            &[
+                AttemptEvent::DialStarted { at: t(0) },
+                AttemptEvent::Answered { at: t(5) },
+            ],
+        )
+        .unwrap(),
+    ] {
+        let failed = apply(
+            &start,
+            &AttemptEvent::AgentFailed {
+                at: t(7),
+                detail: "no agent in the room 2000 ms after the answer".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(failed.agent.name(), "failed");
+        assert_eq!(failed.outcome().unwrap().class(), "abandoned");
+        let absent = apply(&start, &AttemptEvent::Absent { at: t(6) }).unwrap();
+        assert_eq!(absent.outcome().unwrap().class(), "abandoned");
+    }
+}
+
+#[test]
+fn customer_first_hangup_before_the_limit_is_not_abandoned() {
+    let hangup = |at| {
+        apply(
+            &answered_customer_first(),
+            &AttemptEvent::Hangup {
+                at,
+                detail: "the callee hung up".into(),
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        hangup(ms(6, 0)).outcome(),
+        Some(&Outcome::Completed {
+            detail: "the callee hung up before the agent joined".into()
+        })
+    );
+    assert_eq!(hangup(ms(7, 1)).outcome().unwrap().class(), "abandoned");
+}
+
+#[test]
+fn customer_first_without_a_limit_fails_closed() {
+    let mut a = answered_customer_first();
+    a.agent_within_ms = None;
+    let ready = apply(
+        &a,
+        &AttemptEvent::AgentReady {
+            at: t(5),
+            identity: "agent-1".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(ready.outcome().unwrap().class(), "abandoned");
+}
+
 #[test]
 fn an_old_snapshot_without_the_agent_region_still_reads() {
     let old = serde_json::json!({
@@ -438,7 +574,11 @@ fn any_event() -> impl Strategy<Value = AttemptEvent> {
 }
 
 fn any_start() -> impl Strategy<Value = Attempt> {
-    prop_oneof![Just(Attempt::default()), Just(Attempt::with_agent())]
+    prop_oneof![
+        Just(Attempt::default()),
+        Just(Attempt::with_agent()),
+        Just(Attempt::with_agent_on_answer(2000)),
+    ]
 }
 
 /// Apply every event that applies; return the end state and the applied ones.
@@ -511,6 +651,38 @@ proptest! {
             if a.dialed_at.is_some() {
                 prop_assert!(a.agent_ready_at.is_some());
             }
+        }
+    }
+
+    // Customer first: a call never stays connected with an agent that came
+    // late, and an answered call that ends with no agent is abandoned or
+    // ended by the callee in time.
+    #[test]
+    fn customer_first_never_carries_a_late_agent(
+        events in proptest::collection::vec(any_event(), 0..30)
+    ) {
+        let (a, _) = run_all(&Attempt::with_agent_on_answer(2000), &events);
+        if let (Leg::Connected { .. }, AgentLeg::Ready { since }) = (&a.leg, &a.agent) {
+            prop_assert!(*since <= a.agent_due().unwrap());
+        }
+        if let (Some(outcome), Some(_), None) = (a.outcome(), a.answered_at, a.agent_ready_at) {
+            prop_assert!(
+                matches!(outcome, Outcome::Abandoned { .. })
+                    || outcome.detail().ends_with("before the agent joined"),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    // Only an answered call can be abandoned.
+    #[test]
+    fn abandoned_only_after_an_answer(
+        start in any_start(),
+        events in proptest::collection::vec(any_event(), 0..30)
+    ) {
+        let (a, _) = run_all(&start, &events);
+        if let Some(Outcome::Abandoned { .. }) = a.outcome() {
+            prop_assert!(a.answered_at.is_some());
         }
     }
 }
