@@ -1,7 +1,8 @@
 //! Lead API: bulk-load a campaign's contact list, and list a campaign's leads.
 //!
 //!   POST /v1/campaigns/:id/leads   bulk load (201), 404 if campaign missing,
-//!                                   400 if any phone_number is empty
+//!                                   400 with a report of each lead that
+//!                                   `ad_contact` refuses
 //!   GET  /v1/campaigns/:id/leads   list the campaign's leads
 
 use std::collections::BTreeMap;
@@ -41,6 +42,10 @@ pub struct NewLeadDto {
 #[derive(Debug, Deserialize)]
 pub struct BulkLoadRequest {
     pub leads: Vec<NewLeadDto>,
+    /// The country (ISO 3166, for example `US`) of a number without a
+    /// country code.
+    #[serde(default)]
+    pub default_region: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,10 +90,52 @@ pub struct BulkLoadResponse {
 #[derive(Debug, Serialize)]
 pub struct ErrorDto {
     pub error: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<Rejected>,
+}
+
+/// A lead that the load refuses.
+#[derive(Debug, Serialize)]
+pub struct Rejected {
+    pub index: usize,
+    pub phone_number: String,
+    pub reason: String,
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorDto>) {
-    (status, Json(ErrorDto { error: msg.into() }))
+    (
+        status,
+        Json(ErrorDto {
+            error: msg.into(),
+            rejected: Vec::new(),
+        }),
+    )
+}
+
+/// A lead in the form that the dialer keeps: the number in E.164 and the
+/// postal code in the standard form of the number's country.
+fn new_lead(
+    cid: CampaignId,
+    dto: NewLeadDto,
+    region: Option<&str>,
+) -> Result<NewLead, (String, String)> {
+    let refuse =
+        |dto: &NewLeadDto, e: &dyn std::fmt::Display| (dto.phone_number.clone(), e.to_string());
+    let phone = ad_contact::dialable(&dto.phone_number, region).map_err(|e| refuse(&dto, &e))?;
+    let postal_code = match dto.postal_code.as_deref() {
+        Some(raw) => Some(
+            ad_contact::postal_code(raw, phone.region.as_deref()).map_err(|e| refuse(&dto, &e))?,
+        ),
+        None => None,
+    };
+    Ok(NewLead {
+        campaign_id: cid,
+        phone_number: phone.e164.into_string(),
+        timezone: dto.timezone,
+        state: dto.state,
+        postal_code,
+        context: dto.context,
+    })
 }
 
 async fn bulk_load(
@@ -108,22 +155,27 @@ async fn bulk_load(
     if req.leads.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "leads must not be empty"));
     }
+    let region = req.default_region.as_deref();
     let mut new = Vec::with_capacity(req.leads.len());
-    for (i, dto) in req.leads.into_iter().enumerate() {
-        if dto.phone_number.trim().is_empty() {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!("lead {i}: phone_number is empty"),
-            ));
+    let mut rejected = Vec::new();
+    for (index, dto) in req.leads.into_iter().enumerate() {
+        match new_lead(cid, dto, region) {
+            Ok(lead) => new.push(lead),
+            Err((phone_number, reason)) => rejected.push(Rejected {
+                index,
+                phone_number,
+                reason,
+            }),
         }
-        new.push(NewLead {
-            campaign_id: cid,
-            phone_number: dto.phone_number,
-            timezone: dto.timezone,
-            state: dto.state,
-            postal_code: dto.postal_code,
-            context: dto.context,
-        });
+    }
+    if !rejected.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorDto {
+                error: format!("{} leads refused; no lead was loaded", rejected.len()),
+                rejected,
+            }),
+        ));
     }
 
     let created = state

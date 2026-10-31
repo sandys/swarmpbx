@@ -75,7 +75,7 @@ fn app_with(attempts: PgAttemptRepo, db: Option<&Db>) -> axum::Router {
         None => AppState::new(Arc::new(SystemClock)),
     };
     state.webhooks = Some(Webhooks {
-        verifier: WebhookVerifier::new(KEY, SECRET),
+        verifier: WebhookVerifier::new(KEY, SECRET, Arc::new(SystemClock)),
         attempts,
     });
     router(state)

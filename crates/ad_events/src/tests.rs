@@ -40,6 +40,18 @@ fn every_variant(campaign_id: i64) -> Vec<CampaignEvent> {
             campaign_id,
             failure_rate: 0.5,
         },
+        CampaignEvent::AgentPoolTripped {
+            campaign_id,
+            pool: "livekit:sales".into(),
+            failed_in_row: 5,
+            attempt_ids: vec![1, 2, 3, 4, 5],
+        },
+        CampaignEvent::AgentOutcome {
+            campaign_id,
+            attempt_id: 7,
+            disposition: Some("SALE".into()),
+            dnc: false,
+        },
         CampaignEvent::CampaignCompleted { campaign_id },
     ]
 }

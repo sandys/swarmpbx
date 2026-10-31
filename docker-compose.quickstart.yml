@@ -59,6 +59,10 @@ services:
   agent:
     build:
       context: e2e/agents/livekit
+      # The client of the session stream: the proto and agent_session.py.
+      additional_contexts:
+        proto: proto
+        session: e2e/agents/session
     image: ad-e2e-livekit-agent
     environment:
       LIVEKIT_URL: ws://livekit:7880
@@ -101,10 +105,13 @@ services:
     command: ["api"]
     environment:
       - AD_API_ADDR=0.0.0.0:8080
+      - AD_SESSION_ADDR=0.0.0.0:9090
       - DATABASE_URL=postgres://ad:ad@postgres:5432/ad
       - RUST_LOG=info
     ports:
       - "127.0.0.1:8080:8080"
+      # The agent session stream (gRPC).
+      - "127.0.0.1:9090:9090"
 
   node:
     build: .
@@ -128,6 +135,8 @@ services:
       - AD_TWILIO_API_SECRET=${AD_TWILIO_API_SECRET:-}
       - AD_TWILIO_SIP_URI=${AD_TWILIO_SIP_URI:-}
       - AD_ETCD_ENDPOINTS=http://kine:2379
+      # The URL of the session stream that your agent reaches.
+      - AD_SESSION_URL=${AD_SESSION_URL:-http://api:9090}
       - AD_ROOM_PREFIX=call
       - AD_NODE_CAPACITY=10
       - RUST_LOG=info

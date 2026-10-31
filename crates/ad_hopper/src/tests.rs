@@ -70,8 +70,20 @@ fn eligible_lead_inside_window_is_selected() {
 fn only_new_and_queued_leads_pass_the_status_gate() {
     let input = SelectionInput {
         leads: vec![
-            lead(1, LeadStatus::Done, 0, Some("America/New_York"), "+1a"),
-            lead(2, LeadStatus::Dnc, 0, Some("America/New_York"), "+1b"),
+            lead(
+                1,
+                LeadStatus::Done,
+                0,
+                Some("America/New_York"),
+                "+13125550201",
+            ),
+            lead(
+                2,
+                LeadStatus::Dnc,
+                0,
+                Some("America/New_York"),
+                "+13125550202",
+            ),
             // A dispositioned lead dials again only through a retry, recycle,
             // or callback rule (GAPS.md LEAD-3).
             lead(
@@ -79,10 +91,16 @@ fn only_new_and_queued_leads_pass_the_status_gate() {
                 LeadStatus::Dispositioned,
                 1,
                 Some("America/New_York"),
-                "+1c",
+                "+13125550203",
             ),
-            lead(4, LeadStatus::InCall, 0, Some("America/New_York"), "+1d"),
-            lead(5, LeadStatus::Blocked, 0, None, "+1e"),
+            lead(
+                4,
+                LeadStatus::InCall,
+                0,
+                Some("America/New_York"),
+                "+13125550204",
+            ),
+            lead(5, LeadStatus::Blocked, 0, None, "+13125550205"),
         ],
         windows: &windows(),
         dnc: &DncSet::default(),
@@ -102,7 +120,13 @@ fn only_new_and_queued_leads_pass_the_status_gate() {
 #[test]
 fn call_count_cap_excludes() {
     let input = SelectionInput {
-        leads: vec![lead(1, LeadStatus::New, 3, Some("America/New_York"), "+1a")],
+        leads: vec![lead(
+            1,
+            LeadStatus::New,
+            3,
+            Some("America/New_York"),
+            "+13125550201",
+        )],
         windows: &windows(),
         dnc: &DncSet::default(),
         call_count_limit: Some(3),
@@ -116,7 +140,7 @@ fn call_count_cap_excludes() {
 #[test]
 fn unknown_timezone_excluded_fail_closed() {
     let input = SelectionInput {
-        leads: vec![lead(1, LeadStatus::New, 0, None, "+1a")],
+        leads: vec![lead(1, LeadStatus::New, 0, None, "+13125550201")],
         windows: &windows(),
         dnc: &DncSet::default(),
         call_count_limit: None,
@@ -132,15 +156,14 @@ fn unknown_timezone_excluded_fail_closed() {
 
 #[test]
 fn dnc_number_excluded() {
-    let mut dnc = DncSet::default();
-    dnc.system.insert("18005551234".into());
+    let dnc = DncSet::from_lists(&["+18005551234".into()], &[], &[]).unwrap();
     let input = SelectionInput {
         leads: vec![lead(
             1,
             LeadStatus::New,
             0,
             Some("America/New_York"),
-            "1-800-555-1234",
+            "+1-800-555-1234",
         )],
         windows: &windows(),
         dnc: &dnc,
@@ -162,12 +185,24 @@ fn routing_rule_excludes_a_lead() {
         Detail::condition("state", "^TX$", 0, 0),
         Detail::action("skip", "", 0, 10),
     ]);
-    let mut tx_lead = lead(2, LeadStatus::New, 0, Some("America/New_York"), "+1tx");
+    let mut tx_lead = lead(
+        2,
+        LeadStatus::New,
+        0,
+        Some("America/New_York"),
+        "+12145550207",
+    );
     tx_lead.state = Some("TX".into());
     let input = SelectionInput {
         leads: vec![
-            lead(1, LeadStatus::New, 0, Some("America/New_York"), "+1ny"), // NY -> eligible
-            tx_lead,                                                       // TX -> skipped
+            lead(
+                1,
+                LeadStatus::New,
+                0,
+                Some("America/New_York"),
+                "+12125550206",
+            ), // NY -> eligible
+            tx_lead, // TX -> skipped
         ],
         windows: &windows(),
         dnc: &DncSet::default(),
@@ -189,9 +224,27 @@ fn routing_rule_excludes_a_lead() {
 fn up_count_ordering_fresh_first() {
     let input = SelectionInput {
         leads: vec![
-            lead(1, LeadStatus::New, 2, Some("America/New_York"), "+1a"),
-            lead(2, LeadStatus::New, 0, Some("America/New_York"), "+1b"),
-            lead(3, LeadStatus::New, 1, Some("America/New_York"), "+1c"),
+            lead(
+                1,
+                LeadStatus::New,
+                2,
+                Some("America/New_York"),
+                "+13125550201",
+            ),
+            lead(
+                2,
+                LeadStatus::New,
+                0,
+                Some("America/New_York"),
+                "+13125550202",
+            ),
+            lead(
+                3,
+                LeadStatus::New,
+                1,
+                Some("America/New_York"),
+                "+13125550203",
+            ),
         ],
         windows: &windows(),
         dnc: &DncSet::default(),
@@ -209,9 +262,27 @@ fn up_count_ties_break_by_id_ascending() {
     // All same call_count -> stable tie-break by id ascending.
     let input = SelectionInput {
         leads: vec![
-            lead(3, LeadStatus::New, 5, Some("America/New_York"), "+1c"),
-            lead(1, LeadStatus::New, 5, Some("America/New_York"), "+1a"),
-            lead(2, LeadStatus::New, 5, Some("America/New_York"), "+1b"),
+            lead(
+                3,
+                LeadStatus::New,
+                5,
+                Some("America/New_York"),
+                "+13125550203",
+            ),
+            lead(
+                1,
+                LeadStatus::New,
+                5,
+                Some("America/New_York"),
+                "+13125550201",
+            ),
+            lead(
+                2,
+                LeadStatus::New,
+                5,
+                Some("America/New_York"),
+                "+13125550202",
+            ),
         ],
         windows: &windows(),
         dnc: &DncSet::default(),
@@ -231,8 +302,20 @@ fn up_count_ties_break_by_id_ascending() {
 fn oldest_order_is_id_ascending_ignoring_call_count() {
     let input = SelectionInput {
         leads: vec![
-            lead(2, LeadStatus::New, 0, Some("America/New_York"), "+1b"),
-            lead(1, LeadStatus::New, 9, Some("America/New_York"), "+1a"),
+            lead(
+                2,
+                LeadStatus::New,
+                0,
+                Some("America/New_York"),
+                "+13125550202",
+            ),
+            lead(
+                1,
+                LeadStatus::New,
+                9,
+                Some("America/New_York"),
+                "+13125550201",
+            ),
         ],
         windows: &windows(),
         dnc: &DncSet::default(),
@@ -261,7 +344,7 @@ fn routing_rule_that_does_not_match_leaves_lead_eligible() {
             LeadStatus::New,
             0,
             Some("America/New_York"),
-            "+1ny",
+            "+12125550206",
         )],
         windows: &windows(),
         dnc: &DncSet::default(),
@@ -276,7 +359,13 @@ fn routing_rule_that_does_not_match_leaves_lead_eligible() {
 
 #[test]
 fn every_lead_appears_exactly_once_across_eligible_and_excluded() {
-    let mut tx_lead = lead(4, LeadStatus::New, 0, Some("America/New_York"), "+1tx");
+    let mut tx_lead = lead(
+        4,
+        LeadStatus::New,
+        0,
+        Some("America/New_York"),
+        "+12145550207",
+    );
     tx_lead.state = Some("TX".into());
     let rs = Ruleset::new(vec![
         Detail::condition("state", "^TX$", 0, 0),
@@ -284,10 +373,22 @@ fn every_lead_appears_exactly_once_across_eligible_and_excluded() {
     ]);
     let input = SelectionInput {
         leads: vec![
-            lead(1, LeadStatus::New, 0, Some("America/New_York"), "+1ok"), // eligible
-            lead(2, LeadStatus::Done, 0, Some("America/New_York"), "+1done"), // status
-            lead(3, LeadStatus::New, 0, None, "+1notz"),                   // compliance
-            tx_lead,                                                       // routing
+            lead(
+                1,
+                LeadStatus::New,
+                0,
+                Some("America/New_York"),
+                "+13125550209",
+            ), // eligible
+            lead(
+                2,
+                LeadStatus::Done,
+                0,
+                Some("America/New_York"),
+                "+13125550210",
+            ), // status
+            lead(3, LeadStatus::New, 0, None, "+1notz"), // compliance
+            tx_lead,                                     // routing
         ],
         windows: &windows(),
         dnc: &DncSet::default(),

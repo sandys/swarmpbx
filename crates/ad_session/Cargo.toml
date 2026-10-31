@@ -1,0 +1,27 @@
+[package]
+name = "ad_session"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ad_core = { path = "../ad_core" }
+ad_db = { path = "../ad_db" }
+ad_disposition = { path = "../ad_disposition" }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+rand = "0.8"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+serde_json = { workspace = true }

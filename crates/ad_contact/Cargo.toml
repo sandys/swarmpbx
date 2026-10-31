@@ -1,0 +1,17 @@
+[package]
+name = "ad_contact"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+# libphonenumber in Rust, with the libphonenumber 9.0.33 metadata. A new copy
+# changes which numbers are valid (vendor/VENDORED.md).
+phonenumber = { path = "../../vendor/phonenumber" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+proptest = { workspace = true }

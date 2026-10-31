@@ -37,9 +37,24 @@ place.
 - Stop each stack when you finish (`down -v`).
 
 CAUTION: Do not use AgentDialer for production calls to real people yet.
-Production dialing uses a 24-hour call window and an empty DNC list
-(`GAPS.md` COMP-1). The API has no authentication (API-1), so do not put it on
-a public network.
+Production dialing uses a 24-hour call window (`GAPS.md` COMP-1). The DNC list
+holds only the entries that you and the agents add. No national list is
+loaded (COMP-8). The API has no authentication (API-1), so do not put it on a
+public network.
+
+## How a lead moves
+
+```
+new or queued -> the leader claims it (in_call)
+  -> the gate: the DNC list, the timezone, the calling window
+  -> the dial -> the call ends -> the agent reports, or not
+  -> the leader settles it: dispositioned, done, dnc, blocked,
+     or queued for a retry or a callback
+```
+
+README "Architecture" has a diagram for each step: "Before the dial: the
+claim and the gate", "One call, step by step", and "After the call: the
+settlement".
 
 ## 1. Select the trunk
 
@@ -96,6 +111,7 @@ The `agent` object (the `connect-an-agent` skill has the full contract):
 | `start_url` | `pipecat` only: the `http` or `https` URL of your bot server's start endpoint. |
 | `dial_order` | `customer_first` (the default) or `agent_first`. |
 | `join_timeout_s` | `agent_first`: how long the dialer waits for the agent before it dials. 1 to 300, default 20. |
+| `outcome_wait_s` | How long the dialer waits for the agent's outcome after an answered call ends. 0 to 600, default 30. |
 | `metadata` | Any JSON. The agent gets it with each call. |
 
 The API refuses an unknown field in `agent` (HTTP 400).
@@ -109,13 +125,14 @@ scripts/api.sh POST /v1/campaigns \
 
 ## 4. Load leads
 
-`POST /v1/campaigns/:id/leads` with `{"leads": [...]}`:
+`POST /v1/campaigns/:id/leads` with `{"leads": [...], "default_region": "US"}`.
+`default_region` (ISO 3166) is the country of a number without a country code.
 
 | Field | Need | Meaning |
 |---|---|---|
-| `phone_number` | required | E.164: `+` and the country code. The API refuses an empty number. A trunk refuses other forms (Twilio answers SIP 400). |
+| `phone_number` | required | Any common form: `+1 202 555 0123`, or `(202) 555-0123` with a `default_region`. The dialer keeps it in E.164 (`+12025550123`). The number must be one that the numbering plan assigns. |
 | `timezone` | required to dial | An IANA name, for example `America/New_York`. A lead without one does not dial, because compliance fails closed (COMP-2). |
-| `state`, `postal_code` | optional | Saved with the lead. |
+| `state`, `postal_code` | optional | Saved with the lead. A US or Canadian postal code gets its standard form (`12345-6789`, `K1A 0B1`). |
 | `context` | optional | A map of strings. The agent gets it as `lead.context`. Put the name of the person and the facts that the agent needs here. |
 
 ```bash
@@ -123,6 +140,13 @@ scripts/api.sh POST /v1/campaigns/1/leads \
   '{"leads": [{"phone_number": "+12025550123", "timezone": "America/New_York",
                "context": {"first_name": "Ada", "plan": "gold"}}]}'
 ```
+
+If one lead is bad, the API loads no lead. It answers HTTP 400 with a report
+of each bad lead: `{"error", "rejected": [{"index", "phone_number",
+"reason"}]}`. Correct those leads, and send the list again.
+
+The phone numbers and the postal codes go through one module,
+`crates/ad_contact`. To use another phone library, change it there.
 
 ## 5. Start, pause, and resume
 
@@ -149,9 +173,11 @@ scripts/api.sh GET /v1/campaigns/1/leads  # the status and called_count of each 
 ```
 
 Useful log lines of the node: `call assigned`, `lead not dialed`,
-`agent in the room after the answer`, `call ended`, `attempt settled`,
-`abandonment rate above the cap; agent first`, `breaker open; campaign paused`,
-`campaign completed`, and `the OS clock is off`.
+`a participant joined the room`, `agent in the room after the answer`,
+`call ended`, `attempt settled`, `abandonment rate above the cap; agent
+first`, `breaker open; campaign paused`, `campaign completed`, and `the OS
+clock is off`. The `api` log shows `agent session open` and `agent outcome`
+for each agent that reports.
 
 The status of a lead:
 
@@ -164,8 +190,15 @@ The status of a lead:
 | `dnc` | On a do-not-call list. |
 | `blocked` | Cannot dial until its data changes, for example a lead with no timezone. |
 
-Each call is a row in `call_attempts`. No API endpoint lists the calls yet.
-Read them with `psql` in a container on the stack network:
+The calls and the events of a campaign, in pages (`?after=<id>&limit=<n>`):
+
+```bash
+scripts/api.sh GET /v1/campaigns/1/attempts   # each call: outcome, sip_code, disposition, agent_outcome
+scripts/api.sh GET /v1/campaigns/1/events     # campaign events, for example agent_pool_tripped
+```
+
+Each call is a row in `call_attempts`. To read more columns, use `psql` in a
+container on the stack network:
 
 ```bash
 docker run --rm --network agentdialer-quickstart_default postgres:16-alpine \
@@ -181,12 +214,12 @@ The outcome of a call:
 
 | Outcome | Meaning | Next step |
 |---|---|---|
-| `completed` | The callee answered, and the call ended. | None. The agent cannot report a disposition yet (DIAL-1, AGNT-2). |
+| `completed` | The callee answered, and the call ended. | The agent's outcome decides (below). |
 | `busy`, `no_answer` | The SIP code of the callee. | The dialer retries (see below). |
 | `declined` | The callee refused the call. | None. The dialer does not call the lead again. |
 | `invalid_number` | The trunk refused the number. | Correct the number. The lead is `done`. |
 | `failed` | The trunk or the carrier failed the call. `sip_code` and `detail` tell why. | Read "If a call fails" in the README section of the trunk. |
-| `abandoned` | The callee answered, and no agent was in the room 2 s later. | Make the agent faster, or use `agent_first`. See section 8. |
+| `abandoned` | The callee answered, and no agent was in the room 2 s later. | Make the agent faster, or use `agent_first`. See section 9. |
 | `setup_error` | The dial request did not reach the trunk. No call exists. | Read the node log. The dialer retries. |
 | `uncertain` | The dialer did not learn the result. | Read the node log. The dialer retries. |
 | `not_dialed` | The dialer did not dial. `detail` gives the reason. | See the next table. |
@@ -201,21 +234,53 @@ The reason of a `not_dialed` call:
 | DNC | Sets the lead to `dnc`. |
 | A rule or a limit excludes the lead | Sets the lead to `done`. |
 
-## 7. Retries and the breaker
+The agent reports the result of the talk on the session stream (the
+`connect-an-agent` skill, "Report the outcome"). The dialer keeps it in
+`disposition` and `agent_outcome`:
+
+| The agent reports | The lead |
+|---|---|
+| A DNC request, or the code `DNC` | `dnc`. The number goes on the DNC list. |
+| `CALLBK` with a time | `queued` until that time, before the other leads. |
+| `AM`, or a machine answer | A voicemail retry. |
+| Any other code | `dispositioned`. |
+| Nothing in `outcome_wait_s` | Settled by the call result. |
+
+If an attempt has no `disposition`, read the `api` log. No `agent session
+open` line means that the agent did not reach `AD_SESSION_URL`.
+
+The disposition codes: `scripts/api.sh GET /v1/campaigns/1/dispositions`. To
+add campaign codes, `PUT` a list of `{"code", "name", "flags"}`. The flags
+are `human_answered`, `sale`, `customer_contact`, `not_interested`,
+`unworkable`, `scheduled_callback`, `completed`, `answering_machine`, and
+`dnc`. A campaign code must not use a system code.
+
+## 7. The DNC list
+
+| Request | What it does |
+|---|---|
+| `POST /v1/dnc` `{"phone_number", "scope", "campaign_id", "region", "note"}` | Adds a number. `scope` is `system` (the default, every campaign) or `campaign` (with `campaign_id`). Every waiting lead with that number stops at once. |
+| `GET /v1/dnc?campaign_id=1` | The system list and the list of campaign 1, newest first. |
+| `DELETE /v1/dnc/:id` | Removes an entry. A lead that stopped stays `dnc`. |
+
+The dialer checks the list again before each dial. If it cannot read the
+list, it does not dial (fail closed).
+
+## 8. Retries and the breaker
 
 - A lead gets at most 3 calls. The wait before the next call is 5 min after
-  `busy`, 30 min after `no_answer`, and 15 min after `failed`, `abandoned`,
-  `setup_error`, or `uncertain`. After the third call, the lead is
-  `dispositioned`. No setting changes this yet
+  `busy`, 30 min after `no_answer`, 60 min after a machine answer, and 15 min
+  after `failed`, `abandoned`, `setup_error`, or `uncertain`. After the third
+  call, the lead is `dispositioned`. No setting changes this yet
   (`crates/ad_orchestrator/src/retry.rs`).
-- `completed` and `declined` end the lead (`dispositioned`). There is no
-  callback or recycle rule yet.
+- `completed` and `declined` end the lead (`dispositioned`), unless the agent
+  asked for a callback or a voicemail retry. There is no recycle rule yet.
 - The retry of an `abandoned` lead dials agent first.
 - The breaker pauses a campaign when at least 5 calls ended in the last
   2 min, and more than half of them are `failed`, `setup_error`, or
   `uncertain`. Correct the cause, and then send `resume`.
 
-## 8. Select the dial order and the pacing
+## 9. Select the dial order and the pacing
 
 **The dial order** (`agent.dial_order`):
 
@@ -252,7 +317,7 @@ If the campaign dials one call at a time, read `recent.p95_ms` in the pacing
 answer. The agents take too long to join. Keep the agent workers ready for a
 job (the `connect-an-agent` skill).
 
-## 9. Stop
+## 10. Stop
 
 ```bash
 $QS down -v
@@ -262,10 +327,11 @@ e2e/twilio/run.sh teardown          # optional: delete the trunk and its credent
 
 ## Limits to tell the user
 
-- Compliance data: a 24-hour window and an empty DNC list (COMP-1).
+- Compliance data: a 24-hour window (COMP-1). The DNC list holds only what
+  the API and the agents put in it. No national DNC list is loaded.
 - No authentication on the API (API-1).
 - No answering-machine detection. Each answer counts as a human answer.
-- No disposition from the agent, and no reports or dashboard.
+- No reports or dashboard.
 - No call rate for each campaign or each trunk. `AD_CALLS_PER_SEC` limits the
   whole cluster.
 - A LiveKit phone number takes incoming calls only. The quickstart calls stay

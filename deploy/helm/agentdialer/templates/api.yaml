@@ -25,9 +25,13 @@ spec:
           ports:
             - name: http
               containerPort: {{ .Values.api.port }}
+            - name: session
+              containerPort: {{ .Values.api.sessionPort }}
           env:
             - name: AD_API_ADDR
               value: "0.0.0.0:{{ .Values.api.port }}"
+            - name: AD_SESSION_ADDR
+              value: "0.0.0.0:{{ .Values.api.sessionPort }}"
             {{- include "agentdialer.dbEnv" . | nindent 12 }}
             {{- include "agentdialer.livekitKeysEnv" . | nindent 12 }}
           readinessProbe:
@@ -61,6 +65,10 @@ spec:
     - name: http
       port: {{ .Values.api.port }}
       targetPort: http
+    - name: session
+      port: {{ .Values.api.sessionPort }}
+      targetPort: session
+      appProtocol: grpc
 {{- if .Values.api.hpa.enabled }}
 ---
 apiVersion: autoscaling/v2

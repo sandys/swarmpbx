@@ -120,13 +120,58 @@ async fn check_denied_dnc_hit() {
             "timezone": "America/New_York",
             "phone_number": "+1-800-555-1234",
             "uniform_window": { "start_hhmm": 900, "stop_hhmm": 2100 },
-            "dnc": { "system": ["18005551234"] }
+            "dnc": { "system": ["+18005551234"] }
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["allowed"], false);
     assert_eq!(v["reason"], "dnc");
+}
+
+#[tokio::test]
+async fn check_dnc_matches_another_form_and_refuses_an_entry_that_does_not_read() {
+    let app = app_at(2026, 6, 1, 15, 0);
+    let req = |entry: &str| {
+        json!({
+            "timezone": "America/New_York",
+            "phone_number": "+13125550100",
+            "uniform_window": { "start_hhmm": 900, "stop_hhmm": 2100 },
+            "dnc": { "campaign": [entry] }
+        })
+    };
+    let (status, v) = post_json(
+        app.clone(),
+        "/v1/compliance/check",
+        req("+1 (312) 555-0100"),
+    )
+    .await;
+    assert_eq!(
+        (status, v["reason"].as_str()),
+        (StatusCode::OK, Some("dnc"))
+    );
+    let (status, v) = post_json(app.clone(), "/v1/compliance/check", req("312-555-0100")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["allowed"], false);
+    assert!(
+        v["reason"].as_str().unwrap().starts_with("invalid_dnc"),
+        "{v}"
+    );
+    let (status, v) = post_json(
+        app,
+        "/v1/compliance/check",
+        json!({
+            "timezone": "America/New_York",
+            "phone_number": "312-555-0100",
+            "uniform_window": { "start_hhmm": 900, "stop_hhmm": 2100 },
+            "dnc": {}
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, v["reason"].as_str()),
+        (StatusCode::OK, Some("invalid_number"))
+    );
 }
 
 #[tokio::test]

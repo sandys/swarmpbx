@@ -8,7 +8,7 @@
 use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use ad_compliance::dnc::DncSet;
+use ad_compliance::dnc::{DncEntryError, DncSet};
 use ad_compliance::safe_hours::{self, CallWindowSet, DayWindow, LeadLocation};
 use ad_compliance::{Decision, DenyReason};
 
@@ -51,6 +51,16 @@ pub struct DncDto {
     pub campaign: Vec<String>,
     #[serde(default)]
     pub area_codes: Vec<String>,
+}
+
+impl DncDto {
+    /// The DNC set of a request. An entry that does not read is an error.
+    pub fn to_set(dto: Option<&DncDto>) -> Result<DncSet, DncEntryError> {
+        match dto {
+            Some(d) => DncSet::from_lists(&d.system, &d.campaign, &d.area_codes),
+            None => Ok(DncSet::default()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +108,7 @@ fn reason_str(r: &DenyReason) -> &'static str {
         DenyReason::Holiday => "holiday",
         DenyReason::Dnc(_) => "dnc",
         DenyReason::InvalidWindowConfig => "invalid_window_config",
+        DenyReason::InvalidNumber => "invalid_number",
     }
 }
 
@@ -119,19 +130,15 @@ async fn check(
 
     // DNC first (cheapest, and a DNC hit denies regardless of time).
     if let Some(dnc) = &req.dnc {
-        let set = DncSet {
-            system: dnc
-                .system
-                .iter()
-                .map(|s| ad_compliance::dnc::normalize(s))
-                .collect(),
-            campaign: dnc
-                .campaign
-                .iter()
-                .map(|s| ad_compliance::dnc::normalize(s))
-                .collect(),
-            area_codes: dnc.area_codes.iter().cloned().collect(),
-        };
+        let set = DncDto::to_set(Some(dnc)).map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(CheckResponse {
+                    allowed: false,
+                    reason: Some(format!("invalid_dnc: {e}")),
+                }),
+            )
+        })?;
         if let Decision::Denied(r) = set.check(&req.phone_number) {
             return Ok(Json(CheckResponse {
                 allowed: false,

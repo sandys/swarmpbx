@@ -12,7 +12,7 @@
 //     (Twilio's "Symmetric RTP"); 0 sends it to the address in the SDP.
 //
 // Each number has a behavior (SIM_NUMBERS, for example
-// "+15550000486=busy,+15550000408=noanswer"); other numbers get
+// "+12025550486=busy,+12025550408=noanswer"); other numbers get
 // SIM_DEFAULT (default echo):
 //
 //	echo        answer, send each RTP payload back, BYE after SIM_HOLD_MS

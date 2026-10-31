@@ -133,7 +133,7 @@ for t in json.load(sys.stdin)["tunnels"]:
 ngrok_up() { [ -n "$(ngrok_addr)" ]; }
 
 run_sim() {
-  local answer_a=+15550002001 answer_b=+15550002002 busy=+15550000486 noanswer=+15550000408 answers fails sid_a
+  local answer_a=+12025550101 answer_b=+12025550102 busy=+12025550486 noanswer=+12025550408 answers fails sid_a
   echo "== (a) the stack, with click-to-call, and the campaigns through the API =="
   $CL up -d --build 2>&1 | tail -1
   wait_for 120 "the api answers" http_ok http://api:8080/health || exit 1

@@ -13,6 +13,7 @@ ad_circuit_breaker = { path = "../ad_circuit_breaker" }
 ad_events = { path = "../ad_events" }
 ad_attempt = { path = "../ad_attempt" }
 ad_lead = { path = "../ad_lead" }
+ad_disposition = { path = "../ad_disposition" }
 chrono = { workspace = true }
 chrono-tz = "0.10"
 

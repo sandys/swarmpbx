@@ -1,0 +1,122 @@
+// The agent session stream (decision D-6, GAPS.md AGNT-2).
+//
+// The dialer gives each agent a session URL and a token for each call, in
+// the call facts (`session.url`, `session.token`). The agent opens one
+// stream, sends Hello first, and then sends its Outcome. The dialer answers
+// each message. The first outcome that the dialer accepts stays; the same
+// outcome again gets an Ack with `duplicate`.
+syntax = "proto3";
+
+package agentdialer.session.v1;
+
+service Session {
+  rpc Open(stream AgentMessage) returns (stream DialerMessage);
+}
+
+message AgentMessage {
+  oneof body {
+    Hello hello = 1;
+    Outcome outcome = 2;
+    Event event = 3;
+    Log log = 4;
+  }
+}
+
+message Hello {
+  int64 attempt_id = 1;
+  string token = 2;
+  // The name and the version of the agent, for the logs.
+  string agent = 3;
+}
+
+// The result of the call, as the agent saw it.
+message Outcome {
+  // The dialer reads version 1.
+  uint32 schema_version = 1;
+  // A code of the catalog in Welcome. Empty: no disposition.
+  string disposition = 2;
+  AnsweredBy answered_by = 3;
+  // Call the lead again at this local time. Needs a disposition with the
+  // scheduled_callback flag.
+  Callback callback = 4;
+  // The callee asked not to be called again. The dialer adds the number to
+  // the DNC list at once.
+  Dnc dnc = 5;
+  // The number or SIP URI that the agent asked to transfer to. The dialer
+  // records it; it does not transfer calls yet.
+  string transfer_to = 6;
+  string summary = 7;
+  // The disclosures that the agent spoke, for example "recording_notice".
+  repeated string disclosures = 8;
+}
+
+enum AnsweredBy {
+  ANSWERED_BY_UNKNOWN = 0;
+  ANSWERED_BY_HUMAN = 1;
+  ANSWERED_BY_MACHINE = 2;
+}
+
+message Callback {
+  // The local time, YYYY-MM-DDTHH:MM.
+  string local_time = 1;
+  // The IANA zone. Empty: the zone of the lead.
+  string zone = 2;
+}
+
+message Dnc {
+  // "system" (every campaign; also when empty) or "campaign".
+  string scope = 1;
+}
+
+// A session event. The dialer writes it to its log.
+message Event {
+  string name = 1;
+  // The event data as JSON.
+  string json = 2;
+}
+
+// A log line of the agent. The dialer writes it to its log.
+message Log {
+  string level = 1;
+  string message = 2;
+}
+
+message DialerMessage {
+  oneof body {
+    Welcome welcome = 1;
+    Ack ack = 2;
+    Rejected rejected = 3;
+  }
+}
+
+message Welcome {
+  int64 attempt_id = 1;
+  int64 campaign_id = 2;
+  // The schema version of Outcome that the dialer reads.
+  uint32 schema_version = 3;
+  // The codes that the agent can report.
+  repeated Disposition dispositions = 4;
+}
+
+message Disposition {
+  string code = 1;
+  string name = 2;
+  // The flags that are set, for example "sale" and "human_answered".
+  repeated string flags = 3;
+}
+
+// The dialer stored the outcome.
+message Ack {
+  // The same outcome came before.
+  bool duplicate = 1;
+  // The lead settled before the outcome came: only a DNC request still
+  // changes the leads.
+  bool settled = 2;
+  // The waiting leads that the DNC request stopped.
+  uint64 cancelled = 3;
+}
+
+// The dialer did not store the message. Send a corrected outcome.
+message Rejected {
+  string reason = 1;
+}

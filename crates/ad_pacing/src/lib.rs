@@ -11,9 +11,18 @@
 //! each round of fast joins, then each round adds one, and a slow join or a
 //! failed start halves it. The target and the back-off are below the
 //! abandonment limit, so the pool slows down before a call is abandoned.
+//!
+//! `tripped` is the breaker of the pool (GAPS.md DIAL-9 item 7): at `k` = 1,
+//! `trip_after` agent starts in a row that failed pause the pool's
+//! campaigns. It counts apart from the call failures of the campaign breaker.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// The failed starts in a row that open the breaker of a pool.
+pub const DEFAULT_TRIP_AFTER: u32 = 5;
+/// The attempt ids of failed starts that the state keeps.
+const FAILED_KEPT: usize = 20;
 
 /// How a campaign uses the limit of its pool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +64,10 @@ pub struct Settings {
     /// The largest `k`. Default: no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_k: Option<u32>,
+    /// The failed agent starts in a row, at `k` = 1, that pause the
+    /// campaigns of the pool. Default: 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trip_after: Option<u32>,
 }
 
 /// The settings with every default filled in.
@@ -64,6 +77,7 @@ pub struct Limits {
     pub backoff_ms: u32,
     pub first_k: u32,
     pub max_k: Option<u32>,
+    pub trip_after: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -78,6 +92,7 @@ impl Settings {
             backoff_ms: self.backoff_ms.unwrap_or(connect_within_ms / 4 * 3),
             first_k: self.first_k.unwrap_or(1),
             max_k: self.max_k,
+            trip_after: self.trip_after.unwrap_or(DEFAULT_TRIP_AFTER),
         };
         let bad = |m: String| Err(SettingsError(m));
         if limits.target_ms == 0 {
@@ -100,6 +115,9 @@ impl Settings {
         }
         if limits.max_k.is_some_and(|m| m < limits.first_k) {
             return bad("max_k must be at least first_k".into());
+        }
+        if limits.trip_after == 0 {
+            return bad("trip_after must be at least 1".into());
         }
         Ok(limits)
     }
@@ -124,6 +142,12 @@ pub struct State {
     pub samples: u64,
     #[serde(default)]
     pub slow: u64,
+    /// The agent starts that failed in a row, since the last join or trip.
+    #[serde(default)]
+    pub failed_in_row: u32,
+    /// The attempts of the last of these failures, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<i64>,
 }
 
 impl State {
@@ -136,7 +160,15 @@ impl State {
             halved_at: None,
             samples: 0,
             slow: 0,
+            failed_in_row: 0,
+            failed: Vec::new(),
         }
+    }
+
+    /// Start the count of failed starts again, after a trip.
+    pub fn reset_failures(&mut self) {
+        self.failed_in_row = 0;
+        self.failed.clear();
     }
 }
 
@@ -157,6 +189,7 @@ pub enum Join {
 /// One agent start of the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
+    pub attempt_id: i64,
     pub started_at: DateTime<Utc>,
     /// When the result was known: the join or the end.
     pub at: DateTime<Utc>,
@@ -194,6 +227,16 @@ pub fn observe(state: &State, limits: &Limits, sample: &Sample) -> State {
         return next;
     };
     next.samples += 1;
+    match sample.join {
+        Join::Failed => {
+            next.failed_in_row = next.failed_in_row.saturating_add(1);
+            next.failed.push(sample.attempt_id);
+            let over = next.failed.len().saturating_sub(FAILED_KEPT);
+            next.failed.drain(..over);
+        }
+        Join::Joined { .. } => next.reset_failures(),
+        Join::Unknown => {}
+    }
     match class {
         Class::Fast => {
             next.proven = next.proven.max(sample.concurrent);
@@ -225,6 +268,11 @@ pub fn observe(state: &State, limits: &Limits, sample: &Sample) -> State {
     }
     next.k = cap(next.k, limits);
     next
+}
+
+/// The breaker of the pool is open: pause its campaigns.
+pub fn tripped(state: &State, limits: &Limits) -> bool {
+    state.k == 1 && state.failed_in_row >= limits.trip_after
 }
 
 /// The window limit of a campaign of the pool.

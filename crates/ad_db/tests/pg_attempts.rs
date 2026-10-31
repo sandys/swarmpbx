@@ -36,6 +36,7 @@ fn to_status(
                 counts_as_call: true,
                 next_eligible_at: None,
                 wait_reason: None,
+                priority: 0,
             },
             Vec::new(),
         )
@@ -244,6 +245,7 @@ async fn settlement_updates_the_lead_once() {
                 counts_as_call: true,
                 next_eligible_at: Some(due),
                 wait_reason: Some("no_answer"),
+                priority: 0,
             },
             vec![CampaignEvent::RetryScheduled {
                 campaign_id: input.campaign_id.0,
@@ -711,6 +713,7 @@ async fn customer_first_dials_first_and_the_retry_of_an_abandoned_call_waits_for
                 counts_as_call: true,
                 next_eligible_at: None,
                 wait_reason: Some("abandoned"),
+                priority: 0,
             },
             Vec::new(),
         )

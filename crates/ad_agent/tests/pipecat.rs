@@ -4,8 +4,10 @@
 use std::sync::{Arc, Mutex};
 
 use ad_agent::{AgentError, AgentSpec, Agents, CallFacts, LiveKitAccess};
+use ad_core::time::{FixedClock, SystemClock};
+use ad_core::Clock;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-use livekit_api::access_token::TokenVerifier;
+use livekit_api::access_token::{Claims, TokenVerifier};
 use serde_json::{json, Value};
 
 const KEY: &str = "devkey";
@@ -32,11 +34,18 @@ async fn bot_server(status: StatusCode) -> (String, Seen) {
 }
 
 fn agents() -> Agents {
-    Agents::new(LiveKitAccess {
-        url: "ws://livekit.test:7880".into(),
-        api_key: KEY.into(),
-        api_secret: SECRET.into(),
-    })
+    agents_at(SystemClock)
+}
+
+fn agents_at(clock: impl Clock + 'static) -> Agents {
+    Agents::new(
+        LiveKitAccess {
+            url: "ws://livekit.test:7880".into(),
+            api_key: KEY.into(),
+            api_secret: SECRET.into(),
+        },
+        Arc::new(clock),
+    )
 }
 
 fn call(context: &Value) -> CallFacts<'_> {
@@ -48,6 +57,7 @@ fn call(context: &Value) -> CallFacts<'_> {
         callee_identity: "sip-attempt-42",
         phone_number: "+15550100",
         lead_context: context,
+        session: None,
     }
 }
 
@@ -80,6 +90,21 @@ async fn the_bot_gets_a_room_token_and_the_call_facts() {
     assert_eq!(claims.video.room, "campaign-42");
     assert!(claims.video.room_join && claims.video.agent);
     assert!(!claims.video.room_admin && !claims.video.room_create);
+}
+
+#[tokio::test]
+async fn the_bot_token_takes_its_time_from_the_clock() {
+    let (url, seen) = bot_server(StatusCode::OK).await;
+    let at = chrono::DateTime::from_timestamp(1_900_000_000, 0).unwrap();
+    let context = json!({});
+    agents_at(FixedClock(at))
+        .start(&spec(&url), &call(&context))
+        .await
+        .unwrap();
+    let body = seen.lock().unwrap().pop().expect("one start request");
+    let claims = Claims::from_unverified(body["token"].as_str().unwrap()).unwrap();
+    assert_eq!(claims.nbf as i64, at.timestamp());
+    assert_eq!(claims.exp as i64, at.timestamp() + 3600);
 }
 
 #[tokio::test]

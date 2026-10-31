@@ -10,6 +10,13 @@ fn default_join_timeout() -> u32 {
     DEFAULT_JOIN_TIMEOUT_S
 }
 
+/// The default wait for the agent's outcome after the call ends.
+pub const DEFAULT_OUTCOME_WAIT_S: u32 = 30;
+
+fn default_outcome_wait() -> u32 {
+    DEFAULT_OUTCOME_WAIT_S
+}
+
 /// When the dialer starts the agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +54,11 @@ pub enum AgentSpec {
         dial_order: DialOrder,
         #[serde(default = "default_join_timeout")]
         join_timeout_s: u32,
+        /// After an answered call that the agent joined, the dialer waits
+        /// this long for the agent's outcome before it settles the lead
+        /// without one.
+        #[serde(default = "default_outcome_wait")]
+        outcome_wait_s: u32,
     },
     /// A pipecat bot server. The dialer POSTs a start request with a room
     /// token to `start_url`; the bot joins with pipecat's LiveKit transport.
@@ -58,6 +70,11 @@ pub enum AgentSpec {
         dial_order: DialOrder,
         #[serde(default = "default_join_timeout")]
         join_timeout_s: u32,
+        /// After an answered call that the agent joined, the dialer waits
+        /// this long for the agent's outcome before it settles the lead
+        /// without one.
+        #[serde(default = "default_outcome_wait")]
+        outcome_wait_s: u32,
     },
 }
 
@@ -86,6 +103,9 @@ impl AgentSpec {
             }
             _ if self.join_timeout_s() == 0 || self.join_timeout_s() > 300 => {
                 Err(SpecError("join_timeout_s must be between 1 and 300".into()))
+            }
+            _ if self.outcome_wait_s() > 600 => {
+                Err(SpecError("outcome_wait_s must be between 0 and 600".into()))
             }
             _ => Ok(()),
         }
@@ -119,6 +139,13 @@ impl AgentSpec {
         match self {
             AgentSpec::Livekit { join_timeout_s, .. }
             | AgentSpec::Pipecat { join_timeout_s, .. } => *join_timeout_s,
+        }
+    }
+
+    pub fn outcome_wait_s(&self) -> u32 {
+        match self {
+            AgentSpec::Livekit { outcome_wait_s, .. }
+            | AgentSpec::Pipecat { outcome_wait_s, .. } => *outcome_wait_s,
         }
     }
 

@@ -37,6 +37,9 @@ Examples:
 - `crates/ad_api/src/compliance.rs`: an endpoint over a pure engine.
 - `crates/ad_api/src/pacing.rs`: an endpoint that needs Postgres. It answers
   503 without Postgres, and it reads and writes settings at run time.
+- `crates/ad_api/src/outcomes.rs`: the dispositions, the attempts, the
+  events, and the DNC list. It shows pages (`?after=<id>&limit=<n>`), a 404
+  for an unknown campaign, and a 400 for a body that does not read.
 
 ## The test pattern (in process)
 
@@ -96,6 +99,12 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
 - Time: a role takes the time from its `Clock`, and a call from its
   `CallTimes`. Measure a duration with `Instant`, not with two wall-clock
   times.
+- The agent contract: the session stream is the API of the agents
+  (`proto/agentdialer/session/v1/session.proto`). Add fields. Do not
+  renumber or remove a field, because old agents must keep working. Test the
+  server in `crates/ad_session/`, and run `e2e/run_e2e.sh`, which uses both
+  reference agents.
+- Phone numbers and postal codes: read them with `ad_contact` only.
 - Users: if the slice changes what a user does, change the README and the
   skill that teaches it (`run-campaigns` for the API and the stack,
   `connect-an-agent` for the agent contract).

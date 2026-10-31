@@ -48,6 +48,8 @@ pub enum DenyReason {
     Dnc(dnc::DncScope),
     /// A referenced calling-window definition was missing or invalid (fail-closed).
     InvalidWindowConfig,
+    /// The phone number does not read, so no list can clear it (fail-closed).
+    InvalidNumber,
 }
 
 impl std::fmt::Display for DenyReason {
@@ -58,6 +60,7 @@ impl std::fmt::Display for DenyReason {
             DenyReason::Holiday => write!(f, "holiday"),
             DenyReason::Dnc(scope) => write!(f, "DNC ({scope:?})"),
             DenyReason::InvalidWindowConfig => write!(f, "invalid window config (fail-closed)"),
+            DenyReason::InvalidNumber => write!(f, "invalid number (fail-closed)"),
         }
     }
 }

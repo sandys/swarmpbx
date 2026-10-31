@@ -75,6 +75,24 @@ pub enum CampaignEvent {
     },
     /// The failure rate crossed the threshold, and the campaign is paused.
     CircuitBreakerTripped { campaign_id: i64, failure_rate: f64 },
+    /// The agents of the campaign's pool did not start: `failed_in_row`
+    /// starts in a row failed at a limit of 1 (GAPS.md DIAL-9 item 7). The
+    /// campaign is paused.
+    AgentPoolTripped {
+        campaign_id: i64,
+        pool: String,
+        failed_in_row: u32,
+        /// The last attempts of the run, oldest first.
+        attempt_ids: Vec<i64>,
+    },
+    /// The agent of an attempt reported its outcome. A DNC request in it
+    /// took effect in the same transaction.
+    AgentOutcome {
+        campaign_id: i64,
+        attempt_id: i64,
+        disposition: Option<String>,
+        dnc: bool,
+    },
     /// No work is left, and the campaign is completed.
     CampaignCompleted { campaign_id: i64 },
 }
@@ -88,6 +106,8 @@ impl CampaignEvent {
             | CampaignEvent::CallCompleted { campaign_id, .. }
             | CampaignEvent::RetryScheduled { campaign_id, .. }
             | CampaignEvent::CircuitBreakerTripped { campaign_id, .. }
+            | CampaignEvent::AgentPoolTripped { campaign_id, .. }
+            | CampaignEvent::AgentOutcome { campaign_id, .. }
             | CampaignEvent::CampaignCompleted { campaign_id } => *campaign_id,
         }
     }
@@ -101,6 +121,8 @@ impl CampaignEvent {
             CampaignEvent::CallCompleted { .. } => "call_completed",
             CampaignEvent::RetryScheduled { .. } => "retry_scheduled",
             CampaignEvent::CircuitBreakerTripped { .. } => "circuit_breaker_tripped",
+            CampaignEvent::AgentPoolTripped { .. } => "agent_pool_tripped",
+            CampaignEvent::AgentOutcome { .. } => "agent_outcome",
             CampaignEvent::CampaignCompleted { .. } => "campaign_completed",
         }
     }

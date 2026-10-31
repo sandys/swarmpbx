@@ -26,7 +26,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ad_circuit_breaker::{CircuitBreaker, Config as BreakerConfig};
-use ad_compliance::dnc::DncSet;
 use ad_compliance::safe_hours::{CallWindowSet, DayWindow};
 use ad_core::CampaignId;
 use ad_dispatch::{
@@ -35,6 +34,7 @@ use ad_dispatch::{
 use ad_hopper::{select, Order, SelectionInput};
 use ad_orchestrator::{gate, GateBlock, GateDecision, Schedule};
 
+use crate::compliance::DncDto;
 use crate::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -91,16 +91,6 @@ impl Capacity for AtomicCapacity {
 pub struct DayWindowDto {
     pub start_hhmm: u16,
     pub stop_hhmm: u16,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct DncDto {
-    #[serde(default)]
-    pub system: Vec<String>,
-    #[serde(default)]
-    pub campaign: Vec<String>,
-    #[serde(default)]
-    pub area_codes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,24 +163,6 @@ fn build_windows(req: &RunBatchRequest) -> Result<CallWindowSet, String> {
     Ok(set)
 }
 
-fn build_dnc(dto: Option<&DncDto>) -> DncSet {
-    let mut set = DncSet::default();
-    if let Some(d) = dto {
-        set.system = d
-            .system
-            .iter()
-            .map(|s| ad_compliance::dnc::normalize(s))
-            .collect();
-        set.campaign = d
-            .campaign
-            .iter()
-            .map(|s| ad_compliance::dnc::normalize(s))
-            .collect();
-        set.area_codes = d.area_codes.iter().cloned().collect();
-    }
-    set
-}
-
 fn outcome_str(o: &CallOutcome) -> String {
     match o {
         CallOutcome::Answered => "answered".into(),
@@ -240,7 +212,8 @@ async fn run_batch(
 
     let windows = build_windows(&req)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid_window: {e}")))?;
-    let dnc = build_dnc(req.dnc.as_ref());
+    let dnc = DncDto::to_set(req.dnc.as_ref())
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid_dnc: {e}")))?;
 
     // Select eligible leads via the hopper (compliance + status + ordering).
     let leads = state

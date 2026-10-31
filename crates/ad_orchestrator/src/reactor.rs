@@ -30,9 +30,16 @@ pub fn react(event: &CampaignEvent) -> ReactorAction {
         | CampaignEvent::AgentJoined { campaign_id, .. } => ReactorAction::Dispatch {
             campaign_id: *campaign_id,
         },
+        // An outcome that comes after the end of the call settles it now;
+        // during the call, the settlement does nothing.
         CampaignEvent::AttemptEnded {
             campaign_id,
             attempt_id,
+        }
+        | CampaignEvent::AgentOutcome {
+            campaign_id,
+            attempt_id,
+            ..
         } => ReactorAction::SettleAndDispatch {
             campaign_id: *campaign_id,
             attempt_id: *attempt_id,
@@ -40,6 +47,7 @@ pub fn react(event: &CampaignEvent) -> ReactorAction {
         CampaignEvent::CallCompleted { .. }
         | CampaignEvent::RetryScheduled { .. }
         | CampaignEvent::CircuitBreakerTripped { .. }
+        | CampaignEvent::AgentPoolTripped { .. }
         | CampaignEvent::CampaignCompleted { .. } => ReactorAction::Noop,
     }
 }

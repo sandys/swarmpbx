@@ -14,18 +14,22 @@ use sqlx::{PgPool, Row};
 pub mod attempts;
 pub mod breaker;
 pub mod clock;
+pub mod dnc;
 pub mod events;
 pub mod leads;
+pub mod outcomes;
 pub mod pacing;
 pub use attempts::{
-    Applied, AttemptBrief, AttemptError, AttemptRow, ClaimRequest, ClaimedAttempt, LeadUpdate,
-    LiveAttempt, Owner, PgAttemptRepo, RoomAttempt, SettleInput,
+    Applied, AttemptBrief, AttemptError, AttemptRow, AttemptView, ClaimRequest, ClaimedAttempt,
+    LeadUpdate, LiveAttempt, Owner, PgAttemptRepo, RoomAttempt, SettleInput,
 };
 pub use breaker::PgBreakerStore;
 pub use clock::PgClock;
+pub use dnc::{Added, DncEntry, DncError, NewDnc, PgDncRepo};
 pub use events::{PgEventConsumer, PgEventLog};
 pub use leads::PgLeadRepo;
-pub use pacing::{Listed, PaceClaim, PacingError, PgPacingRepo, PoolView, Recent};
+pub use outcomes::{OutcomeError, PgOutcomeRepo, Recorded, Session};
+pub use pacing::{Listed, PaceClaim, PacingError, PgPacingRepo, PoolView, Recent, Trip};
 
 use ad_campaign::repo::{CampaignRepo, NewCampaign, RepoError};
 use ad_campaign::{Campaign, CampaignState, Counters, Transition, TransitionError};
@@ -93,6 +97,14 @@ impl Db {
 
     pub fn pacing(&self) -> PgPacingRepo {
         PgPacingRepo::new(self.pool.clone())
+    }
+
+    pub fn dnc(&self) -> PgDncRepo {
+        PgDncRepo::new(self.pool.clone())
+    }
+
+    pub fn outcomes(&self) -> PgOutcomeRepo {
+        PgOutcomeRepo::new(self.pool.clone())
     }
 
     pub fn events(&self) -> PgEventLog {

@@ -14,7 +14,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ad_agent::{AgentSpec, CallFacts};
+use ad_agent::{AgentSpec, CallFacts, SessionFacts};
 use ad_attempt::{AgentLeg, Attempt, AttemptEvent, Leg, NotDialedReason};
 use ad_cluster::{decode, keys, Assignment, Snapshot};
 use ad_core::time::Clock;
@@ -119,8 +119,27 @@ async fn drive(node: &Node, id: AttemptId, owner: &Owner) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The URL and the token of an agent session.
+type AgentSession = (String, String);
+
+/// A session for the agent: a new token whose digest the attempt keeps.
+/// `None` when the node has no session URL, or another node owns the call.
+async fn new_session(node: &Node, id: AttemptId, owner: &Owner) -> Option<AgentSession> {
+    let url = node.settings.session_url.clone()?;
+    let token = ad_session::new_token();
+    let digest = ad_session::digest(&token);
+    match node.db.outcomes().set_session(id, owner, &digest).await {
+        Ok(true) => Some((url, token)),
+        Ok(false) => None,
+        Err(e) => {
+            tracing::warn!(attempt = id.0, error = %e, "no session: the agent cannot report");
+            None
+        }
+    }
+}
+
 /// What the agent learns about the call.
-fn call_facts(row: &AttemptRow) -> CallFacts<'_> {
+fn call_facts<'a>(row: &'a AttemptRow, session: Option<&'a AgentSession>) -> CallFacts<'a> {
     CallFacts {
         attempt_id: row.attempt_id.0,
         campaign_id: row.campaign_id.0,
@@ -129,6 +148,7 @@ fn call_facts(row: &AttemptRow) -> CallFacts<'_> {
         callee_identity: &row.participant_identity,
         phone_number: &row.phone_number,
         lead_context: &row.lead_context,
+        session: session.map(|(url, token)| SessionFacts { url, token }),
     }
 }
 
@@ -171,8 +191,13 @@ async fn prepare_agent(
         if let Err(e) = node.gateway.create_room(&row.room).await {
             return step(node, id, owner, &fail(format!("room: {e}"))).await;
         }
+        let session = new_session(node, id, owner).await;
         let sent = now();
-        let event = match node.agents.start(&spec, &call_facts(row)).await {
+        let event = match node
+            .agents
+            .start(&spec, &call_facts(row, session.as_ref()))
+            .await
+        {
             Ok(detail) => AttemptEvent::AgentStarting { at: sent, detail },
             Err(e) => fail(e.to_string()),
         };
@@ -236,11 +261,17 @@ async fn dial(
         _ => return Ok(()),
     };
     // Customer first: the agent starts at the answer, while the call joins the
-    // room, because the abandonment limit counts from the answer.
+    // room, because the abandonment limit counts from the answer. Its session
+    // is saved before the dial, so the start waits for nothing.
+    let session = if customer_first {
+        new_session(node, id, owner).await
+    } else {
+        None
+    };
     let answer = Notify::new();
     let start = async {
         answer.notified().await;
-        start_agent(node, row, times).await
+        start_agent(node, row, times, session.as_ref()).await
     };
     tokio::pin!(start);
     let mut agent_started = None;
@@ -339,14 +370,19 @@ async fn dial(
 }
 
 /// The agent's start request, as `AgentStarting` or `AgentFailed`.
-async fn start_agent(node: &Node, row: &AttemptRow, times: &CallTimes) -> AttemptEvent {
+async fn start_agent(
+    node: &Node,
+    row: &AttemptRow,
+    times: &CallTimes,
+    session: Option<&AgentSession>,
+) -> AttemptEvent {
     let failed = |detail: String| AttemptEvent::AgentFailed {
         at: times.now(),
         detail,
     };
     let sent = times.now();
     match row.agent.as_ref().map(AgentSpec::parse) {
-        Some(Ok(spec)) => match node.agents.start(&spec, &call_facts(row)).await {
+        Some(Ok(spec)) => match node.agents.start(&spec, &call_facts(row, session)).await {
             Ok(detail) => AttemptEvent::AgentStarting { at: sent, detail },
             Err(e) => failed(e.to_string()),
         },

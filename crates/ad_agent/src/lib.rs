@@ -21,18 +21,21 @@
 //!   pipecat's `LiveKitTransport(url, token, room_name)`.
 //!
 //! Both get the same call facts (`call_metadata`), so one agent design serves
-//! both runtimes. Adding a runtime is one `AgentSpec` variant and one match arm
+//! both runtimes. When the dialer serves the session stream, the facts carry
+//! `session: {url, token}`: the agent opens the stream with them and reports
+//! the outcome of the call (`proto/agentdialer/session/v1/session.proto`). Adding a runtime is one `AgentSpec` variant and one match arm
 //! in `Agents::start`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use livekit_api::access_token::{AccessToken, VideoGrants};
-use livekit_api::services::agent_dispatch::AgentDispatchClient;
+use ad_core::Clock;
+use ad_livekit::{Api, Signer, VideoGrants};
 use livekit_protocol::CreateAgentDispatchRequest;
 use serde_json::json;
 
 mod spec;
-pub use spec::{AgentSpec, DialOrder, SpecError, DEFAULT_JOIN_TIMEOUT_S};
+pub use spec::{AgentSpec, DialOrder, SpecError, DEFAULT_JOIN_TIMEOUT_S, DEFAULT_OUTCOME_WAIT_S};
 
 /// What the agent learns about the call.
 #[derive(Debug, Clone, Copy)]
@@ -46,12 +49,22 @@ pub struct CallFacts<'a> {
     pub phone_number: &'a str,
     /// `leads.context` (the CSV extra columns).
     pub lead_context: &'a serde_json::Value,
+    pub session: Option<SessionFacts<'a>>,
+}
+
+/// Where the agent reports the outcome of the call.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionFacts<'a> {
+    /// The gRPC URL of the session stream.
+    pub url: &'a str,
+    /// The secret of this attempt's session.
+    pub token: &'a str,
 }
 
 /// The call facts as JSON: the LiveKit job metadata, and `call` in the pipecat
 /// start request. Pure.
 pub fn call_metadata(spec: &AgentSpec, call: &CallFacts<'_>) -> serde_json::Value {
-    json!({
+    let mut facts = json!({
         "attempt_id": call.attempt_id,
         "campaign_id": call.campaign_id,
         "room": call.room,
@@ -62,7 +75,11 @@ pub fn call_metadata(spec: &AgentSpec, call: &CallFacts<'_>) -> serde_json::Valu
             "context": call.lead_context,
         },
         "metadata": spec.metadata(),
-    })
+    });
+    if let Some(s) = call.session {
+        facts["session"] = json!({"url": s.url, "token": s.token});
+    }
+    facts
 }
 
 /// The room identity of a pipecat bot.
@@ -86,20 +103,23 @@ pub enum AgentError {
     Unreachable(String),
 }
 
+/// The life of a pipecat bot's room token.
+const BOT_TOKEN_TTL: Duration = Duration::from_secs(3600);
+
 /// The runtimes. One value serves every campaign.
 pub struct Agents {
-    dispatch: AgentDispatchClient,
+    dispatch: Api,
     http: reqwest::Client,
     livekit: LiveKitAccess,
 }
 
 impl Agents {
-    pub fn new(livekit: LiveKitAccess) -> Self {
+    /// The tokens take their time from `clock` (OPS-9).
+    pub fn new(livekit: LiveKitAccess, clock: Arc<dyn Clock>) -> Self {
         Self {
-            dispatch: AgentDispatchClient::with_api_key(
+            dispatch: Api::new(
                 &livekit.url,
-                &livekit.api_key,
-                &livekit.api_secret,
+                Signer::new(&livekit.api_key, &livekit.api_secret, clock),
             ),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -162,20 +182,20 @@ impl Agents {
 
     /// A token that lets the bot join one room as an agent.
     fn bot_token(&self, room: &str, identity: &str) -> Result<String, AgentError> {
-        AccessToken::with_api_key(&self.livekit.api_key, &self.livekit.api_secret)
-            .with_identity(identity)
-            .with_name(identity)
-            .with_kind("agent")
-            .with_ttl(Duration::from_secs(3600))
-            .with_grants(VideoGrants {
-                room_join: true,
-                room: room.to_string(),
-                agent: true,
-                can_publish: Some(true),
-                can_subscribe: Some(true),
-                ..Default::default()
-            })
-            .to_jwt()
+        self.dispatch
+            .signer()
+            .join(
+                room,
+                identity,
+                Some("agent"),
+                VideoGrants {
+                    agent: true,
+                    can_publish: Some(true),
+                    can_subscribe: Some(true),
+                    ..Default::default()
+                },
+                BOT_TOKEN_TTL,
+            )
             .map_err(|e| AgentError::Refused(format!("token: {e}")))
     }
 }
@@ -193,6 +213,7 @@ mod tests {
         let s = AgentSpec::parse(&livekit_spec()).unwrap();
         assert_eq!(s.runtime(), "livekit");
         assert_eq!(s.join_timeout_s(), DEFAULT_JOIN_TIMEOUT_S);
+        assert_eq!(s.outcome_wait_s(), DEFAULT_OUTCOME_WAIT_S);
         let p = AgentSpec::parse(&json!({
             "runtime": "pipecat", "start_url": "http://bots:7860/start", "join_timeout_s": 5
         }))
@@ -229,6 +250,7 @@ mod tests {
             json!({"runtime": "livekit", "agent_name": " "}),
             json!({"runtime": "pipecat", "start_url": "ftp://x"}),
             json!({"runtime": "pipecat", "start_url": "http://x", "join_timeout_s": 0}),
+            json!({"runtime": "pipecat", "start_url": "http://x", "outcome_wait_s": 601}),
             json!({"runtime": "vapi", "url": "x"}),
             json!({"runtime": "livekit", "agent_name": "a", "typo": 1}),
             json!({"runtime": "livekit", "agent_name": "a", "dial_order": "agent_last"}),
@@ -249,8 +271,24 @@ mod tests {
             callee_identity: "sip-attempt-42",
             phone_number: "+15550100",
             lead_context: &context,
+            session: Some(SessionFacts {
+                url: "http://api:9090",
+                token: "t",
+            }),
         };
         let lk = call_metadata(&AgentSpec::parse(&livekit_spec()).unwrap(), &call);
+        assert_eq!(
+            lk["session"],
+            json!({"url": "http://api:9090", "token": "t"})
+        );
+        let without = call_metadata(
+            &AgentSpec::parse(&livekit_spec()).unwrap(),
+            &CallFacts {
+                session: None,
+                ..call
+            },
+        );
+        assert!(without.get("session").is_none());
         assert_eq!(lk["attempt_id"], 42);
         assert_eq!(lk["callee_identity"], "sip-attempt-42");
         assert_eq!(lk["lead"]["context"]["first_name"], "Ada");

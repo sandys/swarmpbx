@@ -25,7 +25,7 @@ pub mod retry;
 pub use retry::{retry_decision, RetryDecision, RetryPolicy};
 
 pub mod settle;
-pub use settle::{settle, Settlement};
+pub use settle::{settle, settle_with, Settlement, CALLBACK_PRIORITY};
 
 /// A business-hours schedule window: a timezone and per-weekday [start, end)
 /// in minutes since local midnight. Distinct from the compliance safe-hours

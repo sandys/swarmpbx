@@ -1023,7 +1023,9 @@ crates/
                   #   condition/action/anti-action/break/inline/group evaluator,
                   #   variable interpolation + function registry + action registry.
   ad_pacing/      # join-paced window controller (built); power/predictive (planned).
-  ad_disposition/ # status/disposition model + lead state machine + outcome apply.
+  ad_disposition/ # disposition catalog + flags + check of the agent's report. BUILT.
+  ad_contact/     # phone numbers (E.164) and postal codes, one backend. BUILT.
+  ad_session/     # the agent session stream, gRPC (D-6). BUILT.
   ad_compliance/  # §9 — safe-hours (fail-closed), DNC, abandonment ledger.
   ad_concurrency/ # Postgres SKIP LOCKED claim + per-campaign cap (§0.8).
   ad_orchestrator/# schedule, retry, settlement, circuit breaker (pure).

@@ -37,6 +37,22 @@ fn an_agent_in_the_room_dispatches() {
 }
 
 #[test]
+fn an_agent_outcome_settles_its_attempt() {
+    assert_eq!(
+        react(&CampaignEvent::AgentOutcome {
+            campaign_id: 4,
+            attempt_id: 9,
+            disposition: None,
+            dnc: true,
+        }),
+        ReactorAction::SettleAndDispatch {
+            campaign_id: 4,
+            attempt_id: 9
+        }
+    );
+}
+
+#[test]
 fn records_do_not_dispatch() {
     for e in [
         CampaignEvent::CallCompleted {
@@ -54,6 +70,12 @@ fn records_do_not_dispatch() {
         CampaignEvent::CircuitBreakerTripped {
             campaign_id: 1,
             failure_rate: 0.9,
+        },
+        CampaignEvent::AgentPoolTripped {
+            campaign_id: 1,
+            pool: "livekit:sales".into(),
+            failed_in_row: 5,
+            attempt_ids: vec![3],
         },
         CampaignEvent::CampaignCompleted { campaign_id: 1 },
     ] {

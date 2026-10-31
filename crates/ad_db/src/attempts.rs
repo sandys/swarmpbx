@@ -12,6 +12,7 @@
 use ad_attempt::{Attempt, AttemptEvent, Ignored, Outcome};
 use ad_compliance::abandon::AbandonCounts;
 use ad_core::{AttemptId, CampaignId, LeadId};
+use ad_disposition::AgentOutcome;
 use ad_events::CampaignEvent;
 use ad_lead::{Lead, LeadStatus};
 use chrono::{DateTime, Utc};
@@ -117,6 +118,28 @@ pub struct AttemptRow {
     pub lead_context: serde_json::Value,
 }
 
+/// An attempt as the API shows it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttemptView {
+    pub id: i64,
+    pub lead_id: i64,
+    pub phone_number: String,
+    pub state: String,
+    pub outcome: Option<String>,
+    pub sip_code: Option<i32>,
+    pub detail: Option<String>,
+    pub disposition: Option<String>,
+    pub agent_outcome: Option<serde_json::Value>,
+    pub node: Option<String>,
+    pub pool: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub dialed_at: Option<DateTime<Utc>>,
+    pub answered_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub outcome_at: Option<DateTime<Utc>>,
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
 /// What `apply` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
@@ -134,6 +157,13 @@ pub struct SettleInput<'a> {
     pub outcome: &'a Outcome,
     /// `leads.called_count` before this attempt.
     pub called_count: u32,
+    pub attempt: &'a Attempt,
+    /// The agent's checked report, when it sent one.
+    pub agent_outcome: Option<&'a AgentOutcome>,
+    /// The node gave the agent a session, so the agent can still report.
+    pub session: bool,
+    /// `campaigns.agent`.
+    pub agent: Option<serde_json::Value>,
 }
 
 /// The lead update that a settlement writes.
@@ -143,6 +173,7 @@ pub struct LeadUpdate {
     pub counts_as_call: bool,
     pub next_eligible_at: Option<DateTime<Utc>>,
     pub wait_reason: Option<&'static str>,
+    pub priority: i16,
 }
 
 #[derive(Clone)]
@@ -245,7 +276,7 @@ impl PgAttemptRepo {
             "SELECT {LEAD_COLS}, retry_reason FROM leads \
              WHERE campaign_id = $1 AND status IN ('new', 'queued') \
                AND (next_eligible_at IS NULL OR next_eligible_at <= $2) \
-             ORDER BY called_count, id LIMIT $3 FOR UPDATE SKIP LOCKED"
+             ORDER BY priority DESC, called_count, id LIMIT $3 FOR UPDATE SKIP LOCKED"
         );
         let rows = sqlx::query(&sql)
             .bind(campaign_id.0)
@@ -510,10 +541,26 @@ impl PgAttemptRepo {
     where
         F: FnOnce(&SettleInput<'_>) -> (LeadUpdate, Vec<CampaignEvent>),
     {
+        self.settle_or_wait(attempt_id, |input| Some(rule(input)))
+            .await
+    }
+
+    /// `settle` with a rule that can wait: `None` leaves the attempt
+    /// unsettled, for example until the agent reports its outcome.
+    pub async fn settle_or_wait<F>(
+        &self,
+        attempt_id: AttemptId,
+        rule: F,
+    ) -> Result<Option<LeadUpdate>, AttemptError>
+    where
+        F: FnOnce(&SettleInput<'_>) -> Option<(LeadUpdate, Vec<CampaignEvent>)>,
+    {
         let mut tx = self.pool.begin().await.map_err(err)?;
         let row = sqlx::query(
-            "SELECT a.campaign_id, a.lead_id, a.snapshot, a.settled_at, l.called_count \
+            "SELECT a.campaign_id, a.lead_id, a.snapshot, a.settled_at, a.agent_outcome, \
+                    a.session_token_sha256 IS NOT NULL AS session, l.called_count, c.agent \
              FROM call_attempts a JOIN leads l ON l.id = a.lead_id \
+                  JOIN campaigns c ON c.id = a.campaign_id \
              WHERE a.id = $1 FOR UPDATE OF a, l",
         )
         .bind(attempt_id.0)
@@ -531,17 +578,29 @@ impl PgAttemptRepo {
             return Ok(None);
         }
         let lead_id = LeadId(row.try_get("lead_id").map_err(err)?);
-        let (update, events) = rule(&SettleInput {
+        let agent_outcome: Option<AgentOutcome> = row
+            .try_get::<Option<serde_json::Value>, _>("agent_outcome")
+            .map_err(err)?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(err)?;
+        let Some((update, events)) = rule(&SettleInput {
             campaign_id: CampaignId(row.try_get("campaign_id").map_err(err)?),
             lead_id,
             outcome,
             called_count: row.try_get::<i32, _>("called_count").map_err(err)? as u32,
-        });
+            attempt: &attempt,
+            agent_outcome: agent_outcome.as_ref(),
+            session: row.try_get("session").map_err(err)?,
+            agent: row.try_get("agent").map_err(err)?,
+        }) else {
+            return Ok(None);
+        };
 
         sqlx::query(
             "UPDATE leads SET status = $2, called_count = called_count + $3, \
                  last_local_call_time = CASE WHEN $3 = 1 THEN $4 ELSE last_local_call_time END, \
-                 next_eligible_at = $5, retry_reason = $6, updated_at = now() \
+                 next_eligible_at = $5, retry_reason = $6, priority = $7, updated_at = now() \
              WHERE id = $1",
         )
         .bind(lead_id.0)
@@ -550,6 +609,7 @@ impl PgAttemptRepo {
         .bind(attempt.dialed_at)
         .bind(update.next_eligible_at)
         .bind(update.wait_reason)
+        .bind(update.priority)
         .execute(&mut *tx)
         .await
         .map_err(err)?;
@@ -561,6 +621,50 @@ impl PgAttemptRepo {
         publish_in(&mut tx, &events).await.map_err(err)?;
         tx.commit().await.map_err(err)?;
         Ok(Some(update))
+    }
+
+    /// The attempts of a campaign after the attempt id `after`, oldest first.
+    pub async fn page(
+        &self,
+        campaign_id: CampaignId,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<AttemptView>, AttemptError> {
+        let rows = sqlx::query(
+            "SELECT id, lead_id, phone_number, state, outcome, sip_code, detail, disposition, \
+                    agent_outcome, node, pool, created_at, dialed_at, answered_at, ended_at, \
+                    outcome_at, settled_at \
+             FROM call_attempts WHERE campaign_id = $1 AND id > $2 ORDER BY id LIMIT $3",
+        )
+        .bind(campaign_id.0)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(err)?;
+        rows.iter()
+            .map(|r| {
+                Ok(AttemptView {
+                    id: r.try_get("id").map_err(err)?,
+                    lead_id: r.try_get("lead_id").map_err(err)?,
+                    phone_number: r.try_get("phone_number").map_err(err)?,
+                    state: r.try_get("state").map_err(err)?,
+                    outcome: r.try_get("outcome").map_err(err)?,
+                    sip_code: r.try_get("sip_code").map_err(err)?,
+                    detail: r.try_get("detail").map_err(err)?,
+                    disposition: r.try_get("disposition").map_err(err)?,
+                    agent_outcome: r.try_get("agent_outcome").map_err(err)?,
+                    node: r.try_get("node").map_err(err)?,
+                    pool: r.try_get("pool").map_err(err)?,
+                    created_at: r.try_get("created_at").map_err(err)?,
+                    dialed_at: r.try_get("dialed_at").map_err(err)?,
+                    answered_at: r.try_get("answered_at").map_err(err)?,
+                    ended_at: r.try_get("ended_at").map_err(err)?,
+                    outcome_at: r.try_get("outcome_at").map_err(err)?,
+                    settled_at: r.try_get("settled_at").map_err(err)?,
+                })
+            })
+            .collect()
     }
 
     /// Ended attempts that have not updated their lead yet, oldest first.

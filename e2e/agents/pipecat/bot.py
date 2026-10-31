@@ -8,8 +8,10 @@ POST /start takes the dialer's start request (ad_agent, runtime `pipecat`):
 
 and starts one bot that joins the room with pipecat's LiveKit transport. The
 bot needs no AI service: it counts the audio frames of the callee, plays a
-tone back, and ends when the callee leaves or the room closes. GET /stats
-reports per room, in the same shape as the e2e LiveKit agent.
+tone back, and ends when the callee leaves or the room closes. When the callee
+leaves, it reports the outcome of the call on the session stream
+(agent_session.py). GET /stats reports per room, in the same shape as the e2e
+LiveKit agent.
 """
 
 import asyncio
@@ -23,6 +25,8 @@ from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
 from pipecat.workers.runner import WorkerRunner
+
+from agent_session import Session, planned_outcome
 
 PORT = int(os.environ.get("PORT", "8089"))
 TONE_RATE = 16000
@@ -58,6 +62,17 @@ class CalleeAudio(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+async def open_session(room: str, call: dict) -> "Session | None":
+    try:
+        session = await Session.open(call, "e2e-pipecat")
+    except Exception as e:  # noqa: BLE001 - the stats show it to the test
+        stats[room]["session"] = f"error: {e}"
+        return None
+    stats[room]["session"] = "open" if session else "none"
+    stats[room]["codes"] = session.codes() if session else []
+    return session
+
+
 async def run_bot(req: dict) -> None:
     room, call = req["room_name"], req.get("call", {})
     callee = call.get("callee_identity", "")
@@ -70,6 +85,18 @@ async def run_bot(req: dict) -> None:
         "frames_out": 0,
         "ended": False,
     }
+    # Open the session in the background: the join must not wait for it,
+    # because the callee waits at most 2 s for the agent.
+    opening = asyncio.create_task(open_session(room, call))
+
+    async def report() -> None:
+        session, outcome = await opening, planned_outcome(call)
+        if session and outcome and "outcome" not in stats[room]:
+            try:
+                stats[room]["outcome"] = await session.report(outcome)
+            except Exception as e:  # noqa: BLE001 - the stats show it to the test
+                stats[room]["outcome"] = f"error: {e}"
+
     transport = LiveKitTransport(
         url=req["url"],
         token=req["token"],
@@ -103,6 +130,7 @@ async def run_bot(req: dict) -> None:
     @transport.event_handler("on_participant_disconnected")
     async def _left(_transport, participant_id):
         if participant_id == callee:
+            await report()
             await worker.cancel()
 
     @transport.event_handler("on_disconnected")
@@ -112,6 +140,9 @@ async def run_bot(req: dict) -> None:
     try:
         await runner.run()
     finally:
+        session = await opening
+        if session:
+            await session.close()
         stats[room]["ended"] = True
 
 
@@ -121,8 +152,10 @@ async def start(request: web.Request) -> web.Response:
         if not req.get(field):
             return web.json_response({"error": f"{field} is missing"}, status=400)
     # Test controls of the start_url: hold_ms delays the answer, join=0 starts
-    # no bot.
+    # no bot, refuse=<status> refuses the start with that HTTP status.
     await asyncio.sleep(int(request.query.get("hold_ms", "0")) / 1000)
+    if request.query.get("refuse"):
+        return web.json_response({"error": "refused"}, status=int(request.query["refuse"]))
     if request.query.get("join") != "0":
         task = asyncio.create_task(run_bot(req))
         tasks.add(task)

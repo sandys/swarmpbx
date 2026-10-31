@@ -100,8 +100,8 @@ async fn preview_excludes_by_routing_rule() {
         &app,
         cid,
         json!([
-            { "phone_number": "+1ny", "timezone": "America/New_York", "state": "NY" },
-            { "phone_number": "+1tx", "timezone": "America/New_York", "state": "TX" }
+            { "phone_number": "+12125550206", "timezone": "America/New_York", "state": "NY" },
+            { "phone_number": "+12145550207", "timezone": "America/New_York", "state": "TX" }
         ]),
     )
     .await;
@@ -122,7 +122,7 @@ async fn preview_excludes_by_routing_rule() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["eligible"].as_array().unwrap().len(), 1);
-    assert_eq!(v["eligible"][0]["phone_number"], "+1ny");
+    assert_eq!(v["eligible"][0]["phone_number"], "+12125550206");
     assert_eq!(v["excluded"].as_array().unwrap().len(), 1);
     assert_eq!(v["excluded"][0]["reason"], "routing:skip");
 }
@@ -161,8 +161,8 @@ async fn preview_up_count_order() {
         &app,
         cid,
         json!([
-            { "phone_number": "+1a", "timezone": "America/New_York" },
-            { "phone_number": "+1b", "timezone": "America/New_York" }
+            { "phone_number": "+13125550201", "timezone": "America/New_York" },
+            { "phone_number": "+13125550202", "timezone": "America/New_York" }
         ]),
     )
     .await;
@@ -177,5 +177,5 @@ async fn preview_up_count_order() {
     assert_eq!(status, StatusCode::OK);
     let e = v["eligible"].as_array().unwrap();
     assert_eq!(e.len(), 2);
-    assert_eq!(e[0]["phone_number"], "+1a");
+    assert_eq!(e[0]["phone_number"], "+13125550201");
 }

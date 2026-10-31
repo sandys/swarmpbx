@@ -12,6 +12,7 @@ fn limits() -> Limits {
 /// window of limit `k`.
 fn sample(start_ms: i64, join: Join, k: u32) -> Sample {
     Sample {
+        attempt_id: start_ms,
         started_at: t(start_ms),
         at: t(start_ms + 100),
         join,
@@ -33,8 +34,8 @@ fn feed(state: State, samples: &[Sample]) -> State {
 fn the_defaults_come_from_the_abandonment_limit() {
     let l = limits();
     assert_eq!(
-        (l.target_ms, l.backoff_ms, l.first_k, l.max_k),
-        (1000, 1500, 1, None)
+        (l.target_ms, l.backoff_ms, l.first_k, l.max_k, l.trip_after),
+        (1000, 1500, 1, None, 5)
     );
     assert_eq!(State::new(&l).k, 1);
     assert!(State::new(&l).slow_start);
@@ -74,6 +75,7 @@ fn settings_that_cannot_work_are_refused() {
         backoff_ms: Some(600),
         first_k: Some(4),
         max_k: Some(8),
+        trip_after: Some(3),
     };
     assert_eq!(State::new(&ok.resolve(2000).unwrap()).k, 4);
 }
@@ -141,6 +143,7 @@ fn one_round_halves_k_once() {
     // Four calls of one burst, all claimed before the first result.
     let burst: Vec<Sample> = (0..4)
         .map(|i| Sample {
+            attempt_id: i,
             started_at: t(i),
             at: t(1600 + i),
             join: Join::Failed,
@@ -242,6 +245,82 @@ fn a_mid_sample_neither_proves_nor_halves() {
         }],
     );
     assert_eq!((next.k, next.proven), (4, 2));
+}
+
+/// `n` failed starts, 100 ms apart, from attempt `first` on.
+fn failures(first: i64, n: i64) -> Vec<Sample> {
+    (first..first + n)
+        .map(|i| Sample {
+            attempt_id: i,
+            ..sample(i * 100, Join::Failed, 1)
+        })
+        .collect()
+}
+
+#[test]
+fn five_failed_starts_in_a_row_at_k_1_open_the_breaker() {
+    let l = limits();
+    let s = feed(State::new(&l), &failures(1, 4));
+    assert!(!tripped(&s, &l));
+    let s = feed(s, &failures(5, 1));
+    assert!(tripped(&s, &l));
+    assert_eq!(
+        (s.failed_in_row, s.failed.clone()),
+        (5, vec![1, 2, 3, 4, 5])
+    );
+}
+
+#[test]
+fn a_join_starts_the_count_again_and_an_unknown_end_keeps_it() {
+    let l = limits();
+    let s = feed(State::new(&l), &failures(1, 4));
+    let joined = feed(s.clone(), &[sample(500, Join::Joined { ms: 1900 }, 1)]);
+    assert_eq!((joined.failed_in_row, joined.failed.len()), (0, 0));
+    let s = feed(s, &[sample(500, Join::Unknown, 1)]);
+    let s = feed(s, &failures(6, 1));
+    assert!(
+        tripped(&s, &l),
+        "the callee's hang-up does not break the run"
+    );
+}
+
+#[test]
+fn the_breaker_opens_only_at_k_1() {
+    let l = limits();
+    let mut s = State::new(&l);
+    s.k = 4;
+    s.failed_in_row = 7;
+    assert!(!tripped(&s, &l));
+    s.k = 1;
+    assert!(tripped(&s, &l));
+}
+
+#[test]
+fn trip_after_is_a_setting() {
+    let l = Settings {
+        trip_after: Some(2),
+        ..Settings::default()
+    }
+    .resolve(2000)
+    .unwrap();
+    let s = (1..=2).fold(State::new(&l), |s, i| {
+        observe(&s, &l, &sample(i * 100, Join::Failed, 1))
+    });
+    assert!(tripped(&s, &l));
+    let zero = Settings {
+        trip_after: Some(0),
+        ..Settings::default()
+    };
+    assert!(zero.resolve(2000).is_err());
+}
+
+#[test]
+fn the_state_keeps_the_last_failed_attempts() {
+    let mut s = feed(State::new(&limits()), &failures(1, 30));
+    assert_eq!(s.failed_in_row, 30);
+    assert_eq!(s.failed, (11..=30).collect::<Vec<i64>>());
+    s.reset_failures();
+    assert_eq!((s.failed_in_row, s.failed.len()), (0, 0));
 }
 
 #[test]

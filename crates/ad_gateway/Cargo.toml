@@ -17,7 +17,9 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 livekit = "0.9"
-livekit-api = "0.8"
+ad_livekit = { path = "../ad_livekit" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 livekit-protocol = "0.8"
 futures-util = "0.3"
 # Click-to-call: the Twilio Calls API (HTTPS) and the call tokens.
@@ -25,6 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rand = "0.8"
 
 [dev-dependencies]
+chrono = { workspace = true }
 base64 = "0.21"
 sha2 = "0.10"
 url = "2"

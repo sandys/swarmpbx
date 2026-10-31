@@ -58,6 +58,10 @@ services:
   livekit-agent:
     build:
       context: agents/livekit
+      # The client of the session stream: the proto and agent_session.py.
+      additional_contexts:
+        proto: ../proto
+        session: agents/session
     image: ad-e2e-livekit-agent
     environment:
       LIVEKIT_URL: ws://livekit:7880
@@ -71,6 +75,9 @@ services:
   pipecat-bot:
     build:
       context: agents/pipecat
+      additional_contexts:
+        proto: ../proto
+        session: agents/session
     image: ad-e2e-pipecat-bot
     environment:
       PORT: "8089"
@@ -162,6 +169,7 @@ services:
       - AD_SIP_CALLER_ID=${E2E_SIP_CALLER_ID:-+15550001000}
       - AD_SIP_PROXY=kamailio:5060
       - AD_ETCD_ENDPOINTS=http://kine:2379
+      - AD_SESSION_URL=http://api:9090
       - AD_ROOM_PREFIX=campaign
       - AD_NODE_CAPACITY=2
       - AD_CLUSTER_TTL_S=5
@@ -171,8 +179,8 @@ services:
     networks: [cluster]
 
   node-2:
-    # The OS clock of this node is 3 min behind (assert (h)).
-    image: agentdialer:e2e-clock-3m
+    # The OS clock of this node is 11 min behind (assert (h)).
+    image: agentdialer:e2e-clock-behind-11m
     command: ["orchestrator"]
     environment:
       - HOSTNAME=node-2
@@ -186,6 +194,7 @@ services:
       - AD_SIP_CALLER_ID=${E2E_SIP_CALLER_ID:-+15550001000}
       - AD_SIP_PROXY=kamailio:5060
       - AD_ETCD_ENDPOINTS=http://kine:2379
+      - AD_SESSION_URL=http://api:9090
       - AD_ROOM_PREFIX=campaign
       - AD_NODE_CAPACITY=2
       - AD_CLUSTER_TTL_S=5
@@ -195,8 +204,9 @@ services:
     networks: [cluster]
 
   node-3:
-    # The OS clock of this node is 11 min behind (assert (h)).
-    image: agentdialer:e2e-clock-11m
+    # The OS clock of this node is 3 min ahead (assert (h)). LiveKit refuses
+    # a token whose nbf is more than 1 min ahead of its clock.
+    image: agentdialer:e2e-clock-ahead-3m
     command: ["orchestrator"]
     environment:
       - HOSTNAME=node-3
@@ -210,6 +220,7 @@ services:
       - AD_SIP_CALLER_ID=${E2E_SIP_CALLER_ID:-+15550001000}
       - AD_SIP_PROXY=kamailio:5060
       - AD_ETCD_ENDPOINTS=http://kine:2379
+      - AD_SESSION_URL=http://api:9090
       - AD_ROOM_PREFIX=campaign
       - AD_NODE_CAPACITY=2
       - AD_CLUSTER_TTL_S=5

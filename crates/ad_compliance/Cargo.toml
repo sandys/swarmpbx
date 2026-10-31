@@ -9,6 +9,7 @@ license.workspace = true
 ad_core = { path = "../ad_core" }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+ad_contact = { path = "../ad_contact" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 

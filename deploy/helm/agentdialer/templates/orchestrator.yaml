@@ -48,6 +48,9 @@ spec:
               value: {{ .Values.orchestrator.eventSweepMs | quote }}
             - name: AD_ETCD_ENDPOINTS
               value: {{ .Values.cluster.etcdEndpoints | quote }}
+            # The agents report the outcome of each call on this stream.
+            - name: AD_SESSION_URL
+              value: {{ .Values.api.sessionUrl | default (printf "http://%s-api:%v" (include "agentdialer.fullname" .) .Values.api.sessionPort) | quote }}
             # The node carries its calls (PLAN.md §0.0): its SIP user agent
             # sends through the SIP edge and advertises the pod IP.
             - name: AD_DIAL_PROVIDER

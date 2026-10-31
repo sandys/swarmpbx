@@ -1,6 +1,6 @@
 //! Property tests for the join-paced controller.
 
-use ad_pacing::{limit, observe, Join, Limits, Mode, Sample, Settings, State};
+use ad_pacing::{limit, observe, tripped, Join, Limits, Mode, Sample, Settings, State};
 use chrono::{DateTime, Duration, Utc};
 use proptest::prelude::*;
 
@@ -26,6 +26,7 @@ fn sample() -> impl Strategy<Value = Sample> {
         0u32..64,
     )
         .prop_map(|(start, len, join, window, limit, concurrent)| Sample {
+            attempt_id: start,
             started_at: t(start),
             at: t(start + len),
             join,
@@ -41,14 +42,16 @@ fn limits() -> impl Strategy<Value = Limits> {
         0u32..1000,
         1u32..16,
         proptest::option::of(0u32..64),
+        1u32..10,
     )
-        .prop_map(|(target, extra, first, max)| {
+        .prop_map(|(target, extra, first, max, trip_after)| {
             let max = max.map(|m| m.max(first));
             Settings {
                 target_ms: Some(target),
                 backoff_ms: Some((target + 1 + extra).min(2000)),
                 first_k: Some(first),
                 max_k: max,
+                trip_after: Some(trip_after),
             }
             .resolve(2000)
             .unwrap()
@@ -109,6 +112,24 @@ proptest! {
     fn strict_never_allows_more_than_adaptive(l in limits(), samples in prop::collection::vec(sample(), 0..100)) {
         for s in run(&l, &samples) {
             prop_assert!(limit(&s, &l, Mode::Strict) <= limit(&s, &l, Mode::Adaptive));
+        }
+    }
+
+    // INVARIANT: the breaker opens only at k = 1, after trip_after failed
+    // starts with no join between them.
+    #[test]
+    fn the_breaker_needs_k_1_and_a_run_of_failures(l in limits(), samples in prop::collection::vec(sample(), 0..200)) {
+        let mut run_len = 0u32;
+        for (i, st) in run(&l, &samples).iter().enumerate() {
+            if i > 0 {
+                match samples[i - 1].join {
+                    Join::Failed => run_len += 1,
+                    Join::Joined { .. } => run_len = 0,
+                    Join::Unknown => {}
+                }
+            }
+            prop_assert_eq!(st.failed_in_row, run_len);
+            prop_assert_eq!(tripped(st, &l), st.k == 1 && run_len >= l.trip_after);
         }
     }
 

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ad_core = { path = "../ad_core" }
 ad_compliance = { path = "../ad_compliance" }
+ad_contact = { path = "../ad_contact" }
 ad_campaign = { path = "../ad_campaign" }
 ad_lead = { path = "../ad_lead" }
 ad_routing = { path = "../ad_routing" }
@@ -20,6 +21,9 @@ ad_attempt = { path = "../ad_attempt" }
 ad_gateway = { path = "../ad_gateway" }
 ad_agent = { path = "../ad_agent" }
 ad_pacing = { path = "../ad_pacing" }
+ad_disposition = { path = "../ad_disposition" }
+ad_session = { path = "../ad_session" }
+ad_events = { path = "../ad_events" }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

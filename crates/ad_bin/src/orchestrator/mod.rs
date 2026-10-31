@@ -42,6 +42,8 @@ struct Settings {
     breaker: BreakerConfig,
     retry: RetryPolicy,
     windows: CallWindowSet,
+    /// The session stream that the agents reach (`AD_SESSION_URL`).
+    session_url: Option<String>,
 }
 
 /// A running call: its task, and the generation of the assignment it runs.
@@ -133,6 +135,7 @@ pub fn run() -> anyhow::Result<()> {
         node_capacity,
         cluster_ttl_s,
         worker,
+        session_url,
         ..
     } = cfg;
 
@@ -141,7 +144,7 @@ pub fn run() -> anyhow::Result<()> {
         let db = ad_db::Db::connect_ready(&database_url, None).await?;
         let clock = PgClock::start(db.pool().clone()).await;
         let kine = Kine::connect_ready(&etcd_endpoints, None).await?;
-        let sip_caller = start_sip(&sip, &worker, &gw).await?;
+        let sip_caller = start_sip(&sip, &worker, &gw, clock.clone()).await?;
         let caller = match provider {
             DialProvider::SipTrunk => Telephony::SipTrunk(sip_caller),
             DialProvider::TwilioClickToCall(twilio) => {
@@ -158,13 +161,16 @@ pub fn run() -> anyhow::Result<()> {
             attempts: db.attempts(),
             breaker: db.breaker(),
             db,
-            gateway: Gateway::new(LiveKitGateway::new(&gw)),
+            gateway: Gateway::new(LiveKitGateway::new(&gw, clock.clone())),
             caller,
-            agents: Agents::new(LiveKitAccess {
-                url: gw.livekit_url.clone(),
-                api_key: gw.api_key.clone(),
-                api_secret: gw.api_secret.clone(),
-            }),
+            agents: Agents::new(
+                LiveKitAccess {
+                    url: gw.livekit_url.clone(),
+                    api_key: gw.api_key.clone(),
+                    api_secret: gw.api_secret.clone(),
+                },
+                clock.clone(),
+            ),
             kine: kine.clone(),
             clock,
             settings: Settings {
@@ -177,6 +183,7 @@ pub fn run() -> anyhow::Result<()> {
                 breaker: BreakerConfig::default(),
                 retry: RetryPolicy::default(),
                 windows: CallWindowSet::uniform(0, 2400).expect("full-day window"),
+                session_url,
             },
             running: Mutex::default(),
         });
@@ -243,6 +250,7 @@ async fn start_sip(
     sip: &SipSettings,
     worker: &str,
     gw: &ad_gateway::GatewayConfig,
+    clock: Arc<PgClock>,
 ) -> anyhow::Result<SipCaller> {
     let proxy = match &sip.proxy {
         Some(p) => Some(resolve_ready(p).await),
@@ -289,5 +297,6 @@ async fn start_sip(
                 .map(|(username, password)| ad_sip::TrunkAuth { username, password }),
         },
         gw.clone(),
+        clock,
     ))
 }

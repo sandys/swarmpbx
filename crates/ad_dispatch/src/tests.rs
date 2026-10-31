@@ -158,16 +158,18 @@ async fn dnc_regate_blocks() {
         in_use: Arc::new(AtomicUsize::new(0)),
         max: 10,
     };
-    let mut dnc = DncSet::default();
-    dnc.system.insert("18005551234".into());
+    let dnc = DncSet::from_lists(&["+18005551234".into()], &[], &[]).unwrap();
     let w = windows();
     let clock = clock_inside();
     let d = dispatcher(&clock, &init, &cap, &w, &dnc);
 
     let out = d
-        .dispatch_lead(&lead(1, Some("America/New_York"), "1-800-555-1234"))
+        .dispatch_lead(&lead(1, Some("America/New_York"), "+1-800-555-1234"))
         .await;
-    assert!(matches!(out, CallOutcome::ComplianceDenied(_)));
+    assert!(
+        matches!(&out, CallOutcome::ComplianceDenied(r) if r.starts_with("DNC")),
+        "{out:?}"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -188,7 +190,7 @@ async fn capacity_cap_reports_no_capacity_when_slots_full() {
     let d = dispatcher(&clock, &init, &cap, &w, &dnc);
 
     let out = d
-        .dispatch_lead(&lead(1, Some("America/New_York"), "+1a"))
+        .dispatch_lead(&lead(1, Some("America/New_York"), "+13125550201"))
         .await;
     assert_eq!(out, CallOutcome::NoCapacity);
     assert_eq!(
@@ -217,9 +219,9 @@ async fn batch_releases_slots_so_more_than_cap_can_dial_sequentially() {
     let d = dispatcher(&clock, &init, &cap, &w, &dnc);
 
     let leads = vec![
-        lead(1, Some("America/New_York"), "+1a"),
-        lead(2, Some("America/New_York"), "+1b"),
-        lead(3, Some("America/New_York"), "+1c"),
+        lead(1, Some("America/New_York"), "+13125550201"),
+        lead(2, Some("America/New_York"), "+13125550202"),
+        lead(3, Some("America/New_York"), "+13125550203"),
     ];
     let out = d.dispatch_batch(&leads).await;
     assert!(out.iter().all(|(_, o)| *o == CallOutcome::Answered));
@@ -271,7 +273,7 @@ async fn placements_map_to_dispatch_outcomes() {
         };
         let d = dispatcher(&clock, &init, &cap, &w, &dnc);
         let got = d
-            .dispatch_lead(&lead(1, Some("America/New_York"), "+1a"))
+            .dispatch_lead(&lead(1, Some("America/New_York"), "+13125550201"))
             .await;
         assert_eq!(got, want);
     }

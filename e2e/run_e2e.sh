@@ -18,9 +18,18 @@
 # BYE comes back through Kamailio and ends the attempt on the node. The leader
 # settles the lead, closes the room, and completes the campaign.
 #
+# Each agent reports the outcome of its call on the session stream
+# (AD_SESSION_URL). The lead context tells the test agent which outcome to
+# send: lead 1 reports SALE, lead 2 asks for a DNC entry of its campaign,
+# lead 9 asks for a callback in one day, and lead 8 reports nothing. Campaign
+# 5 waits 3 s for an outcome (outcome_wait_s), and then settles lead 8
+# without one. The other leads report DONE.
+#
 # Campaign 3 has no agent. Its leads call the carrier's busy, failing, and
 # unanswered numbers, and each must end with the matching outcome (the
-# unanswered one at the ring timeout, by CANCEL).
+# unanswered one at the ring timeout, by CANCEL). Its fourth lead has a number
+# on the system DNC list from before the lead existed, so only the leader's
+# gate can stop it: it is not dialed, and the lead becomes `dnc`.
 #
 # Campaign 4 dials the customer first with a bot whose start request takes
 # 4 s and that never joins. Its first lead answers, and the node hangs up 2 s
@@ -36,6 +45,12 @@
 # resumes the campaign. The first two calls start at once; their slow joins
 # halve the window to 1. No call is abandoned, no claim goes above its limit,
 # and the faster pools grow their limit above 1.
+#
+# Campaign 8 tests the breaker of an agent pool (GAPS.md DIAL-9 item 7). Its
+# bot server refuses each start request (HTTP 503), and it dials agent first,
+# so no call is placed. After five refused starts in a row at a limit of 1,
+# the leader pauses the campaign and records the attempt ids; its sixth lead
+# is not tried.
 #
 # The checks treat Postgres and kine as managed services: they go through the
 # database URL and the kine endpoint, never into a container. The carrier's
@@ -74,7 +89,8 @@ route_added() { [ "$($CL ps -a --format '{{.Service}} {{.State}} {{.ExitCode}}' 
 
 # check_call <lead> <runtime> <stats URL> <agent identity glob> <number> <dial order>
 check_call() {
-  local lead=$1 runtime=$2 stats=$3 pattern=$4 number=$5 order=$6 room agent events want order_sql gap
+  local lead=$1 runtime=$2 stats=$3 pattern=$4 number=$5 order=$6 status=${7:-dispositioned}
+  local room agent events want order_sql gap
   echo "== $runtime ($order): lead $lead =="
   wait_for 60 "$runtime: attempt created" pg_ge "SELECT count(*) FROM call_attempts WHERE lead_id=$lead" 1 || { FAIL=1; return; }
   room=$(pg "SELECT room FROM call_attempts WHERE lead_id=$lead")
@@ -89,8 +105,8 @@ check_call() {
   wait_for 30 "$runtime: the carrier's BYE came back through Kamailio and ended the attempt" pg_eq \
     "SELECT count(*) FROM call_attempts a JOIN attempt_events e ON e.attempt_id = a.id
      WHERE a.lead_id=$lead AND a.outcome='completed' AND e.kind='hangup' AND e.payload->>'detail' = 'the callee hung up'" 1 || FAIL=1
-  wait_for 15 "$runtime: lead dispositioned and counted once" pg_eq \
-    "SELECT status || ':' || called_count FROM leads WHERE id=$lead" dispositioned:1 || FAIL=1
+  wait_for 15 "$runtime: lead $status and counted once" pg_eq \
+    "SELECT status || ':' || called_count FROM leads WHERE id=$lead" "$status:1" || FAIL=1
   wait_for 20 "$runtime: the leader closed the room and the agent left" bash -c \
     ". ./lib.sh; [ \"\$(room_stat $stats $room ended)\" = True ]" || FAIL=1
   events=$(pg "SELECT string_agg(e.kind, ',' ORDER BY e.seq) FROM attempt_events e JOIN call_attempts a ON a.id = e.attempt_id WHERE a.lead_id=$lead")
@@ -159,34 +175,71 @@ pg "INSERT INTO campaigns (id, org_id, name, state, concurrency_cap, agent, crea
     (2, 1, 'e2e-pipecat', 'running', 1, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start\",\"dial_order\":\"agent_first\"}', now(), now()),
     (3, 1, 'e2e-outcomes', 'running', 3, NULL, now(), now()),
     (4, 1, 'e2e-abandon', 'running', 1, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start?hold_ms=4000&join=0\",\"join_timeout_s\":3}', now(), now()),
-    (5, 1, 'e2e-pipecat-cf', 'running', 1, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start\"}', now(), now()),
+    (5, 1, 'e2e-pipecat-cf', 'running', 1, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start\",\"outcome_wait_s\":3}', now(), now()),
     (6, 1, 'e2e-livekit-af', 'running', 1, '{\"runtime\":\"livekit\",\"agent_name\":\"e2e-livekit\",\"dial_order\":\"agent_first\"}', now(), now()),
-    (7, 1, 'e2e-slow-pool', 'paused', 6, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start?hold_ms=700\"}', now(), now());
-    SELECT setval(pg_get_serial_sequence('campaigns','id'), 7, true);
+    (7, 1, 'e2e-slow-pool', 'paused', 6, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start?hold_ms=700\"}', now(), now()),
+    (8, 1, 'e2e-refused-pool', 'running', 1, '{\"runtime\":\"pipecat\",\"start_url\":\"http://pipecat-bot:8089/start?refuse=503\",\"dial_order\":\"agent_first\"}', now(), now());
+    SELECT setval(pg_get_serial_sequence('campaigns','id'), 8, true);
     INSERT INTO leads (id, campaign_id, phone_number, timezone, status, called_count, context, created_at, updated_at) VALUES
-    (1, 1, '+15550000001', 'America/New_York', 'new', 0, '{\"name\":\"Ada\"}'::jsonb, now(), now()),
-    (2, 2, '+15550000002', 'America/New_York', 'new', 0, '{\"name\":\"Bob\"}'::jsonb, now(), now()),
+    (1, 1, '+15550000001', 'America/New_York', 'new', 0, '{\"name\":\"Ada\",\"outcome\":{\"disposition\":\"SALE\",\"answered_by\":\"human\",\"summary\":\"bought the plan\"}}'::jsonb, now(), now()),
+    (2, 2, '+15550000002', 'America/New_York', 'new', 0, '{\"name\":\"Bob\",\"outcome\":{\"disposition\":\"NI\",\"dnc\":{\"scope\":\"campaign\"}}}'::jsonb, now(), now()),
     (3, 3, '+15550000486', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (4, 3, '+15550000503', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (5, 3, '+15550000408', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (6, 4, '+15550000011', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (7, 4, '+15550000012', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
-    (8, 5, '+15550000003', 'America/New_York', 'new', 0, '{\"name\":\"Cy\"}'::jsonb, now(), now()),
-    (9, 6, '+15550000004', 'America/New_York', 'new', 0, '{\"name\":\"Di\"}'::jsonb, now(), now()),
+    (8, 5, '+15550000003', 'America/New_York', 'new', 0, '{\"name\":\"Cy\",\"outcome\":null}'::jsonb, now(), now()),
+    (9, 6, '+15550000004', 'America/New_York', 'new', 0, '{\"name\":\"Di\",\"outcome\":{\"disposition\":\"CALLBK\",\"callback\":{\"in_s\":86400}}}'::jsonb, now(), now()),
     (10, 7, '+15550000021', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (11, 7, '+15550000022', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (12, 7, '+15550000023', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (13, 7, '+15550000024', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (14, 7, '+15550000025', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()),
     (15, 7, '+15550000026', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now());
-    SELECT setval(pg_get_serial_sequence('leads','id'), 15, true);" >/dev/null
-pg_eq "SELECT count(*) FROM leads" 15 || { echo "FAIL: seed"; exit 1; }
+    INSERT INTO leads (id, campaign_id, phone_number, timezone, status, called_count, context, created_at, updated_at)
+    SELECT 15 + g, 8, '+155500000' || (30 + g), 'America/New_York', 'new', 0, '{}'::jsonb, now(), now()
+    FROM generate_series(1, 6) g;
+    INSERT INTO dnc_numbers (phone_number, scope, source, evidence) VALUES ('+15550000099', 'system', 'api', '{\"note\":\"e2e\"}');
+    INSERT INTO leads (id, campaign_id, phone_number, timezone, status, called_count, context, created_at, updated_at) VALUES
+    (22, 3, '+1 555 000 0099', 'America/New_York', 'new', 0, '{}'::jsonb, now(), now());
+    SELECT setval(pg_get_serial_sequence('leads','id'), 22, true);" >/dev/null
+pg_eq "SELECT count(*) FROM leads" 22 || { echo "FAIL: seed"; exit 1; }
 echo "ok: seeded"
 
 check_call 1 livekit "$LK_STATS" 'agent-AJ_*' +15550000001 customer_first
-check_call 2 pipecat "$PC_STATS" 'agent-attempt-*' +15550000002 agent_first
+check_call 2 pipecat "$PC_STATS" 'agent-attempt-*' +15550000002 agent_first dnc
 check_call 8 pipecat "$PC_STATS" 'agent-attempt-*' +15550000003 customer_first
-check_call 9 livekit "$LK_STATS" 'agent-AJ_*' +15550000004 agent_first
+check_call 9 livekit "$LK_STATS" 'agent-AJ_*' +15550000004 agent_first queued
+
+echo "== the agents' outcomes: a disposition, a DNC request, a callback, and no outcome =="
+room_of() { pg "SELECT room FROM call_attempts WHERE lead_id=$1"; }
+[ "$(room_stat "$LK_STATS" "$(room_of 1)" outcome)" = ack ] && [ "$(room_stat "$PC_STATS" "$(room_of 2)" outcome)" = ack ] \
+  && [ "$(room_stat "$LK_STATS" "$(room_of 9)" outcome)" = ack ] \
+  && echo "ok: the dialer acknowledged the outcomes of leads 1, 2, and 9" \
+  || { echo "FAIL: the session answers were '$(room_stat "$LK_STATS" "$(room_of 1)" outcome)', '$(room_stat "$PC_STATS" "$(room_of 2)" outcome)', '$(room_stat "$LK_STATS" "$(room_of 9)" outcome)'"; FAIL=1; }
+pg_eq "SELECT disposition || ':' || (agent_outcome->>'summary') || ':' || (agent_outcome->>'answered_by') FROM call_attempts WHERE lead_id=1" \
+  "SALE:bought the plan:human" && echo "ok: lead 1 has the disposition SALE and the agent's summary" \
+  || { echo "FAIL: lead 1 outcome '$(pg "SELECT disposition || ' ' || agent_outcome::text FROM call_attempts WHERE lead_id=1")'"; FAIL=1; }
+pg_eq "SELECT d.scope || ':' || d.campaign_id || ':' || d.source || ':' || (d.attempt_id = a.id) || ':' || a.disposition
+       FROM dnc_numbers d JOIN call_attempts a ON a.lead_id = 2 WHERE d.phone_number = '+15550000002'" campaign:2:agent:true:NI \
+  && echo "ok: lead 2 asked not to be called: its number is on the DNC list of campaign 2, from the agent" \
+  || { echo "FAIL: the DNC entry of lead 2 is '$(pg "SELECT row_to_json(d) FROM dnc_numbers d WHERE phone_number = '+15550000002'")'"; FAIL=1; }
+[ "$(api_field "$API/v1/dnc?campaign_id=2" "[e['source'] for e in v if e['phone_number'] == '+15550000002']")" = "['agent']" ] \
+  && echo "ok: GET /v1/dnc shows the entry" || { echo "FAIL: GET /v1/dnc answered '$(api_send GET "$API/v1/dnc?campaign_id=2")'"; FAIL=1; }
+pg_eq "SELECT status || ':' || retry_reason || ':' || priority || ':' || (next_eligible_at BETWEEN now() + interval '23 hours' AND now() + interval '25 hours')
+       FROM leads WHERE id=9" queued:callback:50:true \
+  && echo "ok: lead 9 waits for its callback in one day, before the other leads" \
+  || { echo "FAIL: lead 9 is '$(pg "SELECT status || ' ' || retry_reason || ' ' || priority || ' ' || next_eligible_at FROM leads WHERE id=9")'"; FAIL=1; }
+# Postgres times only (the node's clock can run ahead of Postgres): the wait
+# is 3 s, and a settlement without a wait takes well under 0.5 s.
+WAITED="settled_at - $(saved_end a)"
+pg_eq "SELECT (agent_outcome IS NULL) || ':' || ($WAITED >= interval '2.5 seconds') || ':' || ($WAITED < interval '15 seconds')
+       FROM call_attempts a WHERE a.lead_id=8" true:true:true \
+  && echo "ok: lead 8 reported nothing; the dialer waited $(pg "SELECT round(extract(epoch FROM $WAITED), 1) FROM call_attempts a WHERE a.lead_id=8") s, then settled it" \
+  || { echo "FAIL: lead 8 settled '$(pg "SELECT coalesce(agent_outcome::text, 'no outcome') || ' ' || ($WAITED) FROM call_attempts a WHERE a.lead_id=8")'"; FAIL=1; }
+[ "$(api_field "$API/v1/campaigns/1/attempts" "v[0]['disposition']")" = SALE ] \
+  && echo "ok: GET /v1/campaigns/1/attempts shows the disposition" \
+  || { echo "FAIL: GET /v1/campaigns/1/attempts answered '$(api_send GET "$API/v1/campaigns/1/attempts")'"; FAIL=1; }
 
 echo "== customer first: no agent in the room 2 s after the answer abandons the call =="
 wait_for 60 "lead 6 ends as abandoned" pg_eq "SELECT outcome FROM call_attempts WHERE lead_id=6" abandoned || FAIL=1
@@ -225,8 +278,14 @@ check_outcome 4 +15550000503 failed failed 60
 # No answer: the node cancels at its ring timeout (30 s), and the carrier
 # answers the INVITE with 487.
 check_outcome 5 +15550000408 no_answer canceled 90
+wait_for 30 "lead 22, on the system DNC list, is not dialed" pg_eq \
+  "SELECT a.outcome || ':' || l.status FROM call_attempts a JOIN leads l ON l.id = a.lead_id WHERE l.id = 22" not_dialed:dnc || FAIL=1
+sim_eq "c['to'] == '+15550000099'" 0 && echo "ok: the gate read the DNC list, and the carrier never saw lead 22" \
+  || { echo "FAIL: the carrier saw a call to lead 22, which is on the DNC list"; FAIL=1; }
 
-wait_for 30 "the agent campaigns completed" pg_eq "SELECT count(*) FROM campaigns WHERE state='completed' AND id IN (1, 2, 5, 6)" 4 || FAIL=1
+wait_for 30 "the agent campaigns completed" pg_eq "SELECT count(*) FROM campaigns WHERE state='completed' AND id IN (1, 2, 5)" 3 || FAIL=1
+pg_eq "SELECT state FROM campaigns WHERE id=6" running && echo "ok: campaign 6 runs until the callback of lead 9" \
+  || { echo "FAIL: campaign 6 is $(pg "SELECT state FROM campaigns WHERE id=6") with a callback due"; FAIL=1; }
 
 echo "== join-paced dialing: a slow agent pool gets a smaller window; the API sets its values at run time =="
 SLOW_POOL='pipecat:http://pipecat-bot:8089/start?hold_ms=700'
@@ -267,6 +326,21 @@ FAST=$(api_field "$API/v1/campaigns/5/pacing" "v['pool']['k']")
   && echo "ok: the fast pipecat pool grew its limit to $FAST (p50 $(api_field "$API/v1/campaigns/5/pacing" "v['pool']['recent']['p50_ms']") ms)" \
   || { echo "FAIL: the fast pipecat pool has k='$FAST', want at least 2"; FAIL=1; }
 echo "ok: the pools: $(api_field "$API/v1/agent-pools" "'; '.join(p['pool'] + ' k=' + str(p['k']) + ' joins=' + str(p['samples']) for p in v)")"
+echo "== the agent pool breaker: five refused starts in a row pause the campaign =="
+wait_for 60 "the breaker of its pool paused campaign 8" pg_eq "SELECT state FROM campaigns WHERE id=8" paused || FAIL=1
+TRIP=$(pg "SELECT payload->>'pool' || ' ' || (payload->>'failed_in_row') || ' ' || (payload->'attempt_ids')::text
+           FROM campaign_events WHERE campaign_id=8 AND kind='agent_pool_tripped'")
+IDS=$(pg "SELECT '[' || string_agg(id::text, ', ' ORDER BY id) || ']' FROM call_attempts WHERE campaign_id=8")
+[ "$TRIP" = "pipecat:http://pipecat-bot:8089/start?refuse=503 5 $IDS" ] \
+  && echo "ok: the trip names the pool, 5 failed starts, and the attempts $IDS" \
+  || { echo "FAIL: the trip record of campaign 8 is '$TRIP', the attempts are $IDS"; FAIL=1; }
+pg_eq "SELECT count(*) || ':' || count(*) FILTER (WHERE dialed_at IS NOT NULL) || ':' || count(*) FILTER (WHERE detail LIKE '%answered 503%')
+       FROM call_attempts WHERE campaign_id=8" 5:0:5 \
+  && echo "ok: five starts were refused with 503, no call was dialed, and the sixth lead was not tried" \
+  || { echo "FAIL: campaign 8 attempts: $(pg "SELECT string_agg(id || ':' || outcome || ':' || detail, '; ') FROM call_attempts WHERE campaign_id=8")"; FAIL=1; }
+OUT=$(api_send GET "$API/v1/campaigns/8/events")
+[[ "$OUT" == 200* && "$OUT" == *agent_pool_tripped* ]] && echo "ok: GET /v1/campaigns/8/events shows the trip" \
+  || { echo "FAIL: GET /v1/campaigns/8/events answered '$OUT'"; FAIL=1; }
 wait_for 20 "no call assignment left in kine" kine_none /agentdialer/calls/ || FAIL=1
 NODES=$(kine_keys /agentdialer/nodes/)
 [ "$NODES" = /agentdialer/nodes/node-1 ] || { echo "FAIL: kine nodes '$NODES'"; FAIL=1; }

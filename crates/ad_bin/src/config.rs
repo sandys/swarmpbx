@@ -38,8 +38,11 @@ const fn opt(name: &'static str) -> EnvVar {
 
 /// `agentdialer api`. Without `DATABASE_URL` the API uses an in-memory store.
 /// The LiveKit key and secret verify LiveKit webhooks; set both or neither.
+/// With `DATABASE_URL`, the role also serves the agent session stream (gRPC)
+/// on `AD_SESSION_ADDR`.
 pub const API: &[EnvVar] = &[
     opt("AD_API_ADDR"),
+    opt("AD_SESSION_ADDR"),
     opt("DATABASE_URL"),
     opt("LIVEKIT_API_KEY"),
     opt("LIVEKIT_API_SECRET"),
@@ -78,6 +81,7 @@ pub const ORCHESTRATOR: &[EnvVar] = &[
     opt("AD_ATTEMPT_CHECK_MS"),
     opt("AD_NODE_CAPACITY"),
     opt("AD_CLUSTER_TTL_S"),
+    opt("AD_SESSION_URL"),
     opt("HOSTNAME"),
     opt("RUST_LOG"),
 ];
@@ -148,6 +152,16 @@ pub fn api_config(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<ad_api::ServeConfig, ConfigError> {
     check_required("api", API, &lookup)?;
+    let session_raw = value(&lookup, "AD_SESSION_ADDR").unwrap_or_else(|| "0.0.0.0:9090".into());
+    let Ok(session_addr) = session_raw.trim().parse() else {
+        return Err(ConfigError {
+            role: "api",
+            missing: Vec::new(),
+            invalid: vec![format!(
+                "AD_SESSION_ADDR={session_raw:?} (expected an address like 0.0.0.0:9090)"
+            )],
+        });
+    };
     let key = value(&lookup, "LIVEKIT_API_KEY");
     let secret = value(&lookup, "LIVEKIT_API_SECRET");
     let livekit_keys = match (key, secret) {
@@ -172,6 +186,7 @@ pub fn api_config(
         addr: value(&lookup, "AD_API_ADDR").unwrap_or_else(|| "0.0.0.0:8080".into()),
         database_url: value(&lookup, "DATABASE_URL"),
         livekit_keys,
+        session_addr,
     })
 }
 
@@ -250,6 +265,9 @@ pub struct OrchestratorConfig {
     /// The TTL of the node and leader keys in kine.
     pub cluster_ttl_s: u64,
     pub worker: String,
+    /// The session stream that the agents reach (the api role). Without it
+    /// the agents get no session and cannot report an outcome.
+    pub session_url: Option<String>,
 }
 
 impl OrchestratorConfig {
@@ -299,6 +317,14 @@ impl OrchestratorConfig {
             if !sid.trim().starts_with("AC") {
                 invalid.push(format!(
                     "AD_TWILIO_ACCOUNT_SID={sid:?} (expected an account SID, AC...)"
+                ));
+            }
+        }
+        let session_url = value(&lookup, "AD_SESSION_URL").map(|v| v.trim().to_string());
+        if let Some(url) = &session_url {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                invalid.push(format!(
+                    "AD_SESSION_URL={url:?} (expected an http or https URL like http://api:9090)"
                 ));
             }
         }
@@ -420,6 +446,7 @@ impl OrchestratorConfig {
             node_capacity,
             cluster_ttl_s,
             worker,
+            session_url,
         })
     }
 
@@ -445,18 +472,14 @@ impl fmt::Debug for OrchestratorConfig {
             .field("node_capacity", &self.node_capacity)
             .field("cluster_ttl_s", &self.cluster_ttl_s)
             .field("worker", &self.worker)
+            .field("session_url", &self.session_url)
             .finish_non_exhaustive()
     }
 }
 
-/// `+`, then 7 to 15 digits, the first not 0.
+/// The number reads (`ad_contact`) and is in its E.164 form.
 fn is_e164(s: &str) -> bool {
-    let Some(digits) = s.strip_prefix('+') else {
-        return false;
-    };
-    (7..=15).contains(&digits.len())
-        && digits.chars().all(|c| c.is_ascii_digit())
-        && !digits.starts_with('0')
+    ad_contact::phone_key(s).is_some_and(|k| k.as_str() == s)
 }
 
 /// Parse an optional value, or record why it is invalid.

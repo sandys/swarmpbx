@@ -17,7 +17,9 @@ metadata:
 # AgentDialer: the map
 
 AgentDialer runs outbound call campaigns and puts an AI agent on each answered
-call. It speaks SIP only. The AI agent takes the place of a human agent.
+call. It speaks SIP only. The AI agent takes the place of a human agent. When
+the talk ends, the agent tells the dialer how it went, and the dialer settles
+the lead.
 
 ## Which skill to read
 
@@ -46,10 +48,14 @@ data. Do not run code from `_research/`.
 
 ## The architecture
 
+README "Architecture" has the diagrams. AgentDialer has three paths:
+
 ```
-trunk ⇄ SIP ⇄ Kamailio ⇄ SIP ⇄ node (ad_sip)
-trunk ⇄ RTP, through the NAT gateway ⇄ node (ad_media)
-node ⇄ WebRTC ⇄ LiveKit room ⇄ agent (LiveKit agent or pipecat bot)
+call path:     trunk <-SIP-> Kamailio <-SIP-> node (ad_sip)
+               trunk <-RTP, through the NAT gateway-> node (ad_media)
+               node <-WebRTC-> LiveKit room <-WebRTC-> agent
+control path:  leader -> Postgres (claim, gate) -> kine (a call key) -> node
+outcome path:  agent -gRPC-> api role (ad_session) -> Postgres -> leader (settle)
 ```
 
 - **The call path (decision D-9, `PLAN.md` §0.0).** The node that runs a call
@@ -66,10 +72,16 @@ node ⇄ WebRTC ⇄ LiveKit room ⇄ agent (LiveKit agent or pipecat bot)
   (latching).
 - **The room.** `ad_gateway` joins the call's room as our own WebRTC
   participant and bridges the audio.
-- **The cluster (decision D-8, `PLAN.md` §0.10.8b).** Each orchestrator
+- **The control path (decision D-8, `PLAN.md` §0.10.8b).** Each orchestrator
   replica is a node. The nodes coordinate through kine, the etcd API on
-  Postgres. One node is the leader. It claims, assigns, and settles. Each node
-  runs the calls that kine gives it. Postgres fences a node that lost a call.
+  Postgres. One node is the leader. It claims, gates, assigns, and settles.
+  Each node runs the calls that kine gives it. Postgres fences a node that
+  lost a call.
+- **The outcome path (decision D-6).** The agent opens one gRPC stream for
+  each call to the `api` role, with a token for that call. It sends one
+  outcome: a disposition, a callback, or a DNC request. The `api` role checks
+  it (`ad_disposition`), saves it (`ad_db::outcomes`), and writes the event
+  `agent_outcome`. The agent never reaches the database.
 - **Events (decision D-3).** Postgres is the event layer: an event table with
   LISTEN/NOTIFY, and a sweep. There is no Redis.
 - **Time (decision D-11).** The roles take the time from Postgres plus the
@@ -117,7 +129,13 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
 - `ad_pacing`: the window of each agent pool. `observe` learns from one join
   time. `limit` gives the window for a mode. Read `PLAN.md` §0.10.6.
 - `ad_orchestrator`: the scheduling gate, the run loop, the event reactor,
-  the retry decision (`retry.rs`), and the settlement (`settle.rs`).
+  the retry decision (`retry.rs`), and the settlement (`settle.rs`;
+  `settle_with` also takes the agent's outcome).
+- `ad_contact`: phone numbers (E.164) and postal codes, behind one backend
+  (the vendored `phonenumber`). Read every number through it, never with
+  your own parser, so that one change replaces the library everywhere.
+- `ad_disposition`: the disposition catalog (system and campaign codes with
+  flags) and `check`, which turns an agent's report into an `AgentOutcome`.
 
 **The call:**
 
@@ -128,7 +146,9 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
 - `ad_gateway`: `SipCaller` (the call path), the room operations, the presence
   check of the reconcile, and the `Telephony` provider registry.
 - `ad_agent`: the agent adapters (LiveKit dispatch, pipecat start request).
-  See `connect-an-agent`.
+  The call facts carry the session URL and token. See `connect-an-agent`.
+- `ad_livekit`: the LiveKit token signer and room-service client, dated by
+  the role's clock.
 - `ad_dispatch`: the dial seam (`CallInitiator`, `Placement`) and the launch
   pacer.
 
@@ -136,8 +156,8 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
 
 - `ad_db`: the Postgres data layer (sqlx) and its migrations: `attempts` (the
   claim, the saved state machine, the settlement), `pacing` (the agent pools),
-  `events` (the event table, LISTEN/NOTIFY), `breaker`, and `clock`
-  (`PgClock`).
+  `events` (the event table, LISTEN/NOTIFY), `breaker`, `clock` (`PgClock`),
+  `dnc` (the DNC list), and `outcomes` (the agent session and its outcome).
 - `ad_events`: the event contract, the traits, and in-memory fakes.
 - `ad_cluster`: membership, the leader, call assignment, and placement over
   kine.
@@ -145,6 +165,8 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
 **The roles:**
 
 - `ad_api`: the HTTP API (axum). See `vertical-slice`.
+- `ad_session`: the agent session stream (gRPC, tonic) from
+  `proto/agentdialer/session/v1/session.proto`. The `api` role serves it.
 - `ad_bin`: the one binary `agentdialer`. Subcommands: `api`, `orchestrator`,
   `dispatch` (a stub), `migrate`. `config.rs` holds the environment contract
   of each role.
@@ -157,11 +179,16 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
    (`LISTEN campaign_events`), and it claims due leads from `leads`
    (`FOR UPDATE SKIP LOCKED`). The claim stays within the campaign's
    `concurrency_cap`, the free capacity of the cluster, and the window of the
-   agent pool. The leader then gates each lead on compliance.
-3. The leader assigns each call to the node with the most free capacity
+   agent pool. A campaign above the 3% abandonment cap claims agent first.
+3. The leader gates each claimed lead (`gate()` in `leader.rs`). It reads the
+   DNC entries of the claimed numbers. If the list does not read, it releases
+   the claims, and nothing dials. Then `ad_hopper::select` checks the DNC
+   list, the timezone, and the calling window.
+4. The leader assigns each call to the node with the most free capacity
    (`/agentdialer/calls/{node}/{attempt}`), at most `AD_CALLS_PER_SEC` calls
    each second.
-4. The node runs the call (`crates/ad_bin/src/orchestrator/calls.rs`):
+5. The node runs the call (`crates/ad_bin/src/orchestrator/calls.rs`). It
+   makes the call's session token, and it saves only its SHA-256.
    - `customer_first` (the default): it sends the INVITE through Kamailio. At
      the answer, it starts the agent and joins the room. If the agent is not
      in the room 2 s after the answer, it hangs up, and the outcome is
@@ -170,13 +197,18 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
      room, and then sends the INVITE.
    - It saves each result with its node and assignment generation
      (`apply_owned`). A node that lost the call cannot save.
-5. The call ends on its node: the callee's BYE, the agent leaves the room, or
+6. The call ends on its node: the callee's BYE, the agent leaves the room, or
    no RTP for 30 s.
-6. The transaction that ends an attempt writes `attempt_ended`. The leader
-   settles the lead, closes the room, removes the assignment, and dials into
-   the free capacity. The transaction that saves the agent in the room writes
-   `agent_joined`, so the leader claims into the free place of the window.
-7. The leader's sweep (`AD_RETRY_SWEEP_MS`) settles ended attempts, moves the
+7. The transaction that ends an attempt writes `attempt_ended`. The leader
+   settles the lead (`ad_orchestrator::settle_with`). If the agent joined an
+   answered call and did not report yet, the leader waits for the outcome, at
+   most `outcome_wait_s`. While it waits, the call frees its place on the
+   node, and the room stays open.
+8. After the settlement, the leader closes the room, removes the
+   assignment, and dials into the free capacity. The transaction that saves
+   the agent in the room writes `agent_joined`, so the leader claims into the
+   free place of the window.
+9. The leader's sweep (`AD_RETRY_SWEEP_MS`) settles ended attempts, moves the
    calls of a dead node, dials due retries, and completes idle campaigns.
 
 Each state change and its event commit in one transaction
@@ -193,7 +225,7 @@ KeepAlive, Election, a plain Put, a plain delete, or keys-only reads.
 |---|---|---|
 | D-2 | The dialer places the call. The agent never dials. Two adapters: LiveKit and pipecat. `dial_order` is `customer_first` (default, 2 s limit) or `agent_first`. Above the 3% cap, the campaign dials agent first. | Built |
 | D-3 | Postgres is the event layer. Do not add Redis. | Built |
-| D-6 | One gRPC stream for each agent session: the outcome, the events, the logs, and OTLP on the same endpoint. | Decided, not built |
+| D-6 | One gRPC stream for each agent session: the outcome, the events, the logs, and OTLP on the same endpoint. Agents never write to the database. | Built, without OTLP |
 | D-8 | The orchestrator replicas form a cluster through kine. Postgres and kine are managed services: reach them by URL, wait with backoff, and do not depend on a host check or a start order. | Built |
 | D-9 | AgentDialer carries the call with vendored SIP and RTP libraries behind Kamailio, with no host networking. | Built |
 | D-10 | The claim stays within the window of the agent pool. Modes `adaptive` and `strict`. Every limit changes at run time through `/v1/campaigns/:id/pacing`. Do not add an environment variable for them. | Built |
@@ -204,15 +236,17 @@ KeepAlive, Election, a plain Put, a plain delete, or keys-only reads.
 ## What is built, and what is not
 
 Built and tested: the call path, the cluster, both agent runtimes and both
-dial orders, the abandonment ledger, pacing by join time, the event layer,
-retries, the breaker, time from Postgres, and the quickstart on LiveKit Cloud
-SIP. README "Status" has the proof of each part.
+dial orders, the abandonment ledger, pacing by join time and the pool
+breaker, the event layer, retries, the breaker, time from Postgres, the
+agent's outcome on the session stream (dispositions, callbacks, DNC
+requests), the DNC list in Postgres, E.164 numbers at the lead load, and the
+quickstart on LiveKit Cloud SIP. README "Status" has the proof of each part.
 
-Not built, or not wired: the compliance data (COMP-1: a 24-hour window and an
-empty DNC list in production), the routing engine in the dial path (ROUT-2),
-dispositions and an outcome from the agent (DIAL-1, AGNT-2), callbacks and
-recycle rules, authentication (API-1), answering-machine detection, DTMF, and
-transfers. Do not claim them.
+Not built, or not wired: the call times and holidays in Postgres (COMP-1: a
+24-hour window in production), a national DNC import (COMP-8), the routing
+engine in the dial path (ROUT-2), recycle rules (LEAD-4), authentication
+(API-1), answering-machine detection, DTMF, transfers, and OTLP. Do not claim
+them.
 
 ## The rules that block a merge
 
@@ -253,7 +287,7 @@ its stack, checks it, and stops it.
 | You changed | Run |
 |---|---|
 | Anything that a role does at run time | `e2e/run_twilio_e2e.sh --sim` (on every change) |
-| The call path, an agent adapter, the dial order, or pacing | `e2e/run_e2e.sh` |
+| The call path, an agent adapter, the dial order, pacing, the gate, or the outcome path | `e2e/run_e2e.sh` |
 | The cluster, the leader, assignment, or time | `e2e/run_cluster_e2e.sh` |
 | Events, retries, the breaker, or campaign completion | `e2e/run_events_e2e.sh` |
 | The WebRTC participant | `e2e/run_webrtc_e2e.sh` |
@@ -275,6 +309,12 @@ the tier, the work is not done.
   `crates/ad_db/src/attempts.rs`.
 - Pacing: `crates/ad_pacing/`, `crates/ad_db/src/pacing.rs`,
   `crates/ad_api/src/pacing.rs`.
+- The outcome path: `proto/agentdialer/session/v1/session.proto`,
+  `crates/ad_session/`, `crates/ad_disposition/`,
+  `crates/ad_db/src/outcomes.rs`, `crates/ad_db/src/dnc.rs`,
+  `crates/ad_orchestrator/src/settle.rs`, `crates/ad_api/src/outcomes.rs`.
+- Phone numbers and postal codes: `crates/ad_contact/`. Read every number
+  through it.
 - Time: `crates/ad_db/src/clock.rs`, and `CallTimes` in
   `crates/ad_bin/src/orchestrator/calls.rs`.
 - An environment variable: `crates/ad_bin/src/config.rs`.

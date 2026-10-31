@@ -48,6 +48,11 @@ telephony:
 api:
   replicas: 2
   port: 8080
+  # The agent session stream (gRPC, decision D-6): the agents report the
+  # outcome of each call on it. sessionUrl is the URL that the agents reach;
+  # empty: the Service of the api, for agents in the cluster.
+  sessionPort: 9090
+  sessionUrl: ""
   resources: {}
   hpa:
     enabled: true

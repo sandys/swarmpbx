@@ -18,12 +18,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use ad_compliance::dnc::DncSet;
 use ad_compliance::safe_hours::{CallWindowSet, DayWindow};
 use ad_core::CampaignId;
 use ad_hopper::{select, ExcludeReason, Order, SelectionInput};
 use ad_routing::{Break, Detail, Ruleset, Tag};
 
+use crate::compliance::DncDto;
 use crate::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -36,16 +36,6 @@ pub fn routes() -> Router<AppState> {
 pub struct DayWindowDto {
     pub start_hhmm: u16,
     pub stop_hhmm: u16,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct DncDto {
-    #[serde(default)]
-    pub system: Vec<String>,
-    #[serde(default)]
-    pub campaign: Vec<String>,
-    #[serde(default)]
-    pub area_codes: Vec<String>,
 }
 
 /// A routing-rule detail in the request (mirrors ad_routing::Detail).
@@ -140,24 +130,6 @@ fn build_windows(req: &PreviewRequest) -> Result<CallWindowSet, String> {
     Ok(set)
 }
 
-fn build_dnc(dto: Option<&DncDto>) -> DncSet {
-    let mut set = DncSet::default();
-    if let Some(d) = dto {
-        set.system = d
-            .system
-            .iter()
-            .map(|s| ad_compliance::dnc::normalize(s))
-            .collect();
-        set.campaign = d
-            .campaign
-            .iter()
-            .map(|s| ad_compliance::dnc::normalize(s))
-            .collect();
-        set.area_codes = d.area_codes.iter().cloned().collect();
-    }
-    set
-}
-
 fn build_ruleset(details: &[DetailDto]) -> Result<Option<Ruleset>, String> {
     if details.is_empty() {
         return Ok(None);
@@ -215,7 +187,8 @@ async fn preview(
 
     let windows = build_windows(&req)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid_window: {e}")))?;
-    let dnc = build_dnc(req.dnc.as_ref());
+    let dnc = DncDto::to_set(req.dnc.as_ref())
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid_dnc: {e}")))?;
     let ruleset = build_ruleset(&req.ruleset)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid_ruleset: {e}")))?;
     let order = match req.order.as_deref() {

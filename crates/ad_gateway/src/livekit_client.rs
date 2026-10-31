@@ -3,11 +3,13 @@
 //! reconcile. The call itself is ours (`sip_call`); LiveKit only runs the
 //! rooms.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use livekit_api::services::room::{CreateRoomOptions, RoomClient};
-use livekit_api::services::{ServerError, ServerErrorCode, ServiceError};
+use ad_core::Clock;
+use ad_livekit::{Api, Signer};
 use livekit_protocol::participant_info::State;
+use livekit_protocol::CreateRoomRequest;
 
 use crate::{GatewayClient, GatewayConfig};
 
@@ -20,16 +22,16 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(40);
 const ROOM_EMPTY_TIMEOUT_S: u32 = 120;
 
 pub struct LiveKitGateway {
-    rooms: RoomClient,
+    rooms: Api,
 }
 
 impl LiveKitGateway {
-    pub fn new(config: &GatewayConfig) -> Self {
+    /// The tokens of the requests take their time from `clock` (OPS-9).
+    pub fn new(config: &GatewayConfig, clock: Arc<dyn Clock>) -> Self {
         Self {
-            rooms: RoomClient::with_api_key(
+            rooms: Api::new(
                 &config.livekit_url,
-                &config.api_key,
-                &config.api_secret,
+                Signer::new(&config.api_key, &config.api_secret, clock),
             ),
         }
     }
@@ -39,23 +41,20 @@ impl GatewayClient for LiveKitGateway {
     async fn participant_present(&self, room: &str, identity: &str) -> Result<bool, String> {
         match self.rooms.get_participant(room, identity).await {
             Ok(p) => Ok(p.state != State::Disconnected as i32),
-            Err(ServiceError::Twirp(ServerError::Twirp(code)))
-                if code.code == ServerErrorCode::NOT_FOUND =>
-            {
-                Ok(false)
-            }
+            Err(e) if e.is_not_found() => Ok(false),
             Err(e) => Err(e.to_string()),
         }
     }
 
     async fn create_room(&self, room: &str) -> Result<(), String> {
-        let options = CreateRoomOptions {
+        let req = CreateRoomRequest {
+            name: room.to_string(),
             // An attempt room that nobody joins closes by itself.
             empty_timeout: ROOM_EMPTY_TIMEOUT_S,
             ..Default::default()
         };
         self.rooms
-            .create_room(room, options)
+            .create_room(req)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -68,11 +67,7 @@ impl GatewayClient for LiveKitGateway {
                 .filter(|p| p.state != State::Disconnected as i32)
                 .map(|p| p.identity)
                 .collect()),
-            Err(ServiceError::Twirp(ServerError::Twirp(code)))
-                if code.code == ServerErrorCode::NOT_FOUND =>
-            {
-                Ok(Vec::new())
-            }
+            Err(e) if e.is_not_found() => Ok(Vec::new()),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -80,11 +75,7 @@ impl GatewayClient for LiveKitGateway {
     async fn delete_room(&self, room: &str) -> Result<(), String> {
         match self.rooms.delete_room(room).await {
             Ok(()) => Ok(()),
-            Err(ServiceError::Twirp(ServerError::Twirp(code)))
-                if code.code == ServerErrorCode::NOT_FOUND =>
-            {
-                Ok(())
-            }
+            Err(e) if e.is_not_found() => Ok(()),
             Err(e) => Err(e.to_string()),
         }
     }

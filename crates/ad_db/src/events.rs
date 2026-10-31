@@ -76,6 +76,33 @@ impl PgEventLog {
             })
             .collect()
     }
+
+    /// The events of a campaign after the event id `after`, oldest first,
+    /// with the time of each.
+    pub async fn page(
+        &self,
+        campaign_id: i64,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, chrono::DateTime<chrono::Utc>, CampaignEvent)>, EventError> {
+        let rows = sqlx::query(
+            "SELECT id, payload, created_at FROM campaign_events \
+             WHERE campaign_id = $1 AND id > $2 ORDER BY id LIMIT $3",
+        )
+        .bind(campaign_id)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(tx)?;
+        rows.iter()
+            .map(|r| {
+                let (id, payload) = decode_row(r)?;
+                let at = r.try_get("created_at").map_err(tx)?;
+                Ok((id, at, decode_event(id, payload)?))
+            })
+            .collect()
+    }
 }
 
 /// Write events inside the caller's transaction (an outbox). The events commit,

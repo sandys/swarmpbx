@@ -24,10 +24,12 @@
 #       its pool, and no call is abandoned because an agent was slow. (Before
 #       DIAL-9, six LiveKit jobs that started at once missed the 2 s limit.)
 #   (h) the nodes take the time from Postgres, not from their OS clock: the
-#       OS clock of node-2 is 3 min behind, of node-3 11 min (a preloaded
-#       shim, e2e/clock-offset). Each node logs its offset, and every event
-#       time that a node saves is within seconds of the time at which
-#       Postgres saved it.
+#       OS clock of node-2 is 11 min behind, and of node-3 3 min ahead (a
+#       preloaded shim, e2e/clock-offset). Each node logs its offset, and
+#       every event time that a node saves is within seconds of the time at
+#       which Postgres saved it. node-3 connects calls: LiveKit refuses a
+#       token whose nbf is more than 1 min ahead, so its tokens take the
+#       Postgres time too (GAPS.md OPS-9).
 #
 # The checks treat Postgres and kine as managed services: they go through the
 # database URL and the kine endpoint, never into a container.
@@ -76,8 +78,8 @@ logged_offset() {
 
 echo "== build images =="
 docker build -q -t agentdialer:e2e .. >/dev/null || { echo "FAIL: image build"; exit 1; }
-for off in 3 11; do
-  docker build -q --build-arg OFFSET_S="-$((off * 60))" -t "agentdialer:e2e-clock-${off}m" clock-offset >/dev/null \
+for c in behind-11m:-660 ahead-3m:180; do
+  docker build -q --build-arg OFFSET_S="${c#*:}" -t "agentdialer:e2e-clock-${c%%:*}" clock-offset >/dev/null \
     || { echo "FAIL: clock image build"; exit 1; }
 done
 $CL build -q livekit-agent pipecat-bot carrier >/dev/null 2>&1 || { echo "FAIL: test image build"; exit 1; }
@@ -236,19 +238,23 @@ done
 wait_for 30 "no call assignment left in kine" kine_none /agentdialer/calls/ || FAIL=1
 
 echo "== assert (h): the nodes take the time from Postgres, not from their OS clock =="
-for n in node-1:0 node-2:-180000 node-3:-660000; do
+for n in node-1:0 node-2:-660000 node-3:180000; do
   name=${n%%:*}; want=${n#*:}
   got=$(logged_offset "$name")
   [ -n "$got" ] && [ "$got" -ge $((want - 2000)) ] && [ "$got" -le $((want + 2000)) ] \
     && echo "ok: $name logged its OS clock $got ms from Postgres" \
     || { echo "FAIL: $name logged an OS clock offset of '${got:-none}' ms, want $want ms"; FAIL=1; }
 done
+AHEAD=$(pg "SELECT count(*) FROM call_attempts WHERE node = 'node-3' AND answered_at IS NOT NULL")
+[ "${AHEAD:-0}" -ge 1 ] 2>/dev/null \
+  && echo "ok: node-3, with its OS clock 3 min ahead, connected $AHEAD calls (LiveKit took its tokens)" \
+  || { echo "FAIL: node-3, with its OS clock 3 min ahead, connected no call: $(pg "SELECT string_agg(id || ':' || coalesce(detail, ''), '; ') FROM call_attempts WHERE node = 'node-3'")"; FAIL=1; }
 # An event time comes before its save, by at most the room join or an agent's
 # start request. It can also come after it: a node's clock follows the
 # monotonic clock between two reads of the Postgres clock, and on WSL2 the
 # wall clock (so the Postgres clock) steps back about 0.6 s every 30 s
-# against the monotonic clock. A node that used its OS clock saves times 3 or
-# 11 min early.
+# against the monotonic clock. A node that used its OS clock saves times
+# 11 min early or 3 min late.
 IN_TIME="(payload->>'at')::timestamptz BETWEEN e.created_at - interval '30 seconds' AND e.created_at + interval '5 seconds'"
 EVENTS=$(pg "SELECT count(*) FROM attempt_events WHERE payload ? 'at'")
 LATE_MS=$(pg "SELECT round(max(extract(epoch FROM (payload->>'at')::timestamptz - e.created_at)) * 1000) FROM attempt_events e WHERE payload ? 'at'")

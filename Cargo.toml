@@ -8,6 +8,9 @@ exclude = ["vendor"]
 resolver = "2"
 members = [
     "crates/ad_core",
+    "crates/ad_contact",
+    "crates/ad_disposition",
+    "crates/ad_session",
     "crates/ad_compliance",
     "crates/ad_campaign",
     "crates/ad_lead",
@@ -17,6 +20,7 @@ members = [
     "crates/ad_events",
     "crates/ad_attempt",
     "crates/ad_cluster",
+    "crates/ad_livekit",
     "crates/ad_agent",
     "crates/ad_media",
     "crates/ad_sip",

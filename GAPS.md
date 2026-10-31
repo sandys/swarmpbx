@@ -4,7 +4,7 @@
 |---|---|
 | Status | Assessment. Not a plan of record. `PLAN.md` stays authoritative. |
 | Date | 2026-10-20 |
-| Last update | 2026-10-24: dial order, abandonment ledger, DIAL-9 built |
+| Last update | 2026-10-30: the agent outcome on the session stream (AGNT-2, D-6), the DNC list in Postgres (COMP-7, COMP-8), E.164 numbers (COMP-9), dispositions and callbacks (LEAD-10, LEAD-5), DIAL-9 item 7, OPS-9 tokens |
 | Code baseline | commit `b19ad3a` |
 | Method | Full read of `PLAN.md`, `README.md`, and every crate. Targeted read of the nine sources in `_research/` that `PLAN.md` cites, plus the FreeSWITCH dialplan evaluator (`_research/freeswitch/`). |
 | Legal note | This document is not legal advice. Verify every legal item with counsel before you claim compliance. |
@@ -83,21 +83,21 @@ Each gap uses this form:
 
 | ID | Gap |
 |---|---|
-| COMP-1 | Production dialing uses a 24-hour window and an empty DNC list. |
+| COMP-1 | Production dialing uses a 24-hour window. Since 2026-10-30 the DNC list is in Postgres (COMP-8). |
 | COMP-2 | A lead without an explicit IANA timezone never dials. There is no derivation. |
 | COMP-6 | No consent record exists. AI voice calls need consent (verify). |
-| COMP-7 | An opt-out in the call cannot reach the DNC list. |
-| DIAL-1 | The gateway reported every call end as "answered". Partly fixed 2026-10-21: SIP codes map to classes and the webhook ends the call; the agent outcome is open. |
+| COMP-7 | An opt-out in the call cannot reach the DNC list. Fixed 2026-10-30: the agent's DNC request writes the DNC entry at once. |
+| DIAL-1 | The gateway reported every call end as "answered". Fixed: SIP codes map to classes (2026-10-21), and the agent outcome arrives on the session stream (2026-10-30). |
 | DIAL-2 | Capacity was not held for the length of the call. Fixed 2026-10-21: a live call attempt is the unit of capacity. |
 | DIAL-3 | The orchestrator dialed one call at a time. Fixed 2026-10-21: calls run in parallel, paced by `AD_CALLS_PER_SEC`. |
 | DIAL-4 | A timeout after the INVITE could cause a second dial. Fixed 2026-10-21: the attempt becomes `uncertain` and is reconciled first. |
-| DIAL-9 | Customer first (the default dial order) has no pacing from the agents' join time. A burst of answers starts more agents than the workers can bring into the rooms in 2 s, and those calls are abandoned. New 2026-10-24. Built 2026-10-24: the claim stays within a window for each agent pool, learned from the join times; item 7 (the agent breaker) is open. |
+| DIAL-9 | Customer first (the default dial order) has no pacing from the agents' join time. A burst of answers starts more agents than the workers can bring into the rooms in 2 s, and those calls are abandoned. New 2026-10-24. Built 2026-10-24: the claim stays within a window for each agent pool, learned from the join times. Item 7 (the agent breaker) built 2026-10-30. |
 | LEAD-1 | Nothing filled the hopper. Fixed 2026-10-21: the claim reads the due leads directly. |
 | LEAD-2 | Retries lived only in Redis. Fixed 2026-10-20: the due time is on the lead row. |
 | LEAD-3 | Claims never released. Fixed 2026-10-21: the call attempt is the claim, and settlement updates the lead once. |
 | ORCH-1 | Campaign state never became paused or completed. Fixed 2026-10-21: both are saved with their events. |
 | AGNT-1 | No agent was dispatched. Fixed 2026-10-21: a LiveKit agent or a pipecat bot joins each attempt room. Since 2026-10-24 the campaign's `dial_order` decides when: on the answer (`customer_first`, the default) or before the dial (`agent_first`). |
-| AGNT-2 | There is no outcome contract from the agent to the dialer. |
+| AGNT-2 | There is no outcome contract from the agent to the dialer. Fixed 2026-10-30: the gRPC session stream (D-6). |
 | API-1 | The API has no authentication and no tenant isolation. |
 | OPS-1 | The orchestrator cannot start from Helm or `e2e/run_e2e.sh` (no `REDIS_URL`). Fixed 2026-10-20. |
 
@@ -114,18 +114,18 @@ Each gap uses this form:
 | Lead ordering options | Many | Random | Two | LEAD-7 |
 | Recycle by disposition | Yes | — | Missing | LEAD-4 |
 | Retries by reason | Partial | Yes | Durable on the lead row; one global policy | LEAD-2 |
-| Scheduled callbacks | Yes | — | Missing | LEAD-5 |
+| Scheduled callbacks | Yes | — | Built (from the agent, priority 50) | LEAD-5 |
 | Alternate numbers | Yes | — | Missing | LEAD-8 |
 | Lead filters | Yes (raw SQL) | — | Missing | LEAD-9 |
-| Disposition catalog with flags | Yes | Yes | Minimal | LEAD-10 |
+| Disposition catalog with flags | Yes | Yes | Built (system and campaign codes) | LEAD-10 |
 | Safe-hours in lead timezone | Yes | No (campaign tz, fails open) | Engine built, not wired | COMP-1 |
 | Timezone derivation | Yes (fails open) | — | Missing | COMP-2 |
 | Per-state windows | Yes | — | Missing | COMP-3 |
 | Holidays | Yes (narrowing) | — | Full-day block only | COMP-4 |
 | Call-frequency limits | Yes | — | Missing | COMP-5 |
 | Consent records | — | — | Missing | COMP-6 |
-| In-call opt-out to DNC | Human action | VICIdial adapter | Missing | COMP-7 |
-| DNC lists | Yes | Via VICIdial | Engine only | COMP-8 |
+| In-call opt-out to DNC | Human action | VICIdial adapter | Built | COMP-7 |
+| DNC lists | Yes | Via VICIdial | System and campaign lists in Postgres; no import | COMP-8 |
 | Abandonment ledger | Yes | Breaker only | Built for customer first, one jurisdiction | COMP-10 |
 | Capacity-bound pacing | Human-based | Yes (slots) | Built (a live attempt is the slot) | DIAL-2 |
 | Adaptive pacing | Yes (idle humans, drop rate) | No (fixed rate, offline load test) | Built (by agent join time) | DIAL-9 |
@@ -135,7 +135,7 @@ Each gap uses this form:
 | Circuit breaker | — | Yes | Partial | DIAL-8 |
 | Voicemail / machine policy | Asterisk AMD | Answer supervisor | Missing | AGNT-5 |
 | Agent dispatch per call | n/a | Pipeline per run | Built (LiveKit, pipecat) | AGNT-1 |
-| Agent outcome contract | Human UI | Status + LLM disposition | Missing | AGNT-2 |
+| Agent outcome contract | Human UI | Status + LLM disposition | Built (gRPC session stream) | AGNT-2 |
 | Transfer | Yes | Yes | Missing | AGNT-4 |
 | A/B agent split | — | Yes | Missing | AGNT-6 |
 | Routing rule engine | Asterisk dialplan | — | Engine, not wired | ROUT-1..4 |
@@ -190,15 +190,18 @@ Each gap uses this form:
 - **Now:** There is no path from the agent to the DNC list.
 - **Reference:** dograh `providers/ari/external_pbx/vicidial.py` `apply_do_not_call`. VICIdial statuses carry a `dnc` flag. `PLAN.md` §0.10.5 lists an `add_dnc` action.
 - **Do:** Add a `dnc_request` with a scope to the agent outcome contract (AGNT-2). Write the DNC entry at once, with evidence. Cancel all pending retries and callbacks for that number. Verify the required timing per jurisdiction.
+- **Status (2026-10-30): fixed**, except the timing for each jurisdiction (D-5). The outcome has `dnc {scope}` (`system` or `campaign`), and the code `DNC` asks for the system list. `PgOutcomeRepo::record` writes the entry (source `agent`, the attempt id, and the disposition and summary as evidence), stops every waiting lead with that number (retries and callbacks too), and writes the outcome, in one transaction. The leader settles the lead as `dnc`. Proven: `crates/ad_db/tests/pg_outcomes.rs` and `e2e/run_e2e.sh` (lead 2).
 
 #### COMP-8 DNC data management — P1
 - **Now:** A `DncSet` is built in memory for each request. There is no storage, no version, and no import.
 - **Reference:** VICIdial has internal, campaign, area-code (`NPAXXXXXXX`), other-campaign, and international DNC. A hit at hopper time rewrites the lead status to DNCL or DNCC.
 - **Do:** Persist DNC lists (system, org, campaign, area code, national-registry import with its scrub date). Index them by E.164. Record the list version that each decision used. Set the lead status on a hit. Track the national-registry re-scrub interval (verify).
+- **Status (2026-10-30): partial.** `dnc_numbers` (migration 0009) holds the system and campaign lists by E.164, with the source (`api` or `agent`), the attempt, and the evidence. `POST`, `GET /v1/dnc` and `DELETE /v1/dnc/:id` manage it; an entry stops the waiting leads at once. The leader's gate reads the entries of the claimed numbers before each dial, and when it cannot read them it releases the claims without a dial (fail closed). Open: the org scope, area codes in storage (only in a request today), the national-registry import, and the list version in each decision (BETTER-2).
 
 #### COMP-9 Phone number normalization — P1
 - **Now:** `dnc::normalize` keeps digits only. Area codes work only for NANP numbers of 10 or 11 digits. The API accepts any non-empty phone string.
 - **Do:** Normalize every number to E.164 at load time, with a default country per list. Reject invalid numbers with a report. Use E.164 for DNC keys, frequency counters, and timezone lookup.
+- **Status (2026-10-30): fixed** for the lead load, the DNC keys, and the caller ID. `ad_contact` is the one module that reads numbers and postal codes; it uses the vendored `phonenumber` crate (libphonenumber metadata 9.0.33). The load takes a `default_region`, keeps E.164, and refuses the whole list with a report of each bad lead (a number that the plan does not assign, a wrong length, an extension). A DNC check on a number that does not read denies the call (`invalid_number`, fail closed). The frequency counters and the timezone lookup do not exist yet (COMP-5, COMP-2).
 
 #### COMP-10 The abandonment ledger — partly done (2026-10-24) — P1
 - **Done (2026-10-24), with customer first:** a customer-first call whose agent is not in the room 2 s after the 200 OK ends as `abandoned` (`ad_attempt`; the pure statechart also turns a late `agent_ready` into `abandoned`). `call_attempts` is the ledger: `PgAttemptRepo::abandon_counts` counts the answered and abandoned calls that ended in the rule's window. The leader reads it before each claim: above the cap (`JurisdictionRule::allows_customer_first`), or when it cannot read it, the claim dials agent first. The retry of an abandoned lead dials agent first. `GET /v1/campaigns/:id/abandonment` reports the ledger.
@@ -277,7 +280,7 @@ Each gap uses this form:
 - **Seen in the SIPp benchmark (2026-10-20):** 19 calls that never sent an INVITE (a local media error) counted as call failures and tripped the breaker. Our own misconfiguration paused the campaign. BETTER-7 separates these classes.
 - **Status (2026-10-21), partial:** a trip pauses the campaign in Postgres, with one `circuit_breaker_tripped` event in the same transaction. A resume through the API sets `campaigns.breaker_reset_at`, and the window counts only attempts that ended after it. `e2e/run_events_e2e.sh` proves both. The breaker counts only attempts that started a dial; `failed`, `setup_error`, and `uncertain` are failures, and busy and no answer are normal results. Open: the comparison, a trunk breaker, and the read-error path.
 
-#### DIAL-9 The pace does not follow the agents' join time — built 2026-10-24 (item 7 open)
+#### DIAL-9 The pace does not follow the agents' join time — built 2026-10-24 (item 7 built 2026-10-30)
 The user's goal for the product: the dialer sets the call rate from the pace at which the agents join. This is the main difference from other dialers (BETTER-6).
 
 - **Now:**
@@ -337,7 +340,8 @@ The user's goal for the product: the dialer sets the call rate from the pace at 
    - `K` never goes above the sum of the concurrency caps of the pool's campaigns. Built differently: `K` grows only when a claim found the window full (window + 1 ≥ `K`), and the caps and the cluster capacity limit the window, so `K` stops near them (at most one doubling above). `max_k` is a hard top that the operator sets at run time.
 5. **The other limits stay.** `AD_CALLS_PER_SEC` still spaces the call starts, and `concurrency_cap` still limits each campaign. The leader uses the smallest limit (BETTER-6). Trunk limits come with DIAL-7.
 6. **Keep `K` across a leader change.** Save `K`, the phase (slow start or not), and the time of the last halving in Postgres, one row for each pool. The leader writes the row when `K` changes, and a new leader reads it. Without the row, a new leader starts again at `K` = 1. That is safe, but the ramp can take minutes when few calls answer. Built: `agent_pools.state`, written by each `ingest`.
-7. **Agent failures (from AGNT-3). Open.** A start that the runtime refuses is a slow sample (built). If `K` = 1 and 5 starts in a row fail, pause the pool's campaigns with the reason and the attempt ids, as the campaign breaker does (DIAL-8). Count these failures apart from the call failures.
+7. **Agent failures (from AGNT-3). Built 2026-10-30.** A start that the runtime refuses is a slow sample (built). If `K` = 1 and 5 starts in a row fail, pause the pool's campaigns with the reason and the attempt ids, as the campaign breaker does (DIAL-8). Count these failures apart from the call failures.
+   - Built: `ad_pacing::tripped` and the pool setting `trip_after` (default 5), `PgPacingRepo::trip` (pauses the running campaigns of the pool and writes `agent_pool_tripped` with the pool, the count, and the attempt ids), and the leader's check after it learns. `resume` of a campaign starts it again. Proven: `ad_pacing` tests, `pg_pacing` tests, and `e2e/run_e2e.sh` (campaign 8: a bot server that answers 503).
 8. **The governor stays.** COMP-10 is still the hard net above the cap. The window also limits a burst: at most `K` calls can abandon before the governor sees the first one.
 9. **Show it.** `GET /v1/campaigns/:id/pacing` shows the pool key, `K`, the phase, the window now, and the join times of the last 50 samples (p50, p95, and the number of slow samples). Export the join times and `K` as metrics (OBS-4). Built, without the metrics. Also built (D-10): `PUT` changes the mode and the pool's settings (target, back-off, first `K`, largest `K`) at run time, and `reset` starts the pool again; `GET /v1/agent-pools` lists the pools. The leader also logs each learning step.
 10. **Put it where `PLAN.md` puts pacing.** Built. `PLAN.md` §0.10.6 names a registry of dial strategies in a crate `ad_pacing`. That crate does not exist yet. Make the controller a pure engine in `ad_pacing`: it takes the samples and returns `K`, with no I/O. Make it the strategy for customer first. Correct §0.10.6 in the same change. It says now that `Progressive` gives about 0% abandonment, which is not true for customer first.
@@ -405,6 +409,7 @@ The user's goal for the product: the dialer sets the call rate from the pace at 
 #### LEAD-5 Scheduled callbacks — P1
 - **Reference:** VICIdial `vicidial_callbacks` (USERONLY or ANYONE, `callback_time`, customer timezone, hopper priority 50). QuickVoice `campaign-time.ts` resolves DST gaps and overlaps on purpose.
 - **Do:** Let the agent request a callback time and zone (AGNT-2). Store it. Make the lead eligible at that time with a higher priority. Re-gate it on compliance. Use an explicit DST gap and overlap rule. "USERONLY" becomes "same agent version".
+- **Status (2026-10-30): built**, except "same agent version". The agent sends `CALLBK` with a local time and an IANA zone (default: the zone of the lead). `ad_disposition` resolves it: a time in a DST gap moves to the first minute after the gap, and a time in an overlap takes the earlier instant. It must be 1 minute to 90 days ahead. The lead waits as `queued` (`retry_reason` `callback`) with priority 50, and the claim takes the higher priority first. The gate checks the call again at the dial. Proven: `ad_disposition` tests, `pg_outcomes` tests, and `e2e/run_e2e.sh` (lead 9).
 
 #### LEAD-6 Lists, list mix, import, dedupe — P1
 - **Now:** Leads belong directly to a campaign. Import is a JSON array.
@@ -428,6 +433,7 @@ The user's goal for the product: the dialer sets the call rate from the pace at 
 - **Now:** `LeadStatus` has six lifecycle states. `call_outcomes.outcome` holds a free string.
 - **Reference:** VICIdial statuses carry the flags `human_answered`, `sale`, `dnc`, `customer_contact`, `not_interested`, `unworkable`, `scheduled_callback`, `completed`, `answering_machine`, and a category, at system and campaign level. dograh separates `call_status` (how the call ended) from `call_disposition` (the business result).
 - **Do:** Keep the lead lifecycle state separate from the disposition. Add a disposition catalog per org and campaign with these flags. Let the flags drive abandonment math, DNC, completion, and reports.
+- **Status (2026-10-30): partial.** `ad_disposition` has seven system codes (`SALE`, `NI`, `CALLBK`, `DNC`, `AM`, `WN`, `DONE`) with the VICIdial flags, and each campaign adds its own codes (`campaigns.dispositions`, `GET`/`PUT /v1/campaigns/:id/dispositions`). The attempt keeps the disposition apart from the call outcome. The flags drive DNC, callbacks, and the voicemail retry. Open: the org level, the category, the abandonment math (the `human_answered` flag does not count yet; COMP-10), and reports.
 
 #### LEAD-11 Quotas — P2
 - **Reference:** VICIdial `demographic_quotas`.
@@ -498,6 +504,7 @@ The user's goal for the product: the dialer sets the call rate from the pace at 
 #### AGNT-2 No outcome contract — P0
 - **Reference:** dograh answer actions (`START_OPENING`, `RELEASE`, `LEAVE_MESSAGE`, `DROP`, `SCREEN_THEN_REARM`, `WAIT_FOR_SCREENING`), machine subtypes, and post-call disposition extraction. The LiveKit sample tools `end_call`, `transfer_call`, `detected_answering_machine`.
 - **Do:** Define a versioned outcome schema: answer class, disposition code, callback time and zone, DNC request and scope, transfer request, summary, disclosures spoken. Carry it on the gRPC session stream (decision D-6). Make it idempotent by attempt id. Validate it against the campaign catalog.
+- **Status (2026-10-30): fixed.** `proto/agentdialer/session/v1/session.proto`, schema version 1, with every field above. The node gives each agent a session URL (`AD_SESSION_URL`) and a random token in the call facts; the attempt keeps only the SHA-256 of the token, fenced by the owner. The `api` role serves the stream (`ad_session`, `AD_SESSION_ADDR`): Hello with the token, Welcome with the catalog, Outcome, then Ack or Rejected. The first outcome stays; the same one again is a duplicate. The check is pure (`ad_disposition::check`). An `agent_outcome` event wakes the leader. After an answered call that its agent joined, the leader waits for the outcome up to `outcome_wait_s` (default 30 s) after the end, and settles by it (`ad_orchestrator::settle_with`: DNC first, then a callback, then a machine answer). Proven: `ad_session` tests (over gRPC), `pg_outcomes` tests, `outcomes_api` tests, and `e2e/run_e2e.sh` with both reference agents. Open: a transfer (the request is only kept, AGNT-4) and OTLP (D-6).
 
 #### AGNT-3 No agent-capacity signal — merged into DIAL-9 (2026-10-24)
 - LiveKit gives the dialer no worker availability; it keeps the worker load inside its dispatch. The measured join time is the capacity signal, and DIAL-9 uses it before each claim. The breaker on agent failures is DIAL-9 item 7. Still true from 2026-10-21: a start that the runtime refuses, or an agent that does not join in time, ends the attempt without a dial and does not count as a call.
@@ -658,11 +665,12 @@ The user's goal for the product: the dialer sets the call rate from the pace at 
 #### OPS-9 The roles trusted the OS clock — P1 (fixed 2026-10-24)
 - **Was:** each role took the time from the OS clock of its node (`SystemClock`). Two nodes compared times that came from two clocks: the takeover of an agent start, the reconcile of a live call (`created_at` is the Postgres `now()`), and the claim's due time against `now()` in SQL. A node with a wrong clock decided the safe hours from a wrong local time. Inside one call, a step of the wall clock changed the measured join (see DIAL-9: 781 ms read as 207 ms).
 - **Now (decision D-11):** the roles with Postgres take the time from `ad_db::PgClock`: the Postgres time (`clock_timestamp()`, the read with the shortest round trip of three, at most 500 ms) plus the monotonic time since that read. A role waits for its first read before it does work, and reads again every 30 s. Each call takes one read at its start and then only the monotonic clock (`CallTimes` in the node). The API without Postgres keeps the OS clock (no other node shares its data).
-- **Still on the OS clock:** the log lines and the LiveKit tokens (`livekit-api` dates the `nbf` and `exp` claims with `SystemTime`). LiveKit refuses a token from a node whose clock is ahead by more than its leeway, so that node's calls fail; they do not dial wrong. A node logs `the OS clock is off` when its OS clock is more than 250 ms from Postgres.
+- **Still on the OS clock:** the log lines only. Until 2026-10-30 the LiveKit tokens were too (`livekit-api` dates the `nbf` and `exp` claims with `SystemTime`), and LiveKit refused the tokens of a node whose clock was ahead. A node logs `the OS clock is off` when its OS clock is more than 250 ms from Postgres.
 - **Proven:** `ad_db` unit tests (the anchor arithmetic, the read choice) and `tests/pg_clock.rs` (the clock tells the Postgres time; a sync corrects a clock that is 1 h off); the node's `CallTimes` test (a step of the node clock after the first read changes no time of the call); `e2e/run_cluster_e2e.sh` assert (h): node-2 and node-3 run with an OS clock 3 min and 11 min behind (an `LD_PRELOAD` shim that moves only the wall clock, `e2e/clock-offset`; libfaketime did the same, but it made a dial take 0.7–7 s instead of 0.1–0.6 s, and the slow nodes abandoned calls), each logs its offset, and every saved event time is within 30 s before and 5 s after the time at which Postgres saved it.
-- **Found on the WSL2 dev machine (2026-10-24):** the wall clock steps back about 0.6 s every 30 s against the monotonic clock (a probe in a plain container: -603 ms at 20 s, -1189 ms at 50 s, -1796 ms at 80 s). Postgres uses that wall clock. So a role's clock runs up to about one step ahead of `now()` until its next read, and the times of one call keep the drift of the call. Before this change, the e2e checks that compared a node time (`ended_at`, `agent_ready_at`) with `created_at` were exact only because every container read the same kernel clock. They now compare only Postgres times (the save times of the events, `e2e/lib.sh` `saved_end` and `left_window`). The same machine once paused for about 3 min during a run (node-3's clock stepped +173 s at its next read).
+- **Found on the WSL2 dev machine (2026-10-24):** the wall clock steps back about 0.6 s every 30 s against the monotonic clock (a probe in a plain container: -603 ms at 20 s, -1189 ms at 50 s, -1796 ms at 80 s). Postgres uses that wall clock. So a role's clock runs up to about one step ahead of `now()` until its next read, and the times of one call keep the drift of the call. Before this change, the e2e checks that compared a node time (`ended_at`, `agent_ready_at`) with `created_at` were exact only because every container read the same kernel clock. They now compare only Postgres times (the save times of the events, `e2e/lib.sh` `saved_end` and `left_window`). The same machine once paused for about 3 min during a run (node-3's clock stepped +173 s at its next read). On 2026-10-30 the step was about -1.1 s at each 30 s read (`clock: re-synced to Postgres step_ms=-1137`). The outcome-wait check of lead 8 then failed once, because it compared `settled_at` with `ended_at`. It now uses `saved_end`.
 - **Mutation checks:** a `PgClock` that tells the OS time fails `a_sync_corrects_a_clock_that_is_one_hour_off` (the other `pg_clock` test passes, because the OS clock and Postgres share one kernel clock in Docker); calls that take their times from the OS clock fail assert (h) of `e2e/run_cluster_e2e.sh` (the events of node-2 and node-3 show -180 s and -660 s), and no other assert.
 - **Do:** date the LiveKit tokens with the role's clock (a patch to `livekit-api`, or our own token signer), so that the OS clock dates only the logs.
+- **Done (2026-10-30):** `ad_livekit` has our own token `Signer` and room-service client (Twirp), dated by the role's clock. The node, the API, and the agent adapters use it. Proven: `ad_livekit` tests and `e2e/run_cluster_e2e.sh`, where node-3 runs 3 min ahead and still connects calls. Unlike `livekit-api`, the client does not fail over to another LiveKit Cloud region.
 
 #### CARRIER-1 Twilio Elastic SIP Trunking, a supported carrier — P1 (new 2026-10-21; it was the primary carrier until 2026-10-24)
 - **Now:** README "Call through Twilio" uses the quickstart stack (`docker-compose.quickstart.yml`) with `e2e/twilio/run.sh setup`. `crates/ad_sip/tests/twilio.rs` and `e2e/run_twilio_e2e.sh --sim` (with the diago carrier simulator) guard it on every change. Twilio reaches real phones; LiveKit Cloud SIP (CARRIER-3) does not.
@@ -766,9 +774,11 @@ real numbers yet. Do not dial real numbers before step 2 is done.
 
 1. **Make the existing path honest and runnable.** OPS-1, OPS-2, OPS-3, API-3. Correct the README status.
 2. **Make dialing legal.** COMP-1, COMP-2, COMP-6, COMP-7, COMP-9, BETTER-2.
+   **Progress (2026-10-30):** COMP-7 and COMP-9 are done, and COMP-8 is partial (the DNC list in Postgres). Open: COMP-1 (call times and holidays in Postgres), COMP-2, COMP-6, and BETTER-2.
 3. **Make the attempt real.** DIAL-1, DIAL-2, DIAL-3, DIAL-4, AGNT-1, AGNT-2, BETTER-4. The gateway stops returning "answered". Capacity is held for the call.
    **Progress (2026-10-21):** DIAL-2, DIAL-3, and DIAL-4 are done. DIAL-1 and BETTER-4 are partial. AGNT-1 and AGNT-2 are open: the agent adapters (D-2) and the session stream (D-6).
    **Progress (2026-10-24):** AGNT-1 is done, with both dial orders. DIAL-9 is done (item 7 open), and `e2e/run_cluster_e2e.sh` passes with it.
+   **Progress (2026-10-30):** AGNT-2 and DIAL-1 are done: the session stream (D-6). DIAL-9 item 7 is done.
 4. **Make scheduling durable.** LEAD-1, LEAD-3, ORCH-1, ORCH-2, ORCH-4, ORCH-5, BETTER-3. Postgres holds all state; there is no Redis (D-3). LEAD-2 is done.
    **Progress (2026-10-21):** LEAD-1, LEAD-3, ORCH-1, and ORCH-4 are done. ORCH-2 and BETTER-3 are partial. ORCH-5 is open.
 5. **Secure the API.** API-1, API-2.
@@ -788,7 +798,7 @@ real numbers yet. Do not dial real numbers before step 2 is done.
 | D-3 | What is the role of Redis? | **Decided and built 2026-10-20:** none. Postgres is the event layer: an event table with `LISTEN/NOTIFY` and a sweep, retries on the lead row, and the breaker window over `call_outcomes` (`PLAN.md` §0.10.8a). Redis is removed from the product. The media e2e stacks keep Redis only for LiveKit. |
 | D-4 | `apalis` or `pgmq` for the durable queue (`PLAN.md` §0.8)? | Neither. Use the eligibility index (BETTER-3). |
 | D-5 | Legal: AI-voice consent level, the 2-second rule for AI agents, the state laws in scope, recording disclosures, UK and India rules. | Get a counsel review before we claim compliance. Keep jurisdictions `experimental` until then. |
-| D-6 | Outcome transport: signed webhook or LiveKit participant attributes and data? | **Decided 2026-10-20:** neither. Each agent session opens one gRPC stream to the dialer. It carries the outcome, the session events, and the logs. OpenTelemetry (OTLP) uses the same gRPC endpoint, so there is no second connection. Open: OTLP as its own service on that endpoint (recommended), or OTLP messages inside the session stream. Not built yet. |
+| D-6 | Outcome transport: signed webhook or LiveKit participant attributes and data? | **Decided 2026-10-20:** neither. Each agent session opens one gRPC stream to the dialer. It carries the outcome, the session events, and the logs. OpenTelemetry (OTLP) uses the same gRPC endpoint, so there is no second connection. Open: OTLP as its own service on that endpoint (recommended), or OTLP messages inside the session stream. **Built 2026-10-30:** the session stream (`ad_session`, `proto/agentdialer/session/v1/session.proto`) with the outcome, the events, and the logs. OTLP is not built. |
 | D-7 | When do we remove `livekit/sip`? | **Superseded by D-9 (2026-10-21):** remove it when the node carries the call through Kamailio and passes the same e2e tests. Old answer: After the drachtio and rtpengine path passes the same e2e tests (MEDIA-1). |
 | D-8 | How do the dialer nodes share the calls when Kubernetes runs several? | **Decided and built 2026-10-21:** through kine, the etcd API on Postgres. Each orchestrator replica is a node with a key in kine; one node holds the leader key and assigns each call to a node with free capacity; Postgres fences a node that lost a call (`PLAN.md` §0.10.8b). Postgres and kine are managed services (for example RDS): the product reaches them only by URL and waits for them with backoff, with no host checks. |
 | D-9 | Who carries the call (SIP and RTP)? | **Decided and built 2026-10-21 (proven in Docker Compose, see MEDIA-1):** agentdialer itself, inside the node process, with vendored libraries (`rsipstack`, `rustrtc`, `audio-codec`, parts of `rustpbx`). No Asterisk, FreeSWITCH, drachtio, rtpengine, or `livekit/sip` under it. Kamailio is the SIP edge (signaling load balancer, `Record-Route`). RTP goes straight between the carrier and the node, one socket per call, in `latching` or `public` (Elastic IP per pod) mode. No host networking (`PLAN.md` §0.0). Supersedes D-7. |

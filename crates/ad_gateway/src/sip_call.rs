@@ -12,9 +12,12 @@
 //! when no agent is in the room by its deadline (`CallEnd::NoAgent`).
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
+use ad_core::Clock;
 use ad_dispatch::Placement;
+use ad_livekit::Signer;
 use ad_media::{MediaConfig, MediaOut, RtpLeg, SAMPLE_RATE};
 use ad_sip::{Ended, Incoming, Invite, Outcome, SipUa, TrunkAuth};
 use tokio::sync::{mpsc, watch, Notify};
@@ -74,6 +77,7 @@ pub struct SipCaller {
     public_ip: Option<IpAddr>,
     trunk: SipTrunk,
     livekit: GatewayConfig,
+    signer: Signer,
 }
 
 impl SipCaller {
@@ -85,8 +89,10 @@ impl SipCaller {
         public_ip: Option<IpAddr>,
         trunk: SipTrunk,
         livekit: GatewayConfig,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
+            signer: Signer::new(&livekit.api_key, &livekit.api_secret, clock),
             ua,
             media_ip,
             public_ip,
@@ -226,12 +232,7 @@ impl SipCaller {
         room: &str,
         identity: &str,
     ) -> Result<crate::webrtc_participant::LiveKitSession, BridgeError> {
-        let token = mint_token(
-            &self.livekit.api_key,
-            &self.livekit.api_secret,
-            room,
-            identity,
-        )?;
+        let token = mint_token(&self.signer, room, identity)?;
         LiveKitParticipant {
             sample_rate: SAMPLE_RATE,
             channels: 1,

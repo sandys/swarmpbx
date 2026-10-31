@@ -148,35 +148,61 @@ fn closed_day_denies() {
 
 // ---- DNC scopes ----
 
-#[test]
-fn dnc_scope_precedence_and_match() {
-    let mut set = DncSet::default();
-    set.system.insert("18005551234".into());
-    set.campaign.insert("4155559999".into());
-    set.area_codes.insert("212".into());
-
-    assert_eq!(
-        set.check("1-800-555-1234"),
-        Decision::Denied(DenyReason::Dnc(DncScope::System))
-    );
-    assert_eq!(
-        set.check("(415) 555-9999"),
-        Decision::Denied(DenyReason::Dnc(DncScope::Campaign))
-    );
-    assert_eq!(
-        set.check("212-867-5309"),
-        Decision::Denied(DenyReason::Dnc(DncScope::AreaCode))
-    );
-    assert_eq!(set.check("312-867-5309"), Decision::Allowed);
+fn lists(system: &[&str], campaign: &[&str], area_codes: &[&str]) -> DncSet {
+    let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    DncSet::from_lists(&own(system), &own(campaign), &own(area_codes)).unwrap()
 }
 
 #[test]
-fn dnc_empty_number_fails_closed() {
+fn dnc_scope_precedence_and_match() {
+    let set = lists(&["+1 800 555 1234"], &["+14155559999"], &["212"]);
+
+    assert_eq!(
+        set.check("+1-800-555-1234"),
+        Decision::Denied(DenyReason::Dnc(DncScope::System))
+    );
+    assert_eq!(
+        set.check("+1 (415) 555-9999"),
+        Decision::Denied(DenyReason::Dnc(DncScope::Campaign))
+    );
+    assert_eq!(
+        set.check("+1 212-867-5309"),
+        Decision::Denied(DenyReason::Dnc(DncScope::AreaCode))
+    );
+    assert_eq!(set.check("+1 312-867-5309"), Decision::Allowed);
+}
+
+#[test]
+fn dnc_matches_every_form_of_a_number() {
+    let set = lists(&["+44 20 7946 0958"], &[], &[]);
+    for form in ["+442079460958", "+44 (0)20 7946 0958", "+44-20-7946-0958"] {
+        assert_eq!(
+            set.check(form),
+            Decision::Denied(DenyReason::Dnc(DncScope::System)),
+            "{form}"
+        );
+    }
+    // The digits of a number of another country do not match.
+    assert_eq!(set.check("+12079460958"), Decision::Allowed);
+}
+
+#[test]
+fn dnc_number_that_does_not_read_fails_closed() {
     let set = DncSet::default();
-    assert!(matches!(
-        set.check("not-a-number"),
-        Decision::Denied(DenyReason::Dnc(_))
-    ));
+    for raw in ["not-a-number", "", "212-867-5309"] {
+        assert_eq!(
+            set.check(raw),
+            Decision::Denied(DenyReason::InvalidNumber),
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn dnc_list_refuses_an_entry_that_does_not_read() {
+    let e = DncSet::from_lists(&["800-555-1234".into()], &[], &[]).unwrap_err();
+    assert_eq!(e.entry, "800-555-1234");
+    assert!(DncSet::from_lists(&[], &[], &["21".into()]).is_err());
 }
 
 // ---- abandonment ledger: regulator denominator ----

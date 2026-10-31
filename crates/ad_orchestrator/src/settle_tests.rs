@@ -158,3 +158,104 @@ fn a_missing_agent_does_not_burn_the_lead() {
     assert_eq!(s.next_eligible_at, Some(now() + p.agent_recheck));
     assert_eq!(s.wait_reason, Some("no_agent"));
 }
+
+fn agent(code: Option<&str>, f: impl FnOnce(&mut ad_disposition::Report)) -> AgentOutcome {
+    let mut r = ad_disposition::Report {
+        schema_version: ad_disposition::SCHEMA_VERSION,
+        disposition: code.map(Into::into),
+        ..Default::default()
+    };
+    f(&mut r);
+    ad_disposition::check(
+        &r,
+        &ad_disposition::Catalog::default(),
+        Some("America/New_York"),
+        now(),
+    )
+    .unwrap()
+}
+
+fn answered() -> Outcome {
+    Outcome::Completed {
+        detail: "bye".into(),
+    }
+}
+
+#[test]
+fn a_dnc_request_stops_the_lead_after_any_end_of_the_call() {
+    let p = RetryPolicy::default();
+    let dnc = agent(Some("DNC"), |_| {});
+    for end in [answered(), Outcome::Busy { sip_code: 486 }] {
+        let s = settle_with(&end, Some(&dnc), 0, &p, now());
+        assert_eq!(s.status, LeadStatus::Dnc, "{end:?}");
+        assert!(s.counts_as_call);
+        assert_eq!((s.retry, s.next_eligible_at), (None, None));
+    }
+    let bare = agent(None, |r| r.dnc = Some(Some("campaign".into())));
+    let s = settle_with(&answered(), Some(&bare), 2, &p, now());
+    assert_eq!(s.status, LeadStatus::Dnc);
+}
+
+#[test]
+fn a_callback_queues_the_lead_at_its_time_with_a_higher_priority() {
+    let p = RetryPolicy::default();
+    let cb = agent(Some("CALLBK"), |r| {
+        r.callback = Some(ad_disposition::CallbackRequest {
+            at: "2026-10-22T09:30".into(),
+            zone: None,
+        })
+    });
+    // 09:30 EDT is 13:30 UTC.
+    let due = Utc.with_ymd_and_hms(2026, 10, 22, 13, 30, 0).unwrap();
+    // The cap of retries does not stop a callback.
+    let s = settle_with(&answered(), Some(&cb), p.max_attempts, &p, now());
+    assert_eq!(s.status, LeadStatus::Queued);
+    assert!(s.counts_as_call && !s.exhausted);
+    assert_eq!(s.next_eligible_at, Some(due));
+    assert_eq!(s.callback, Some(due));
+    assert_eq!(s.wait_reason, Some("callback"));
+    assert_eq!(s.priority, CALLBACK_PRIORITY);
+}
+
+#[test]
+fn a_machine_answer_is_a_voicemail_retry() {
+    let p = RetryPolicy::default();
+    let s = settle_with(&answered(), Some(&agent(Some("AM"), |_| {})), 0, &p, now());
+    assert_eq!(s.status, LeadStatus::Queued);
+    assert_eq!(s.retry.map(|r| r.1), Some(RetryReason::Voicemail));
+    assert_eq!(s.priority, 0);
+}
+
+#[test]
+fn a_disposition_of_an_answered_call_settles_it() {
+    let p = RetryPolicy::default();
+    for code in ["SALE", "NI", "WN", "DONE"] {
+        let s = settle_with(&answered(), Some(&agent(Some(code), |_| {})), 0, &p, now());
+        assert_eq!(s.status, LeadStatus::Dispositioned, "{code}");
+        assert_eq!((s.priority, s.callback), (0, None));
+    }
+}
+
+#[test]
+fn only_a_dnc_request_counts_when_the_callee_did_not_answer() {
+    let p = RetryPolicy::default();
+    let cb = agent(Some("CALLBK"), |r| {
+        r.callback = Some(ad_disposition::CallbackRequest {
+            at: "2026-10-22T09:30".into(),
+            zone: None,
+        })
+    });
+    let end = Outcome::NoAnswer { sip_code: 480 };
+    assert_eq!(
+        settle_with(&end, Some(&cb), 0, &p, now()),
+        settle(&end, 0, &p, now())
+    );
+    let am = agent(Some("AM"), |_| {});
+    let abandoned = Outcome::Abandoned {
+        detail: String::new(),
+    };
+    assert_eq!(
+        settle_with(&abandoned, Some(&am), 0, &p, now()),
+        settle(&abandoned, 0, &p, now())
+    );
+}

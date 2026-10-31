@@ -7,6 +7,9 @@ services:
   callee:
     build:
       context: e2e/agents/livekit
+      additional_contexts:
+        proto: proto
+        session: e2e/agents/session
     image: ad-e2e-livekit-agent
     environment:
       LIVEKIT_URL: ${LIVEKIT_URL:?set LIVEKIT_URL in .env}

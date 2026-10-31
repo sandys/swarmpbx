@@ -22,4 +22,4 @@ services:
       # The Twilio Calls API, for click-to-call (e2e/run_twilio_c2c_e2e.sh).
       SIM_TWILIO_KEY: SKsimulator
       SIM_TWILIO_SECRET: SimulatorSecret
-      SIM_NUMBERS: "+15550000486=busy,+15550000408=noanswer"
+      SIM_NUMBERS: "+12025550486=busy,+12025550408=noanswer"

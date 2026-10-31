@@ -3,7 +3,9 @@
 The dialer dispatches it by agent name into each call room (explicit
 dispatch, `CreateDispatch`). It needs no AI service. In each room it counts
 the audio frames of the callee, plays a tone back, and ends when the callee
-leaves or the room closes. GET /stats on STATS_PORT reports per room:
+leaves or the room closes. At the end, it reports the outcome of the call on
+the session stream (agent_session.py). GET /stats on STATS_PORT reports per
+room:
 
   {"rooms": {"<room>": {"agent": "agent-AJ_x", "attempt_id": 5, "loud_in": L,
                         "callee": "sip-attempt-5", "frames_in": N,
@@ -21,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 from livekit import rtc
 from livekit.agents import AgentServer, AutoSubscribe, JobContext, JobExecutorType, cli
+
+from agent_session import Session, planned_outcome
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "e2e-livekit")
 STATS_PORT = int(os.environ.get("STATS_PORT", "8088"))
@@ -73,6 +77,16 @@ server = AgentServer(
 )
 
 
+async def open_session(room: str, call: dict) -> "Session | None":
+    try:
+        session = await Session.open(call, AGENT_NAME)
+    except Exception as e:  # noqa: BLE001 - the stats show it to the test
+        update(room, session=f"error: {e}")
+        return None
+    update(room, session="open" if session else "none", codes=session.codes() if session else [])
+    return session
+
+
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: JobContext) -> None:
     call = json.loads(ctx.job.metadata or "{}")
@@ -120,6 +134,8 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.room.local_participant.publish_track(
         track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
     )
+    # Open the session in the background: the call must not wait for it.
+    opening = asyncio.ensure_future(open_session(room, call))
 
     n, idx = 0, np.arange(SAMPLES)
     if MAX_CALL_S > 0:
@@ -136,6 +152,15 @@ async def entrypoint(ctx: JobContext) -> None:
             )
         )
         bump(room, "frames_out")
+    outcome, session = planned_outcome(call), await opening
+    if session:
+        try:
+            if outcome:
+                update(room, outcome=await session.report(outcome))
+        except Exception as e:  # noqa: BLE001
+            update(room, outcome=f"error: {e}")
+        finally:
+            await session.close()
     update(room, ended=True)
     ctx.shutdown(reason="the call ended")
 

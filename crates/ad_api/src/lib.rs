@@ -10,10 +10,12 @@ mod compliance;
 mod dispatch;
 mod hopper;
 mod lead;
+mod outcomes;
 mod pacing;
 mod store;
 mod webhook;
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 use axum::{routing::get, Json, Router};
@@ -38,6 +40,9 @@ pub struct AppState {
     pub pacing: Option<ad_db::PgPacingRepo>,
     /// The LiveKit webhook endpoint answers 503 without it.
     pub webhooks: Option<Webhooks>,
+    /// The endpoints of the DNC list, the catalog, the attempts, and the
+    /// events answer 503 without it.
+    pub db: Option<ad_db::Db>,
 }
 
 impl AppState {
@@ -51,6 +56,7 @@ impl AppState {
             attempts: None,
             pacing: None,
             webhooks: None,
+            db: None,
         }
     }
 
@@ -63,7 +69,21 @@ impl AppState {
             attempts: None,
             pacing: None,
             webhooks: None,
+            db: None,
         }
+    }
+
+    /// Postgres for every store and endpoint.
+    pub fn postgres(clock: Arc<dyn Clock>, db: ad_db::Db) -> Self {
+        let mut state = Self::with_stores(
+            clock,
+            CampaignStore::Pg(db.campaigns()),
+            LeadStore::Pg(db.leads()),
+        );
+        state.attempts = Some(db.attempts());
+        state.pacing = Some(db.pacing());
+        state.db = Some(db);
+        state
     }
 }
 
@@ -89,6 +109,7 @@ pub fn router(state: AppState) -> Router {
         .merge(campaign::routes())
         .merge(lead::routes())
         .merge(pacing::routes())
+        .merge(outcomes::routes())
         .merge(hopper::routes())
         .merge(dispatch::routes())
         .merge(webhook::routes())
@@ -103,6 +124,8 @@ pub struct ServeConfig {
     pub database_url: Option<String>,
     /// The LiveKit API key and secret that verify webhooks.
     pub livekit_keys: Option<(String, String)>,
+    /// The agent session stream (gRPC). It needs Postgres.
+    pub session_addr: std::net::SocketAddr,
 }
 
 impl std::fmt::Debug for ServeConfig {
@@ -111,6 +134,7 @@ impl std::fmt::Debug for ServeConfig {
             .field("addr", &self.addr)
             .field("postgres", &self.database_url.is_some())
             .field("webhooks", &self.livekit_keys.is_some())
+            .field("session_addr", &self.session_addr)
             .finish()
     }
 }
@@ -126,16 +150,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             tracing::info!("stores: postgres (migrations applied)");
             // The same time as the orchestrator and `now()` in SQL.
             let clock: Arc<dyn Clock> = ad_db::PgClock::start(db.pool().clone()).await;
-            let mut state = AppState::with_stores(
-                clock,
-                CampaignStore::Pg(db.campaigns()),
-                LeadStore::Pg(db.leads()),
-            );
-            state.attempts = Some(db.attempts());
-            state.pacing = Some(db.pacing());
+            let mut state = AppState::postgres(clock, db.clone());
             if let Some((key, secret)) = &config.livekit_keys {
                 state.webhooks = Some(Webhooks {
-                    verifier: ad_gateway::WebhookVerifier::new(key, secret),
+                    verifier: ad_gateway::WebhookVerifier::new(key, secret, state.clock.clone()),
                     attempts: db.attempts(),
                 });
             }
@@ -150,9 +168,23 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         tracing::warn!("LiveKit webhooks are off: they need DATABASE_URL and the LiveKit keys");
     }
 
+    let session = state
+        .db
+        .as_ref()
+        .map(|db| (db.outcomes(), state.clock.clone()));
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(addr = %config.addr, "api listening");
-    axum::serve(listener, app).await?;
+    let http = axum::serve(listener, app).into_future();
+    match session {
+        Some((store, clock)) => tokio::select! {
+            r = http => r?,
+            r = ad_session::serve(config.session_addr, store, clock) => r?,
+        },
+        None => {
+            tracing::warn!("the agent session stream is off: it needs DATABASE_URL");
+            http.await?
+        }
+    }
     Ok(())
 }

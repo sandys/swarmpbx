@@ -380,3 +380,83 @@ async fn only_a_missing_agent_at_the_limit_is_a_failed_join() {
     let s = db.pacing().ingest(&pool, 2000).await.unwrap();
     assert_eq!((s.k, s.slow), (1, 1), "no agent by the limit halves k");
 }
+
+#[tokio::test]
+async fn five_failed_starts_at_k_1_pause_the_campaigns_of_the_pool() {
+    let Some(db) = common::db().await else {
+        return;
+    };
+    let c1 = agent_campaign(&db, 10).await;
+    let c2 = agent_campaign(&db, 10).await;
+    let other = agent_campaign(&db, 10).await;
+    leads(&db, c1, 6).await;
+    let pool = pool_name(c1);
+    first_k(&db, &pool, 1).await;
+    let p = pace(&pool, Mode::Adaptive);
+    let mut failed = Vec::new();
+    for i in 0..5 {
+        let a = claim(&db, c1, &p).await;
+        assert_eq!(a.len(), 1, "start {i}: a limit of 1");
+        let now = Utc::now();
+        answer(&db, a[0].attempt_id, now).await;
+        apply_all(
+            &db,
+            a[0].attempt_id,
+            &[AttemptEvent::AgentFailed {
+                at: now + Duration::milliseconds(2000),
+                detail: "no agent in the room 2000 ms after the answer".into(),
+            }],
+        )
+        .await;
+        failed.push(a[0].attempt_id.0);
+        let s = db.pacing().ingest(&pool, 2000).await.unwrap();
+        assert_eq!(s.failed_in_row, i + 1);
+        if i < 4 {
+            assert_eq!(
+                db.pacing().trip(&pool, 2000, &[c1, c2]).await.unwrap(),
+                None
+            );
+        }
+    }
+    let trip = db
+        .pacing()
+        .trip(&pool, 2000, &[c1, c2])
+        .await
+        .unwrap()
+        .expect("five failed starts at a limit of 1 open the breaker");
+    assert_eq!(trip.paused, vec![c1, c2]);
+    assert_eq!(
+        (trip.failed_in_row, trip.attempt_ids.clone()),
+        (5, failed.clone())
+    );
+    for (c, want) in [(c1, "paused"), (c2, "paused"), (other, "running")] {
+        let state: String = sqlx::query_scalar("SELECT state FROM campaigns WHERE id = $1")
+            .bind(c.0)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(state, want, "campaign {}", c.0);
+    }
+    let events = db.events().list(c1.0, 100).await.unwrap();
+    assert!(events.iter().any(|(_, e)| matches!(e,
+        ad_events::CampaignEvent::AgentPoolTripped { pool: p, failed_in_row: 5, attempt_ids, .. }
+            if *p == pool && *attempt_ids == failed)));
+    assert!(
+        claim(&db, c1, &p).await.is_empty(),
+        "a paused campaign claims nothing"
+    );
+    // The trip starts the count again.
+    assert_eq!(
+        db.pacing()
+            .view(&pool, 2000)
+            .await
+            .unwrap()
+            .state
+            .failed_in_row,
+        0
+    );
+    assert_eq!(
+        db.pacing().trip(&pool, 2000, &[c1, c2]).await.unwrap(),
+        None
+    );
+}

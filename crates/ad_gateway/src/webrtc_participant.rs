@@ -3,6 +3,7 @@
 //! `send_audio`, and forwards the agent's subscribed track into an inbound
 //! channel. This is OUR SIP↔WebRTC media leg — no `livekit/sip`.
 
+use ad_livekit::{Signer, VideoGrants};
 use futures_util::StreamExt;
 use livekit::options::TrackPublishOptions;
 use livekit::track::{LocalAudioTrack, LocalTrack, RemoteTrack, TrackSource};
@@ -11,29 +12,27 @@ use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use livekit::webrtc::prelude::AudioFrame as WebRtcAudioFrame;
 use livekit::{Room, RoomEvent, RoomOptions};
-use livekit_api::access_token::{AccessToken, VideoGrants};
 use tokio::sync::mpsc;
 
 use crate::bridge::{AudioFrame, BridgeError, RoomConnection, RoomParticipant, RoomSession};
 
+/// The life of the token of the callee's participant, as in `livekit-api`.
+const JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 /// Mint a room-join token for a participant identity with publish + subscribe.
-pub fn mint_token(
-    api_key: &str,
-    api_secret: &str,
-    room: &str,
-    identity: &str,
-) -> Result<String, BridgeError> {
-    AccessToken::with_api_key(api_key, api_secret)
-        .with_identity(identity)
-        .with_name(identity)
-        .with_grants(VideoGrants {
-            room_join: true,
-            room: room.to_string(),
-            can_publish: Some(true),
-            can_subscribe: Some(true),
-            ..Default::default()
-        })
-        .to_jwt()
+pub fn mint_token(signer: &Signer, room: &str, identity: &str) -> Result<String, BridgeError> {
+    signer
+        .join(
+            room,
+            identity,
+            None,
+            VideoGrants {
+                can_publish: Some(true),
+                can_subscribe: Some(true),
+                ..Default::default()
+            },
+            JOIN_TTL,
+        )
         .map_err(|e| BridgeError::Join(e.to_string()))
 }
 
@@ -119,6 +118,7 @@ impl RoomParticipant for LiveKitParticipant {
         let first = room.remote_participants().into_keys().next().map(|id| id.0);
         let (joined_tx, others_joined) = tokio::sync::watch::channel(first);
         let (rate, channels) = (self.sample_rate, self.channels);
+        let name = room.name();
         let forward_task = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
@@ -146,6 +146,11 @@ impl RoomParticipant for LiveKitParticipant {
                         });
                     }
                     RoomEvent::ParticipantConnected(p) => {
+                        tracing::info!(
+                            room = name,
+                            identity = p.identity().0,
+                            "a participant joined the room"
+                        );
                         joined_tx.send_if_modified(|joined| {
                             if joined.is_some() {
                                 return false;

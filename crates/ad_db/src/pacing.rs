@@ -8,9 +8,12 @@
 //!   fill its last place.
 //! - The API changes the settings of a pool and the mode of a campaign at run
 //!   time; the next claim reads them.
+//! - `trip` pauses the campaigns of a pool whose agents do not start (DIAL-9
+//!   item 7), under the same lock.
 
 use ad_attempt::{AgentLeg, Attempt, Outcome};
 use ad_core::CampaignId;
+use ad_events::CampaignEvent;
 use ad_pacing::{Join, Limits, Mode, Sample, Settings, SettingsError, State};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::postgres::PgRow;
@@ -74,6 +77,14 @@ pub enum Listed {
         pool: String,
         error: SettingsError,
     },
+}
+
+/// An open breaker of a pool, and the campaigns that it paused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trip {
+    pub paused: Vec<CampaignId>,
+    pub failed_in_row: u32,
+    pub attempt_ids: Vec<i64>,
 }
 
 #[derive(Clone)]
@@ -147,6 +158,63 @@ impl PgPacingRepo {
             "pacing: learned from agent joins"
         );
         Ok(state)
+    }
+
+    /// When the breaker of `pool` is open, pause the running campaigns of
+    /// `campaigns` (the caller knows which campaigns use the pool), record an
+    /// `agent_pool_tripped` event for each, and start the count of failed
+    /// starts again. `None` when the breaker is closed.
+    pub async fn trip(
+        &self,
+        pool: &str,
+        connect_within_ms: u32,
+        campaigns: &[CampaignId],
+    ) -> Result<Option<Trip>, PacingError> {
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        let (settings, state) = lock(&mut tx, pool).await.map_err(err)?;
+        let limits = read_settings(settings)?.resolve(connect_within_ms)?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        let mut state: State = serde_json::from_value(state).map_err(err)?;
+        if !ad_pacing::tripped(&state, &limits) {
+            return Ok(None);
+        }
+        let ids: Vec<i64> = campaigns.iter().map(|c| c.0).collect();
+        let paused: Vec<i64> = sqlx::query_scalar(
+            "UPDATE campaigns SET state = 'paused', updated_at = now() \
+             WHERE id = ANY($1) AND state = 'running' RETURNING id",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(err)?;
+        let trip = Trip {
+            paused: paused.iter().copied().map(CampaignId).collect(),
+            failed_in_row: state.failed_in_row,
+            attempt_ids: state.failed.clone(),
+        };
+        state.reset_failures();
+        sqlx::query("UPDATE agent_pools SET state = $2, updated_at = now() WHERE pool = $1")
+            .bind(pool)
+            .bind(serde_json::to_value(&state).map_err(err)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        let events: Vec<CampaignEvent> = paused
+            .iter()
+            .map(|&campaign_id| CampaignEvent::AgentPoolTripped {
+                campaign_id,
+                pool: pool.to_string(),
+                failed_in_row: trip.failed_in_row,
+                attempt_ids: trip.attempt_ids.clone(),
+            })
+            .collect();
+        crate::events::publish_in(&mut tx, &events)
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(Some(trip))
     }
 
     /// The pools that have samples to learn from.
@@ -371,6 +439,7 @@ fn sample_of(row: &PgRow) -> Result<Sample, sqlx::Error> {
     };
     let to_u32 = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
     Ok(Sample {
+        attempt_id: row.try_get("id")?,
         started_at,
         at: attempt
             .agent_ready_at

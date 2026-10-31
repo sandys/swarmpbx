@@ -27,6 +27,9 @@ ad_sip = { path = "../ad_sip" }
 ad_attempt = { path = "../ad_attempt" }
 ad_agent = { path = "../ad_agent" }
 ad_cluster = { path = "../ad_cluster" }
+ad_contact = { path = "../ad_contact" }
+ad_disposition = { path = "../ad_disposition" }
+ad_session = { path = "../ad_session" }
 clap = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
@@ -34,3 +37,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

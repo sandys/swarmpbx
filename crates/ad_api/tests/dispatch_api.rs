@@ -132,9 +132,9 @@ async fn capacity_cap_limits_attempts() {
         &app,
         cid,
         json!([
-            { "phone_number": "+1a", "timezone": "America/New_York" },
-            { "phone_number": "+1b", "timezone": "America/New_York" },
-            { "phone_number": "+1c", "timezone": "America/New_York" }
+            { "phone_number": "+13125550201", "timezone": "America/New_York" },
+            { "phone_number": "+13125550202", "timezone": "America/New_York" },
+            { "phone_number": "+13125550203", "timezone": "America/New_York" }
         ]),
     )
     .await;

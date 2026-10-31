@@ -2,10 +2,13 @@
 name: compliance-engine
 description: >
   Teaches how to work on the AgentDialer compliance engine (crate ad_compliance):
-  safe-hours (TCPA timezone windows), DNC scrubbing, and the abandonment-rate
-  ledger with its jurisdiction registry. Use this skill when you change calling
-  rules, timezones, DNC, abandonment math, or add a jurisdiction. The engine
-  fails closed and must stay pure. This is the highest-risk product subsystem.
+  safe hours (TCPA timezone windows), DNC scrubbing, and the abandonment-rate
+  ledger with its jurisdiction registry. It also shows where the leader calls
+  the engine before each dial, and how the DNC list in Postgres gets its
+  entries (the API and the agents' DNC requests). Use this skill when you
+  change calling rules, timezones, DNC, abandonment math, or add a
+  jurisdiction. The engine fails closed and must stay pure. This is the
+  highest-risk product subsystem.
 license: AGPL-3.0-or-later
 metadata:
   project: agentdialer
@@ -14,111 +17,152 @@ metadata:
 
 # Compliance engine (`ad_compliance`)
 
-The compliance engine decides if AgentDialer may call a lead right now. It is
-the highest-risk product subsystem. A wrong decision carries legal and financial
-penalties. Treat every change here with care.
+The compliance engine decides if AgentDialer may call a lead now. A wrong
+decision can bring legal and money penalties. This is the part of the product
+with the highest risk. Work on it with care.
 
-Read `PLAN.md` §9 for the full design.
+`PLAN.md` §9 has the full design.
 
-Warning: until COMP-1 and COMP-2 in `GAPS.md` are done, do not claim that
-production dialing is compliant. The orchestrator passes a 24-hour window and
-an empty DNC list (COMP-1). No table stores call times, holidays, or DNC
-entries. A lead without an explicit IANA timezone never dials (COMP-2). Counsel
-must also review the rules (decision D-5).
+CAUTION: Do not claim that production dialing is compliant. These gaps are
+open (`GAPS.md`):
 
-Where production calls the engine: the leader's `gate()` in
-`crates/ad_bin/src/orchestrator/leader.rs`. It re-gates each claimed lead with
-`ad_hopper::select`. It passes `CallWindowSet::uniform(0, 2400)` (set in
-`crates/ad_bin/src/orchestrator/mod.rs`), `DncSet::default()`, and no
-ruleset. COMP-1 replaces these with data from tables.
+- The leader passes a 24-hour window (COMP-1). No table stores call times or
+  holidays.
+- The DNC list is in Postgres (`dnc_numbers`). It holds only the entries of
+  the API and of the agents. No national list is loaded (COMP-8).
+- A lead without an IANA timezone never dials (COMP-2). The dialer does not
+  find the timezone from the number or the postal code yet.
+- Counsel must review the rules (decision D-5).
 
-The VICIdial reference shows how a mature dialer stores this data
-(`_research/vicidial/`, see `GAPS.md` Appendix A). Read it before you add the
-tables.
+## Where the dialer calls the engine
+
+The leader calls it before each dial, in `gate()` in
+`crates/ad_bin/src/orchestrator/leader.rs`:
+
+1. It reads the DNC entries of the claimed numbers
+   (`PgDncRepo::set_for`). If the list does not read, it releases every
+   claim, and nothing dials.
+2. It calls `ad_hopper::select` with the leads, the DNC set, the windows,
+   and no ruleset. `select` checks the lead status, the DNC set, and then the
+   safe hours.
+3. It ends each denied lead as `not_dialed`, with the reason. A DNC hit makes
+   the lead `dnc`. An unknown timezone makes it `blocked`. A closed window
+   holds it for 15 minutes.
+
+The windows are `CallWindowSet::uniform(0, 2400)`, set in
+`crates/ad_bin/src/orchestrator/mod.rs`. COMP-1 replaces them with data from
+tables. Read how VICIdial stores this data before you add the tables
+(`_research/vicidial/`; `GAPS.md` Appendix A lists the files).
+
+The DNC list gets its entries in two ways. Both go through `ad_db::dnc`:
+
+- `POST /v1/dnc` (`crates/ad_api/src/outcomes.rs`), with the source `api`.
+- An agent's DNC request on the session stream (`ad_session`), with the
+  source `agent`. It takes effect at once: every waiting lead with that
+  number becomes `dnc`.
 
 ## Two rules you must never break
 
-1. Fail closed. If the engine cannot prove a call is permitted, it denies.
-   Examples that must deny: unknown timezone, unparseable window, missing data.
-   When you add a code path, the default branch denies.
-
-2. Stay pure. A decision function takes data plus a `Clock` and returns a
-   `Decision`. It does no I/O. The caller loads DNC data and passes it in. This
-   keeps the engine deterministic and testable. In production the `Clock` is
-   `ad_db::PgClock`: the safe hours use the Postgres time, not the OS clock
-   of the node (`GAPS.md` OPS-9).
+1. **Fail closed.** If the engine cannot prove that a call is allowed, it
+   denies. An unknown timezone, a window that does not parse, and missing
+   data must deny. When you add a code path, make the default branch deny.
+2. **Stay pure.** A decision function takes data and a `Clock`, and it gives
+   a `Decision`. It does no I/O. The caller loads the DNC data and passes it
+   in. This keeps the engine the same in each run, and easy to test. In
+   production, the `Clock` is `ad_db::PgClock`: the safe hours use the
+   Postgres time, not the OS clock of the node (D-11).
 
 ## The modules
 
-- `safe_hours.rs` — the calling-window gate. It resolves the lead local time
-  from an IANA timezone, then checks per-weekday windows and holidays. Unknown
-  or unparseable timezone denies with `UnknownLocalTime`.
-- `dnc.rs` — do-not-call scrubbing. Scopes: system, campaign, area code. An
-  empty or unusable number denies.
-- `abandon.rs` — the abandonment ledger and the jurisdiction registry.
+- `safe_hours.rs`: the calling-window gate. It finds the lead's local time
+  from its IANA timezone. Then it checks the window of the weekday and the
+  holidays. An unknown timezone denies with `UnknownLocalTime`.
+- `dnc.rs`: DNC scrubbing, with the scopes system, campaign, and area code.
+  The keys of a `DncSet` are E.164 numbers (`ad_contact::E164`).
+  `DncSet::from_lists` refuses an entry that does not read. A number that
+  does not read denies with `InvalidNumber`.
+- `abandon.rs`: the abandonment ledger and the jurisdiction registry.
 
-## The abandonment rate — use the correct denominator
+Read phone numbers only through `ad_contact`. Do not add a second parser.
+Then one change in `ad_contact` changes the rule for every crate.
 
-The regulator rate is NOT failed calls divided by total dials. It is:
+## The abandonment rate: use the right denominator
+
+The rate of the regulator is not the failed calls over all dials. It is:
 
 ```
 abandon_rate = answered_by_human_but_no_agent / answered_by_human
 ```
 
-Only human-answered calls are in the denominator. The ledger records
-human-answered events and marks each as abandoned or not. See
-`abandon.rs::AbandonLedger`.
+Only calls that a human answered are in the denominator. The ledger records
+each such call, and it marks the call as abandoned or not. See
+`AbandonLedger` in `abandon.rs`.
 
-In production, `call_attempts` is the ledger. `ad_db::PgAttemptRepo::abandon_counts`
-returns `AbandonCounts` for a campaign and a window. The leader then calls the
-pure `JurisdictionRule::allows_customer_first`. Keep these rules:
-- No answered call yet: the rate is undefined, and customer first is allowed.
-- A rate above the cap, or a ledger that the leader cannot read: dial agent
-  first. Agent first cannot abandon a call, so this fails closed.
+In production, `call_attempts` is the ledger.
+`ad_db::PgAttemptRepo::abandon_counts` gives the `AbandonCounts` of a
+campaign over a window. The leader then calls the pure
+`JurisdictionRule::allows_customer_first`. Keep these rules:
+
+- With no answered call yet, the rate is not known, and customer first is
+  allowed.
+- With a rate above the cap, or a ledger that does not read, the campaign
+  dials agent first. Agent first cannot abandon a call, so this fails closed.
 - `connect_within` (2 s) is the limit from the answer to the agent in the
   room. A customer-first call past the limit ends as `abandoned`.
-- There is no answering-machine detection yet. Every answer counts as a human
+- There is no answering-machine detection yet. Each answer counts as a human
   answer (`GAPS.md` COMP-10).
-- The join-paced window (`ad_pacing`, `GAPS.md` DIAL-9) is not a compliance
-  gate. It lowers the number of abandoned calls. The governor above stays the
-  hard limit. The window's default target and back-off come from
-  `connect_within`; if you change that limit, saved pool settings can become
-  invalid, and their pools then dial one call at a time (fail closed).
+- The pacing window (`ad_pacing`, DIAL-9) is not a compliance gate. It lowers
+  the number of abandoned calls, but the cap above stays the hard limit. The
+  default target and back-off of the window come from `connect_within`. If
+  you change that limit, saved pool settings can become invalid. Such a pool
+  then dials one call at a time (fail closed).
 
-## Add a jurisdiction (registry pattern)
+## Add a jurisdiction (the registry)
 
-A jurisdiction rule is a variant of `JurisdictionRule` plus match arms for
-`cap()` and `window()`. Add one with a new variant and the arms. Do not run a
-migration. Mark a rule `experimental` until you verify it against primary
-sources. The `IndiaTrai` and `UkOfcom` rules are experimental now.
+A jurisdiction is a variant of `JurisdictionRule`, with its match arms for
+`cap()`, `window()`, and `connect_within()`. To add one, add the variant and
+its arms. Do not add a migration. Mark a rule experimental
+(`is_experimental`) until you check it against primary sources. `IndiaTrai`
+and `UkOfcom` are experimental now. All campaigns use `UsTsr`
+(`JurisdictionRule::CAMPAIGN`) until a campaign can select one.
 
-Warning: before you ship an India rule for production, confirm the TRAI
-Feb-2025 obligations against primary TRAI sources. Do not claim compliance
-without that check.
+CAUTION: Before you ship an India rule for production, check the TRAI
+Feb-2025 rules against primary TRAI sources. Do not claim compliance without
+that check.
 
 ## Tests
 
-Tests live in `crates/ad_compliance/tests/`. They cover DST, half-hour-offset
-zones (for example Asia/Kolkata at +5:30), midnight-wrap windows, holidays,
-closed days, DNC scope precedence, and the abandonment denominator.
-`properties.rs` holds the fail-closed and always-open property tests.
+The tests are in `crates/ad_compliance/tests/`. They cover DST, zones with a
+half-hour offset (for example Asia/Kolkata at +5:30), windows that cross
+midnight, holidays, closed days, the order of the DNC scopes, and the
+abandonment denominator. `properties.rs` has the fail-closed and always-open
+property tests.
 
 When you change the engine:
 
-1. Add or update tests first.
-2. Prove the test has teeth: break the logic once, confirm the test fails, then
-   revert.
-3. Run the crate tests in Docker. Then run the full tier (`vertical-slice` skill):
+1. Add or change the tests first.
+2. Prove that each test can fail. Break the logic one time, see the test
+   fail, and then undo the break.
+3. Run the crate tests in Docker, and then the full tier (`vertical-slice`):
+
    ```
    docker compose -f docker-compose.test.yml run --rm --build tests \
        cargo test -p ad_compliance
    docker compose -f docker-compose.test.yml down
    ```
 
+4. If you change the gate, run `e2e/run_e2e.sh`. It has a lead whose number
+   is on the system DNC list in another form. The carrier must never see that
+   call.
+
 ## The API
 
-The engine is exposed at `POST /v1/compliance/check` in
-`crates/ad_api/src/compliance.rs`. `GET /v1/campaigns/:id/abandonment` shows
-the ledger of a campaign and whether customer first is allowed. A malformed window returns HTTP 400. That is
-also fail-closed: the API never returns `allowed: true` for input it cannot
-interpret. Ship API changes with contract tests. See the `vertical-slice` skill.
+- `POST /v1/compliance/check` (`crates/ad_api/src/compliance.rs`) runs the
+  engine. A window that does not parse gives HTTP 400. This also fails
+  closed: the API never gives `allowed: true` for input that it cannot read.
+- `GET /v1/campaigns/:id/abandonment` shows the ledger of a campaign, and if
+  customer first is allowed.
+- `POST /v1/dnc`, `GET /v1/dnc`, and `DELETE /v1/dnc/:id` manage the DNC
+  list (the `run-campaigns` skill, "The DNC list").
+
+Ship each API change with contract tests (the `vertical-slice` skill).

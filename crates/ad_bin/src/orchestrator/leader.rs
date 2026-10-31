@@ -25,16 +25,15 @@ use ad_attempt::{AttemptEvent, NotDialedReason, Outcome};
 use ad_campaign::repo::CampaignRepo;
 use ad_cluster::{decode, keys, placement, Assignment, Mirror, NodeLoad};
 use ad_compliance::abandon::JurisdictionRule;
-use ad_compliance::dnc::DncSet;
 use ad_compliance::DenyReason;
 use ad_core::time::Clock;
 use ad_core::{AttemptId, CampaignId, LeadId};
-use ad_db::{ClaimRequest, ClaimedAttempt, LeadUpdate, PaceClaim, PgEventConsumer};
+use ad_db::{ClaimRequest, ClaimedAttempt, LeadUpdate, PaceClaim, PgEventConsumer, SettleInput};
 use ad_dispatch::Pacer;
 use ad_events::{BreakerStore, CampaignEvent, Consumer, EventError};
 use ad_hopper::{select, ExcludeReason, Order, SelectionInput};
-use ad_orchestrator::{react, settle, ReactorAction};
-use ad_pacing::Mode;
+use ad_orchestrator::{react, settle_with, ReactorAction};
+use ad_pacing::{Mode, State as PoolState};
 use tokio::sync::{mpsc, watch};
 
 use super::{every, warn_err, AbortOnDrop, Node};
@@ -333,8 +332,17 @@ impl Scheduler {
         };
         let pool = spec.pool();
         // The claim still uses the saved limit when this fails.
-        if let Err(e) = node.db.pacing().ingest(&pool, connect_within_ms).await {
-            tracing::warn!(pool, error = %e, "pacing samples not read");
+        match node.db.pacing().ingest(&pool, connect_within_ms).await {
+            Ok(state) => {
+                if self
+                    .trip_pool(&pool, &state, connect_within_ms)
+                    .await
+                    .contains(&campaign_id)
+                {
+                    return None;
+                }
+            }
+            Err(e) => tracing::warn!(pool, error = %e, "pacing samples not read"),
         }
         Some(Plan {
             agent_on_answer: self.agent_on_answer(campaign_id, &spec).await,
@@ -377,6 +385,52 @@ impl Scheduler {
         rule.connect_within_ms()
     }
 
+    /// Pause the running campaigns of a pool whose agents do not start
+    /// (GAPS.md DIAL-9 item 7). Returns the campaigns that it paused.
+    async fn trip_pool(
+        &self,
+        pool: &str,
+        state: &PoolState,
+        connect_within_ms: u32,
+    ) -> Vec<CampaignId> {
+        if state.failed_in_row == 0 {
+            return Vec::new();
+        }
+        let node = &self.node;
+        let Some(running) = warn_err(
+            node.db.campaigns().list_running().await,
+            "running campaigns",
+        ) else {
+            return Vec::new();
+        };
+        let of_pool: Vec<CampaignId> = running
+            .iter()
+            .filter(|c| {
+                c.agent
+                    .as_ref()
+                    .and_then(|a| AgentSpec::parse(a).ok())
+                    .is_some_and(|s| s.pool() == pool)
+            })
+            .map(|c| c.id)
+            .collect();
+        let trip = node
+            .db
+            .pacing()
+            .trip(pool, connect_within_ms, &of_pool)
+            .await;
+        let Some(Some(trip)) = warn_err(trip, "agent pool breaker") else {
+            return Vec::new();
+        };
+        tracing::warn!(
+            pool,
+            campaigns = ?trip.paused.iter().map(|c| c.0).collect::<Vec<_>>(),
+            failed_in_row = trip.failed_in_row,
+            attempts = ?trip.attempt_ids,
+            "agent pool breaker open; campaigns paused"
+        );
+        trip.paused
+    }
+
     async fn pause_if_breaker_open(&self, campaign_id: CampaignId) -> anyhow::Result<bool> {
         let node = &self.node;
         let (open, stats) = match node
@@ -412,7 +466,29 @@ impl Scheduler {
     /// Re-gate the claimed leads: end the denied attempts, queue the others.
     async fn gate(&self, campaign_id: CampaignId, claimed: Vec<ClaimedAttempt>) {
         let node = &self.node;
-        let dnc = DncSet::default();
+        let numbers: Vec<_> = claimed
+            .iter()
+            .filter_map(|c| ad_contact::phone_key(&c.lead.phone_number))
+            .collect();
+        let dnc = match node.db.dnc().set_for(campaign_id, &numbers).await {
+            Ok(set) => set,
+            Err(e) => {
+                // Fail closed: without the DNC list, no claimed lead dials.
+                tracing::warn!(campaign = campaign_id.0, error = %e, "the DNC list does not read");
+                for a in claimed {
+                    let event = AttemptEvent::NotDialed {
+                        at: node.clock.now_utc(),
+                        reason: NotDialedReason::Released,
+                        detail: format!("the DNC list does not read: {e}"),
+                    };
+                    warn_err(
+                        node.attempts.apply(a.attempt_id, &event).await,
+                        "release a claimed attempt",
+                    );
+                }
+                return;
+            }
+        };
         let selection = select(
             node.clock.as_ref(),
             SelectionInput {
@@ -457,16 +533,28 @@ impl Scheduler {
     }
 
     /// Update the lead from an ended attempt once, then close the room and
-    /// remove the assignment.
+    /// remove the assignment. An answered call that its agent joined waits
+    /// for the agent's outcome, at most `outcome_wait_s` after its end.
     async fn settle(&self, attempt_id: AttemptId) -> anyhow::Result<()> {
         let node = &self.node;
         let policy = node.settings.retry;
         let now = node.clock.now_utc();
         let mut report = None;
+        let mut waits = false;
         let done = node
             .attempts
-            .settle(attempt_id, |input| {
-                let s = settle(input.outcome, input.called_count, &policy, now);
+            .settle_or_wait(attempt_id, |input| {
+                if waits_for_outcome(input, now) {
+                    waits = true;
+                    return None;
+                }
+                let s = settle_with(
+                    input.outcome,
+                    input.agent_outcome,
+                    input.called_count,
+                    &policy,
+                    now,
+                );
                 let mut events = Vec::new();
                 if s.counts_as_call {
                     events.push(CampaignEvent::CallCompleted {
@@ -475,7 +563,7 @@ impl Scheduler {
                         answered: matches!(input.outcome, Outcome::Completed { .. }),
                     });
                 }
-                if let Some((due, _)) = s.retry {
+                if let Some(due) = s.retry.map(|(due, _)| due).or(s.callback) {
                     events.push(CampaignEvent::RetryScheduled {
                         campaign_id: input.campaign_id.0,
                         lead_id: input.lead_id.0,
@@ -487,24 +575,38 @@ impl Scheduler {
                     input.lead_id,
                     input.outcome.class(),
                     s.exhausted,
+                    input
+                        .agent_outcome
+                        .and_then(|o| o.disposition.as_ref())
+                        .map(|d| d.code.clone()),
                 ));
-                (
+                Some((
                     LeadUpdate {
                         status: s.status,
                         counts_as_call: s.counts_as_call,
                         next_eligible_at: s.next_eligible_at,
                         wait_reason: s.wait_reason,
+                        priority: s.priority,
                     },
                     events,
-                )
+                ))
             })
             .await?;
-        if let (Some(update), Some((campaign, lead, outcome, exhausted))) = (done, report) {
+        let Some(update) = done else {
+            // While it waits for the outcome, the call frees its place on the
+            // node. The room stays for the agent.
+            if waits {
+                self.cleanup(attempt_id, false).await?;
+            }
+            return Ok(());
+        };
+        if let Some((campaign, lead, outcome, exhausted, disposition)) = report {
             tracing::info!(
                 campaign = campaign.0,
                 lead = lead.0,
                 attempt = attempt_id.0,
                 outcome,
+                disposition,
                 status = update.status.as_str(),
                 retry_at = update
                     .next_eligible_at
@@ -514,11 +616,11 @@ impl Scheduler {
                 "attempt settled"
             );
         }
-        self.cleanup(attempt_id).await
+        self.cleanup(attempt_id, true).await
     }
 
-    /// Close the room of an ended attempt and remove its assignment key.
-    async fn cleanup(&self, attempt_id: AttemptId) -> anyhow::Result<()> {
+    /// Remove the assignment key of an ended attempt, and close its room.
+    async fn cleanup(&self, attempt_id: AttemptId, close_room: bool) -> anyhow::Result<()> {
         let node = &self.node;
         let Some(brief) = node.attempts.briefs(&[attempt_id.0]).await?.pop() else {
             return Ok(());
@@ -527,8 +629,10 @@ impl Scheduler {
             return Ok(());
         }
         // The agent leaves when its room closes; a SIP leg still in it hangs up.
-        if let Err(e) = node.gateway.delete_room(&brief.room).await {
-            tracing::warn!(attempt = attempt_id.0, error = %e, "room close failed");
+        if close_room {
+            if let Err(e) = node.gateway.delete_room(&brief.room).await {
+                tracing::warn!(attempt = attempt_id.0, error = %e, "room close failed");
+            }
         }
         if let Some(n) = &brief.node {
             ad_cluster::unassign(&node.kine, n, attempt_id.0).await?;
@@ -550,10 +654,10 @@ impl Scheduler {
         for pool in warn_err(node.db.pacing().pools_with_samples().await, "pacing pools")
             .unwrap_or_default()
         {
-            warn_err(
-                node.db.pacing().ingest(&pool, connect_within_ms).await,
-                "pacing ingest",
-            );
+            let state = node.db.pacing().ingest(&pool, connect_within_ms).await;
+            if let Some(state) = warn_err(state, "pacing ingest") {
+                self.trip_pool(&pool, &state, connect_within_ms).await;
+            }
         }
         self.repair().await?;
         for campaign in node.db.campaigns().list_running().await? {
@@ -592,9 +696,7 @@ impl Scheduler {
             match briefs.get(attempt) {
                 None => ad_cluster::unassign(&node.kine, key_node, *attempt).await?,
                 Some(b) if !b.live => {
-                    if b.settled {
-                        self.cleanup(b.attempt_id).await?;
-                    }
+                    self.cleanup(b.attempt_id, b.settled).await?;
                 }
                 Some(b) if b.node.as_deref() != Some(key_node) || b.assign_gen != *gen => {
                     ad_cluster::unassign(&node.kine, key_node, *attempt).await?;
@@ -628,6 +730,27 @@ impl Scheduler {
     }
 }
 
+/// An answered call that its agent joined, with a session and no outcome
+/// yet, waits for the outcome until `outcome_wait_s` after its end.
+fn waits_for_outcome(input: &SettleInput<'_>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if input.agent_outcome.is_some()
+        || !input.session
+        || input.attempt.agent_ready_at.is_none()
+        || !matches!(input.outcome, Outcome::Completed { .. })
+    {
+        return false;
+    }
+    let wait = input
+        .agent
+        .as_ref()
+        .and_then(|a| AgentSpec::parse(a).ok())
+        .map_or(ad_agent::DEFAULT_OUTCOME_WAIT_S, |s| s.outcome_wait_s());
+    input
+        .attempt
+        .ended_at()
+        .is_some_and(|end| now < end + chrono::Duration::seconds(wait.into()))
+}
+
 /// Map a dispatch-gate exclusion to the attempt's end.
 fn not_dialed(reason: &ExcludeReason) -> (NotDialedReason, String) {
     match reason {
@@ -638,6 +761,7 @@ fn not_dialed(reason: &ExcludeReason) -> (NotDialedReason, String) {
                 DenyReason::OutsideCallingWindow
                 | DenyReason::Holiday
                 | DenyReason::InvalidWindowConfig => NotDialedReason::Window,
+                DenyReason::InvalidNumber => NotDialedReason::Excluded,
             };
             (class, r.to_string())
         }
@@ -648,5 +772,155 @@ fn not_dialed(reason: &ExcludeReason) -> (NotDialedReason, String) {
         ExcludeReason::IneligibleStatus => {
             (NotDialedReason::Released, "the lead is not dialable".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ad_attempt::{apply, Attempt, AttemptEvent as E};
+    use chrono::{DateTime, Duration, TimeZone, Utc};
+
+    use super::*;
+
+    fn at(s: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_800_000_000 + s, 0).unwrap()
+    }
+
+    /// Agent first: the agent joins, and the call is answered at 2 s and ends at 10 s.
+    fn ended_with_agent() -> Attempt {
+        run(
+            Attempt::with_agent(),
+            &[
+                E::AgentStarting {
+                    at: at(0),
+                    detail: String::new(),
+                },
+                E::AgentReady {
+                    at: at(1),
+                    identity: "agent".into(),
+                },
+                E::DialStarted { at: at(1) },
+                E::Answered { at: at(2) },
+                E::Hangup {
+                    at: at(10),
+                    detail: "callee".into(),
+                },
+            ],
+        )
+    }
+
+    /// Customer first: the callee hangs up at 3 s, before the agent joins.
+    fn ended_before_the_agent() -> Attempt {
+        run(
+            Attempt::with_agent_on_answer(2000),
+            &[
+                E::DialStarted { at: at(1) },
+                E::Answered { at: at(2) },
+                E::AgentStarting {
+                    at: at(2),
+                    detail: String::new(),
+                },
+                E::Hangup {
+                    at: at(3),
+                    detail: "callee".into(),
+                },
+            ],
+        )
+    }
+
+    fn run(first: Attempt, events: &[E]) -> Attempt {
+        events.iter().fold(first, |a, e| {
+            apply(&a, e).expect("the statechart takes the event")
+        })
+    }
+
+    fn input<'a>(attempt: &'a Attempt, agent: Option<serde_json::Value>) -> SettleInput<'a> {
+        SettleInput {
+            campaign_id: CampaignId(1),
+            lead_id: LeadId(1),
+            outcome: attempt.outcome().expect("the attempt ended"),
+            called_count: 0,
+            attempt,
+            agent_outcome: None,
+            session: true,
+            agent,
+        }
+    }
+
+    #[test]
+    fn the_leader_waits_for_the_outcome_of_an_answered_call_with_an_agent() {
+        let a = ended_with_agent();
+        assert!(matches!(a.outcome(), Some(Outcome::Completed { .. })));
+        let end = at(10);
+        let default = ad_agent::DEFAULT_OUTCOME_WAIT_S as i64;
+        assert!(waits_for_outcome(&input(&a, None), end));
+        assert!(waits_for_outcome(
+            &input(&a, None),
+            end + Duration::seconds(default) - Duration::milliseconds(1)
+        ));
+        assert!(!waits_for_outcome(
+            &input(&a, None),
+            end + Duration::seconds(default)
+        ));
+
+        let spec = serde_json::json!({"runtime": "pipecat", "start_url": "http://bot/start", "outcome_wait_s": 3});
+        assert!(waits_for_outcome(&input(&a, Some(spec.clone())), at(12)));
+        assert!(!waits_for_outcome(&input(&a, Some(spec)), at(13)));
+        let none = serde_json::json!({"runtime": "pipecat", "start_url": "http://bot/start", "outcome_wait_s": 0});
+        assert!(!waits_for_outcome(&input(&a, Some(none)), end));
+    }
+
+    #[test]
+    fn the_leader_does_not_wait_when_no_outcome_can_come() {
+        let a = ended_with_agent();
+        let reported = ad_disposition::AgentOutcome {
+            schema_version: 1,
+            disposition: None,
+            answered_by: ad_disposition::AnsweredBy::Human,
+            callback: None,
+            dnc: None,
+            transfer_to: None,
+            summary: None,
+            disclosures: Vec::new(),
+        };
+        let with_outcome = SettleInput {
+            agent_outcome: Some(&reported),
+            ..input(&a, None)
+        };
+        assert!(!waits_for_outcome(&with_outcome, at(10)));
+        let no_session = SettleInput {
+            session: false,
+            ..input(&a, None)
+        };
+        assert!(!waits_for_outcome(&no_session, at(10)));
+        // The agent never joined, so it has nothing to report.
+        let not_joined = ended_before_the_agent();
+        assert!(matches!(
+            not_joined.outcome(),
+            Some(Outcome::Completed { .. })
+        ));
+        assert!(!waits_for_outcome(&input(&not_joined, None), at(3)));
+        // The agent joined, but the callee was busy: the dialer knows the result.
+        let busy = run(
+            Attempt::with_agent(),
+            &[
+                E::AgentStarting {
+                    at: at(0),
+                    detail: String::new(),
+                },
+                E::AgentReady {
+                    at: at(1),
+                    identity: "agent".into(),
+                },
+                E::DialStarted { at: at(1) },
+                E::Rejected {
+                    at: at(2),
+                    sip_code: Some(486),
+                    detail: "busy".into(),
+                },
+            ],
+        );
+        assert!(busy.agent_ready_at.is_some());
+        assert!(!waits_for_outcome(&input(&busy, None), at(2)));
     }
 }

@@ -68,7 +68,9 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(6);
 
-    let token = mint_token(&key, &secret, &room, &identity).expect("mint token");
+    // A probe run by hand: the OS clock dates its token.
+    let signer = ad_livekit::Signer::new(&key, &secret, Arc::new(ad_core::time::SystemClock));
+    let token = mint_token(&signer, &room, &identity).expect("mint token");
     let participant = LiveKitParticipant::default();
     let session = participant
         .join(RoomConnection {
