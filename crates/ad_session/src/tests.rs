@@ -73,6 +73,7 @@ async fn start() -> (Arc<Memory>, String) {
                         ..Flags::default()
                     },
                 }],
+                callback_min: chrono::Duration::hours(2),
                 live: true,
                 settled: false,
             },
@@ -261,6 +262,25 @@ async fn a_callback_and_a_dnc_request_reach_the_store() {
         serde_json::to_value(&stored).unwrap()["summary"],
         "please stop calling"
     );
+}
+
+#[tokio::test]
+async fn a_callback_sooner_than_the_campaign_floor_is_refused() {
+    let (memory, url) = start().await;
+    let (mut agent, _) = Agent::open(&url, 7, TOKEN).await.unwrap();
+    // The clock is 15:00 UTC (10:00 in New York). The floor is 2 hours.
+    let soon = pb::Outcome {
+        callback: Some(pb::Callback {
+            local_time: "2026-03-01T11:30".into(),
+            zone: String::new(),
+        }),
+        ..outcome("CALLBK")
+    };
+    let Out::Rejected(r) = agent.send(In::Outcome(soon)).await else {
+        panic!("the dialer took a callback 90 minutes ahead")
+    };
+    assert!(r.reason.contains("at least 7200 s"), "{}", r.reason);
+    assert!(memory.outcomes.lock().unwrap().get(&7).is_none());
 }
 
 #[test]

@@ -51,6 +51,9 @@ pub struct Session {
     pub lead_timezone: Option<String>,
     /// The campaign codes of the catalog (`campaigns.dispositions`).
     pub dispositions: Vec<Disposition>,
+    /// A callback must be at least this far in the future
+    /// (`campaigns.retry`).
+    pub callback_min: chrono::Duration,
     pub live: bool,
     pub settled: bool,
 }
@@ -110,7 +113,7 @@ impl PgOutcomeRepo {
     ) -> Result<Session, OutcomeError> {
         let row = sqlx::query(
             "SELECT a.campaign_id, a.lead_id, a.phone_number, a.state, a.settled_at, \
-                    l.timezone, c.dispositions \
+                    l.timezone, c.dispositions, c.retry \
              FROM call_attempts a JOIN leads l ON l.id = a.lead_id \
                   JOIN campaigns c ON c.id = a.campaign_id \
              WHERE a.id = $1 AND a.session_token_sha256 = $2",
@@ -130,6 +133,12 @@ impl PgOutcomeRepo {
             lead_timezone: row.try_get("timezone").map_err(err)?,
             dispositions: serde_json::from_value(row.try_get("dispositions").map_err(err)?)
                 .map_err(|e| OutcomeError::Catalog(e.to_string()))?,
+            callback_min: chrono::Duration::seconds(
+                crate::retry_of(row.try_get("retry").map_err(err)?)
+                    .map_err(|e| OutcomeError::Catalog(e.to_string()))?
+                    .callback_min_s
+                    .into(),
+            ),
             live: state != "ended",
             settled: row
                 .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("settled_at")

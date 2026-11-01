@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use ad_events::CampaignEvent;
+
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -19,6 +21,45 @@ impl PgLeadRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// The earliest time after `after` at which a waiting lead of the
+    /// campaign becomes due (a retry, a callback, or a hold).
+    pub async fn next_due(
+        &self,
+        campaign_id: CampaignId,
+        after: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, RepoError> {
+        sqlx::query_scalar(
+            "SELECT min(next_eligible_at) FROM leads \
+             WHERE campaign_id = $1 AND status IN ('new', 'queued') AND next_eligible_at > $2",
+        )
+        .bind(campaign_id.0)
+        .bind(after)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(to_repo_err)
+    }
+
+    /// `next_due` of each running campaign that has a lead due after `after`.
+    pub async fn next_due_running(
+        &self,
+        after: DateTime<Utc>,
+    ) -> Result<Vec<(CampaignId, DateTime<Utc>)>, RepoError> {
+        let rows: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT l.campaign_id, min(l.next_eligible_at) FROM leads l \
+             JOIN campaigns c ON c.id = l.campaign_id AND c.state = 'running' \
+             WHERE l.status IN ('new', 'queued') AND l.next_eligible_at > $1 \
+             GROUP BY l.campaign_id",
+        )
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_repo_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(c, at)| (CampaignId(c), at))
+            .collect())
+    }
 }
 
 fn to_repo_err(e: sqlx::Error) -> RepoError {
@@ -27,7 +68,8 @@ fn to_repo_err(e: sqlx::Error) -> RepoError {
 
 pub(crate) const COLS: &str =
     "id, campaign_id, phone_number, timezone, state, postal_code, status, \
-     called_count, last_local_call_time, context, created_at, updated_at";
+     called_count, priority, next_eligible_at, retry_reason, last_local_call_time, \
+     context, created_at, updated_at";
 
 pub(crate) fn row_to_lead(row: &PgRow) -> Result<Lead, RepoError> {
     let status_str: String = row.try_get("status").map_err(to_repo_err)?;
@@ -61,6 +103,9 @@ pub(crate) fn row_to_lead(row: &PgRow) -> Result<Lead, RepoError> {
         postal_code: row.try_get("postal_code").map_err(to_repo_err)?,
         status,
         called_count: row.try_get::<i32, _>("called_count").map_err(to_repo_err)? as u32,
+        priority: row.try_get("priority").map_err(to_repo_err)?,
+        next_eligible_at: row.try_get("next_eligible_at").map_err(to_repo_err)?,
+        retry_reason: row.try_get("retry_reason").map_err(to_repo_err)?,
         last_local_call_time,
         context,
         created_at,
@@ -77,8 +122,25 @@ fn context_to_json(context: &BTreeMap<String, String>) -> serde_json::Value {
     )
 }
 
+/// A `leads_added` event for each campaign of the new leads, so the leader
+/// dials them without a wait for its sweep.
+async fn added(tx: &mut sqlx::PgConnection, leads: &[Lead]) -> Result<(), RepoError> {
+    let mut counts = std::collections::BTreeMap::<i64, u32>::new();
+    for lead in leads {
+        *counts.entry(lead.campaign_id.0).or_default() += 1;
+    }
+    let events: Vec<CampaignEvent> = counts
+        .into_iter()
+        .map(|(campaign_id, count)| CampaignEvent::LeadsAdded { campaign_id, count })
+        .collect();
+    crate::events::publish_in(tx, &events)
+        .await
+        .map_err(to_repo_err)
+}
+
 impl LeadRepo for PgLeadRepo {
     async fn create(&self, new: NewLead) -> Result<Lead, RepoError> {
+        let mut tx = self.pool.begin().await.map_err(to_repo_err)?;
         let sql = format!(
             "INSERT INTO leads (campaign_id, phone_number, timezone, state, postal_code, context) \
              VALUES ($1,$2,$3,$4,$5,$6) RETURNING {COLS}"
@@ -90,10 +152,13 @@ impl LeadRepo for PgLeadRepo {
             .bind(&new.state)
             .bind(&new.postal_code)
             .bind(context_to_json(&new.context))
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(to_repo_err)?;
-        row_to_lead(&row)
+        let lead = row_to_lead(&row)?;
+        added(&mut tx, std::slice::from_ref(&lead)).await?;
+        tx.commit().await.map_err(to_repo_err)?;
+        Ok(lead)
     }
 
     async fn bulk_create(&self, new: Vec<NewLead>) -> Result<Vec<Lead>, RepoError> {
@@ -117,6 +182,7 @@ impl LeadRepo for PgLeadRepo {
                 .map_err(to_repo_err)?;
             out.push(row_to_lead(&row)?);
         }
+        added(&mut tx, &out).await?;
         tx.commit().await.map_err(to_repo_err)?;
         Ok(out)
     }

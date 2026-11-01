@@ -76,7 +76,7 @@ Both runtimes get the same JSON, so one agent design serves both:
   "campaign_id": 7,
   "room": "campaign-42",
   "callee_identity": "sip-attempt-42",
-  "lead": {"id": 9, "phone_number": "+12025550123",
+  "lead": {"id": 9, "phone_number": "+12025550123", "called_count": 1,
            "context": {"first_name": "Ada", "plan": "gold"}},
   "metadata": {"script": "renewal-v1"},
   "session": {"url": "http://api:9090", "token": "9f2c...e1"}
@@ -85,6 +85,8 @@ Both runtimes get the same JSON, so one agent design serves both:
 
 - `lead.context` is the `context` map of the lead (the `run-campaigns`
   skill, "Load leads").
+- `lead.called_count` is the number of calls to the lead before this one: 0
+  on the first call, 1 on a callback after one call.
 - `metadata` is the `metadata` of the campaign's agent. Use it to select a
   script or a prompt.
 - `callee_identity` names the callee's participant in the room.
@@ -113,6 +115,7 @@ Both runtimes get the same JSON, so one agent design serves both:
 | The agent leaves the room | The node sends BYE. The outcome is `completed`. To hang up, leave the room. |
 | The callee hangs up | The callee's participant leaves the room. Leave the room, and end the job. |
 | No RTP comes for 30 s | The node ends the call. |
+| Agent first: the agent leaves while the phone rings | The node hangs up at the answer. The outcome is `abandoned`. |
 | The attempt ends | The leader closes the room. Your agent gets a disconnect. |
 
 ## Report the outcome
@@ -142,7 +145,7 @@ The fields of `Outcome`:
 | `schema_version` | `1`. |
 | `disposition` | A code from `Welcome`. The system codes are `SALE`, `NI` (not interested), `CALLBK`, `DNC`, `AM` (answering machine), `WN` (wrong number), and `DONE`. A campaign can add its own codes (`PUT /v1/campaigns/:id/dispositions`). |
 | `answered_by` | `HUMAN`, `MACHINE`, or `UNKNOWN`. |
-| `callback` | `{local_time: "2026-03-02T09:30", zone}`. Needed with `CALLBK`. The zone is IANA; without it, the zone of the lead. It must be 1 minute to 90 days from now. |
+| `callback` | `{local_time: "2026-03-02T09:30", zone}`. Needed with `CALLBK`. The zone is IANA; without it, the zone of the lead. Seconds are optional (`09:30:15`). It must be at least the campaign's `callback_min_s` (default 60 s) and at most 90 days from now. |
 | `dnc` | `{scope: "system" or "campaign"}`. The callee asked not to be called again. An empty scope means `system`. `DNC` as the disposition asks for the same. |
 | `summary`, `transfer_to`, `disclosures` | Kept with the attempt. The dialer does not transfer calls yet. |
 
@@ -150,7 +153,8 @@ What the dialer does with the outcome:
 
 - A DNC request takes effect at once. The number goes on the DNC list
   (source `agent`), and every waiting lead with that number stops.
-- A callback queues the lead at that time, before the other leads.
+- A callback queues the lead at that time, before the other leads. The
+  dialer calls the lead at that time.
 - `AM`, or `answered_by: MACHINE`, schedules a voicemail retry.
 - Any other code settles the lead as `dispositioned`.
 - The first outcome stays. The same outcome again gets `Ack` with
@@ -225,6 +229,12 @@ If the agent cannot join in 2 s, use `"dial_order": "agent_first"`. Set
 `join_timeout_s` (1 to 300, default 20) to the longest start time of the
 agent.
 
+CAUTION: With `agent_first`, the agent joins before the dial, and the phone
+can ring for 30 s or more. Keep the agent in the room until the callee is
+there. Start the talk of the agent when the callee joins, not when the agent
+joins. If the agent leaves before the answer, the dialer hangs up at the
+answer, and the outcome is `abandoned`.
+
 ## The agent pool and the pacing
 
 The agents of one `agent_name` (LiveKit) or one `start_url` (pipecat) are one
@@ -253,23 +263,20 @@ of the trunk. That project holds the callee's side of the call.
 
 1. Start the quickstart stack (the `run-campaigns` skill).
 2. Start your agent in a container on the stack network.
-3. Create a campaign with your `agent_name` or `start_url`, load one lead,
-   and start the campaign.
-4. Read the result and the join time of each call:
+3. Copy `examples/first_call.py`, and put your agent in the campaign: your
+   `agent_name` or your `start_url`. Run it (`$QS run --rm examples
+   my_agent.py`). It loads one lead, starts the campaign, and waits.
+4. Read the result of each call. `examples/demo.py` (`show_attempts`)
+   prints these fields as a table:
 
    ```bash
-   docker run --rm --network agentdialer-quickstart_default postgres:16-alpine \
-     psql postgres://ad:ad@postgres:5432/ad -c \
-     "SELECT id, outcome, agent_state, agent_identity,
-             agent_ready_at - answered_at AS join_after_answer
-        FROM call_attempts WHERE campaign_id = 1 ORDER BY id"
+   $QS run --rm examples agentdialer.py GET /v1/campaigns/1/attempts
    ```
 
-5. Read the outcome that the agent reported:
-
-   ```bash
-   scripts/api.sh GET /v1/campaigns/1/attempts   # disposition and agent_outcome of each attempt
-   ```
+   - `outcome`, `agent_state`, and `agent_identity`: the call and your agent.
+   - `answered_at` and `agent_ready_at`: with customer first, your agent must
+     be in the room 2 s after the answer.
+   - `disposition` and `agent_outcome`: what your agent reported.
 
 `e2e/run_e2e.sh` tests both reference agents with both dial orders. It also
 tests a disposition, a DNC request, a callback, and a call with no outcome.

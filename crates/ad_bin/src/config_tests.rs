@@ -69,7 +69,7 @@ fn defaults_apply_when_optional_vars_are_unset() {
     assert_eq!(cfg.gateway.room_prefix, "campaign");
     assert_eq!(cfg.batch_limit, 20);
     assert_eq!(cfg.calls_per_sec, 10.0);
-    assert_eq!(cfg.retry_sweep_ms, 1000);
+    assert_eq!(cfg.repair_sweep_ms, 10_000);
     assert_eq!(cfg.event_sweep_ms, 2000);
     assert_eq!(cfg.attempt_check_ms, 15000);
     assert_eq!(cfg.node_capacity, 50);
@@ -94,13 +94,13 @@ fn invalid_numbers_are_rejected_not_ignored() {
     let mut pairs = all_required();
     pairs.push(("AD_CALLS_PER_SEC", "fast"));
     pairs.push(("AD_BATCH_LIMIT", "0"));
-    pairs.push(("AD_RETRY_SWEEP_MS", "-5"));
+    pairs.push(("AD_REPAIR_SWEEP_MS", "-5"));
     let err = OrchestratorConfig::from_lookup(lookup_from(&pairs)).unwrap_err();
     assert!(err.missing.is_empty());
     assert_eq!(err.invalid.len(), 3, "{:?}", err.invalid);
     assert!(err.invalid[0].starts_with("AD_BATCH_LIMIT="));
     assert!(err.invalid[1].starts_with("AD_CALLS_PER_SEC="));
-    assert!(err.invalid[2].starts_with("AD_RETRY_SWEEP_MS="));
+    assert!(err.invalid[2].starts_with("AD_REPAIR_SWEEP_MS="));
 }
 
 #[test]

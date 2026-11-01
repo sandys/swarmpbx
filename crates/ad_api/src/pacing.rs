@@ -34,6 +34,7 @@ use ad_campaign::repo::RepoError;
 use ad_compliance::abandon::JurisdictionRule;
 use ad_core::CampaignId;
 use ad_db::{Listed, PacingError, PgPacingRepo, PoolView};
+use ad_events::{CampaignEvent, Publisher};
 use ad_pacing::{Mode, Settings};
 
 use crate::AppState;
@@ -243,6 +244,14 @@ async fn put_one(
             .set_settings(&pool, &settings, update.reset)
             .await
             .map_err(storage)?;
+    }
+    // The leader dispatches with the new settings now. Without the event,
+    // its repair sweep does it.
+    if let Some(db) = &state.db {
+        let changed = CampaignEvent::SettingsChanged { campaign_id: id };
+        if let Err(e) = db.events().publish(&changed).await {
+            tracing::warn!(campaign = id, error = %e, "settings_changed not published");
+        }
     }
     Ok(Json(view(pacing, id, &pool).await?))
 }

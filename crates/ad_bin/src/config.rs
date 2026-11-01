@@ -76,7 +76,7 @@ pub const ORCHESTRATOR: &[EnvVar] = &[
     opt("AD_ROOM_PREFIX"),
     opt("AD_BATCH_LIMIT"),
     opt("AD_CALLS_PER_SEC"),
-    opt("AD_RETRY_SWEEP_MS"),
+    opt("AD_REPAIR_SWEEP_MS"),
     opt("AD_EVENT_SWEEP_MS"),
     opt("AD_ATTEMPT_CHECK_MS"),
     opt("AD_NODE_CAPACITY"),
@@ -249,9 +249,11 @@ pub struct OrchestratorConfig {
     pub provider: DialProvider,
     pub batch_limit: i64,
     pub calls_per_sec: f64,
-    /// Interval of the sweep that dials leads that became due (a retry, a
-    /// hold), settles ended attempts, and completes idle campaigns.
-    pub retry_sweep_ms: u64,
+    /// Interval of the leader's repair sweep. It recovers the work that no
+    /// event and no due time started: it settles ended attempts, repairs the
+    /// assignments, dispatches every running campaign, and reads the due
+    /// times again.
+    pub repair_sweep_ms: u64,
     /// The event consumer reads the event table at least this often, also
     /// when a notification is lost.
     pub event_sweep_ms: u64,
@@ -338,7 +340,7 @@ impl OrchestratorConfig {
 
         let batch_limit = positive(&lookup, "AD_BATCH_LIMIT", 20i64, &mut invalid);
         let calls_per_sec = positive(&lookup, "AD_CALLS_PER_SEC", 10.0f64, &mut invalid);
-        let retry_sweep_ms = positive(&lookup, "AD_RETRY_SWEEP_MS", 1000u64, &mut invalid);
+        let repair_sweep_ms = positive(&lookup, "AD_REPAIR_SWEEP_MS", 10_000u64, &mut invalid);
         let event_sweep_ms = positive(&lookup, "AD_EVENT_SWEEP_MS", 2000u64, &mut invalid);
         let attempt_check_ms = positive(&lookup, "AD_ATTEMPT_CHECK_MS", 15000u64, &mut invalid);
         let node_capacity = positive(&lookup, "AD_NODE_CAPACITY", 50u32, &mut invalid);
@@ -435,7 +437,7 @@ impl OrchestratorConfig {
             },
             batch_limit,
             calls_per_sec,
-            retry_sweep_ms,
+            repair_sweep_ms,
             event_sweep_ms,
             attempt_check_ms,
             etcd_endpoints: get("AD_ETCD_ENDPOINTS")
@@ -465,7 +467,7 @@ impl fmt::Debug for OrchestratorConfig {
             .field("room_prefix", &self.gateway.room_prefix)
             .field("batch_limit", &self.batch_limit)
             .field("calls_per_sec", &self.calls_per_sec)
-            .field("retry_sweep_ms", &self.retry_sweep_ms)
+            .field("repair_sweep_ms", &self.repair_sweep_ms)
             .field("event_sweep_ms", &self.event_sweep_ms)
             .field("attempt_check_ms", &self.attempt_check_ms)
             .field("etcd_endpoints", &self.etcd_endpoints)

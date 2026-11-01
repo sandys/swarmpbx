@@ -23,7 +23,6 @@ use ad_compliance::safe_hours::CallWindowSet;
 use ad_core::AttemptId;
 use ad_db::{PgAttemptRepo, PgBreakerStore, PgClock};
 use ad_gateway::{ClickToCall, Gateway, LiveKitGateway, SipCaller, SipTrunk, Telephony};
-use ad_orchestrator::RetryPolicy;
 use tokio::task::JoinHandle;
 
 use crate::config::{self, DialProvider, OrchestratorConfig, SipSettings};
@@ -36,11 +35,10 @@ struct Settings {
     room_prefix: String,
     batch_limit: i64,
     per_call_gap: Duration,
-    retry_sweep: Duration,
+    repair_sweep: Duration,
     event_sweep: Duration,
     attempt_check: Duration,
     breaker: BreakerConfig,
-    retry: RetryPolicy,
     windows: CallWindowSet,
     /// The session stream that the agents reach (`AD_SESSION_URL`).
     session_url: Option<String>,
@@ -126,7 +124,7 @@ pub fn run() -> anyhow::Result<()> {
         database_url,
         gateway: gw,
         batch_limit,
-        retry_sweep_ms,
+        repair_sweep_ms,
         event_sweep_ms,
         attempt_check_ms,
         etcd_endpoints,
@@ -177,11 +175,10 @@ pub fn run() -> anyhow::Result<()> {
                 room_prefix: gw.room_prefix.clone(),
                 batch_limit,
                 per_call_gap,
-                retry_sweep: Duration::from_millis(retry_sweep_ms),
+                repair_sweep: Duration::from_millis(repair_sweep_ms),
                 event_sweep: Duration::from_millis(event_sweep_ms),
                 attempt_check: Duration::from_millis(attempt_check_ms),
                 breaker: BreakerConfig::default(),
-                retry: RetryPolicy::default(),
                 windows: CallWindowSet::uniform(0, 2400).expect("full-day window"),
                 session_url,
             },

@@ -8,6 +8,7 @@ E2E_OUT="${E2E_OUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.out}"
 mkdir -p "$E2E_OUT"
 
 E2E_PY_IMAGE="${E2E_PY_IMAGE:-python:3.12-slim}"
+E2E_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The Docker network of the probe containers. A stack on its own bridge
 # network sets it, and its URLs then use service names.
 E2E_NET="${E2E_NET:-host}"
@@ -77,6 +78,38 @@ http_ok() {
   docker run --rm --network "$E2E_NET" "$E2E_PY_IMAGE" python3 -c '
 import sys, urllib.request
 urllib.request.urlopen(sys.argv[1], timeout=2)' "$1" >/dev/null 2>&1
+}
+
+# api <method> <path> [json]: one request to the API of the stack, with the
+# Python client of the recipes (examples/agentdialer.py). Prints the reply as
+# one line of JSON; fails on a reply that is not 2xx.
+api() {
+  docker run --rm --network "$E2E_NET" -e AD_API_URL="${E2E_API_URL:-http://api:8080}" \
+    -e PYTHONDONTWRITEBYTECODE=1 -v "$E2E_REPO/examples:/examples:ro" -w /examples \
+    "$E2E_PY_IMAGE" python agentdialer.py "$@"
+}
+
+# The recipes of examples/: each file except the client and its helpers.
+recipes() {
+  local f r
+  for f in "$E2E_REPO"/examples/*.py; do
+    r=$(basename "$f" .py)
+    case "$r" in agentdialer | demo) continue ;; esac
+    # E2E_RECIPES="outcomes dnc" runs only these recipes (default: all).
+    if [ -n "${E2E_RECIPES:-}" ] && ! [[ " $E2E_RECIPES " == *" $r "* ]]; then
+      continue
+    fi
+    echo "$r"
+  done
+}
+
+# run_recipe <compose command> <recipe> [args]: run a recipe in the stack, as
+# README.md tells a user to, and indent its output. Fails when it fails.
+run_recipe() {
+  local cl=$1 r=$2; shift 2
+  echo "-- recipe $r"
+  $cl run --rm -T examples "$r.py" "$@" 2>&1 | sed 's/^/   /'
+  return "${PIPESTATUS[0]}"
 }
 
 # api_send <method> <url> [json]: send one request; print the HTTP status,

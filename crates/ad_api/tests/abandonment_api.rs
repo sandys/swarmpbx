@@ -56,6 +56,7 @@ async fn the_ledger_reports_the_rate_and_stops_customer_first_above_the_cap() {
             name: "ledger".into(),
             concurrency_cap: 10,
             agent: Some(json!({"runtime": "livekit", "agent_name": "sales"})),
+            retry: None,
         })
         .await
         .unwrap()

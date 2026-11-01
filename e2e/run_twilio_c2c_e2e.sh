@@ -41,7 +41,6 @@ SIM=0
 # --sim: the agent stays long enough for step (e) to hang up one call first.
 export DEMO_AGENT_MAX_CALL_S="${DEMO_AGENT_MAX_CALL_S:-$([ "$SIM" = 1 ] && echo 45 || echo 20)}"
 QS="$repo/docker-compose.quickstart.yml"
-API="$repo/scripts/api.sh"
 STATS=http://agent:8088/stats
 export E2E_SIM_URL=http://twilio-sim:8080/calls
 TWILIO_CALLS=http://twilio-sim:8080/twilio/calls
@@ -103,14 +102,14 @@ outcome_is() { [ "$(pg "SELECT a.outcome FROM call_attempts a JOIN leads l ON l.
 campaign() {
   local name=$1 cap=$2; shift 2
   local id leads="" n
-  id=$("$API" POST /v1/campaigns \
+  id=$(api POST /v1/campaigns \
     "{\"org_id\": 1, \"name\": \"$name\", \"concurrency_cap\": $cap, \"agent\": {\"runtime\": \"livekit\", \"agent_name\": \"demo\"}}" \
     | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   [ -n "$id" ] || return 1
   for n in "$@"; do leads="$leads${leads:+, }{\"phone_number\": \"$n\", \"timezone\": \"America/New_York\"}"; done
-  "$API" POST "/v1/campaigns/$id/leads" "{\"leads\": [$leads]}" >/dev/null || return 1
-  "$API" POST "/v1/campaigns/$id/transition" '{"transition": "start"}' >/dev/null || return 1
-  "$API" POST "/v1/campaigns/$id/transition" '{"transition": "sync_complete"}' >/dev/null || return 1
+  api POST "/v1/campaigns/$id/leads" "{\"leads\": [$leads]}" >/dev/null || return 1
+  api POST "/v1/campaigns/$id/transition" '{"transition": "start"}' >/dev/null || return 1
+  api POST "/v1/campaigns/$id/transition" '{"transition": "sync_complete"}' >/dev/null || return 1
   echo "$id"
 }
 # The agent heard the other side in every room of a campaign.

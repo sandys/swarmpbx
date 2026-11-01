@@ -841,10 +841,15 @@ keep a Redis container only because LiveKit server and `livekit/sip` need it.
 - **Retries on the lead row**: the pure `ad_orchestrator::retry_decision`
   (reason + attempts + policy + now) gives a due time or "exhausted". The
   settlement of the ended attempt writes it to `leads.next_eligible_at` /
-  `retry_reason` (§0.10.7a). The claim reads due leads directly, and a sweep
-  (`AD_RETRY_SWEEP_MS`, default 1000 ms) dispatches every running campaign, so
-  a due retry dials without an event. A retry survives a restart. This follows
-  dograh's durable `queued_runs.scheduled_for`.
+  `retry_reason` (§0.10.7a). The claim reads due leads directly. The leader
+  keeps the next due time of each campaign and of each outcome wait
+  (`ad_orchestrator::DueTimes`), and wakes at that time, so a due retry or
+  callback dials at its time. A new leader reads the due times from the lead
+  rows. A repair sweep (`AD_REPAIR_SWEEP_MS`, default 10 s) dispatches every
+  running campaign and reads the due times again; it recovers only what no
+  event and no due time started. A retry survives a restart. This follows
+  dograh's durable `queued_runs.scheduled_for`. The waits and the call limit
+  are settings of each campaign (`ad_campaign::Retry`, `PATCH`).
 - **Breaker window = the ended call attempts** (`ad_db::PgBreakerStore`): the
   attempt row is the record (`failure`, `ended_at`). Evaluation reads the
   window rows after `campaigns.breaker_reset_at` and replays them into the pure

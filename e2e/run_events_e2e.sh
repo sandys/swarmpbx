@@ -87,7 +87,7 @@ docker run -d --name evt-orch --network "$E2E_NET" \
   -e LIVEKIT_URL="ws://127.0.0.1:9" \
   -e LIVEKIT_API_KEY=devkey -e LIVEKIT_API_SECRET=devsecret_devsecret_devsecret_32b \
   -e AD_SIP_TRUNK="[::1]:5060" -e AD_SIP_ADVERTISE_IP=127.0.0.1 -e AD_ROOM_PREFIX=campaign \
-  -e AD_CALLS_PER_SEC=50 -e AD_RETRY_SWEEP_MS=5000 -e AD_EVENT_SWEEP_MS=60000 \
+  -e AD_CALLS_PER_SEC=50 -e AD_REPAIR_SWEEP_MS=5000 -e AD_EVENT_SWEEP_MS=60000 \
   -e AD_BATCH_LIMIT=10 -e AD_ATTEMPT_CHECK_MS=60000 \
   -e AD_ETCD_ENDPOINTS=http://kine:2379 -e HOSTNAME=evt-node \
   -e RUST_LOG=info \

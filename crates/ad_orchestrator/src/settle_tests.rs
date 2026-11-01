@@ -171,6 +171,7 @@ fn agent(code: Option<&str>, f: impl FnOnce(&mut ad_disposition::Report)) -> Age
         &ad_disposition::Catalog::default(),
         Some("America/New_York"),
         now(),
+        chrono::Duration::seconds(60),
     )
     .unwrap()
 }

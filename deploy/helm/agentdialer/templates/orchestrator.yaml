@@ -42,8 +42,8 @@ spec:
               value: {{ .Values.orchestrator.batchLimit | quote }}
             - name: AD_CALLS_PER_SEC
               value: {{ .Values.orchestrator.callsPerSec | quote }}
-            - name: AD_RETRY_SWEEP_MS
-              value: {{ .Values.orchestrator.retrySweepMs | quote }}
+            - name: AD_REPAIR_SWEEP_MS
+              value: {{ .Values.orchestrator.repairSweepMs | quote }}
             - name: AD_EVENT_SWEEP_MS
               value: {{ .Values.orchestrator.eventSweepMs | quote }}
             - name: AD_ETCD_ENDPOINTS

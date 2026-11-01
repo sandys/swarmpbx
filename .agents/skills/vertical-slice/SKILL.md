@@ -99,6 +99,19 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
 - Time: a role takes the time from its `Clock`, and a call from its
   `CallTimes`. Measure a duration with `Instant`, not with two wall-clock
   times.
+- The wake: start the work of the slice on an event or at a due time. If an
+  API change must wake the leader, publish an event in the same transaction
+  (`ad_db::events::publish_in`), and map it in `ad_orchestrator::react`. If
+  work must start later, put its time into the leader's `DueTimes`. Do not
+  add a poll loop or a fixed wait.
+- Policy values: put a wait or a limit into the campaign's settings, with
+  its default and its range in one place (for example
+  `crates/ad_campaign/src/retry.rs`). The API changes it at run time. Do not
+  add an environment variable for it.
+- Prove the wake: `e2e/run_twilio_e2e.sh --sim` runs with the repair sweep
+  at 10 min. A recipe that checks a time (`examples/outcomes.py`,
+  `examples/changes.py`) then fails when an event or a due time is missing.
+  Break the wake on purpose one time, and confirm that the recipe fails.
 - The agent contract: the session stream is the API of the agents
   (`proto/agentdialer/session/v1/session.proto`). Add fields. Do not
   renumber or remove a field, because old agents must keep working. Test the
@@ -132,11 +145,16 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
    docker build -t agentdialer:dev .
    docker network create ad-slice
    docker run -d --name ad-api --network ad-slice agentdialer:dev api
-   AD_API_NETWORK=ad-slice AD_API_URL=http://ad-api:8080 scripts/api.sh GET /health
+   docker run --rm --network ad-slice -v "$PWD/examples:/examples:ro" -w /examples \
+     -e AD_API_URL=http://ad-api:8080 python:3.12-slim python agentdialer.py GET /health
    docker rm -f ad-api
    docker network rm ad-slice
    ```
    Without `DATABASE_URL`, the API uses in-memory stores. To test with
    Postgres, use the quickstart stack (the `run-campaigns` skill).
+7. Give each new endpoint a method in the Python client
+   (`examples/agentdialer.py`) and a row in README.md "The API". If it
+   changes what a user does, show it in a recipe of `examples/`.
+   `e2e/run_twilio_e2e.sh --sim` runs every recipe.
 
 Do not run `cargo`, `curl`, or any other toolchain on the host.

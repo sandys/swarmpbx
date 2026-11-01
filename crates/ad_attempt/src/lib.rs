@@ -482,6 +482,20 @@ pub fn apply(attempt: &Attempt, event: &AttemptEvent) -> Result<Attempt, Ignored
             };
             next.leg = no_agent(*at, detail);
         }
+        // Agent first: the agent left during the dial, so the answered call
+        // has no agent.
+        (L::Connected { .. }, A::Ready { .. }, E::AgentFailed { at, detail }) => {
+            next.agent = A::Failed {
+                at: *at,
+                detail: detail.clone(),
+            };
+            next.leg = ended(
+                *at,
+                Outcome::Abandoned {
+                    detail: detail.clone(),
+                },
+            );
+        }
         (leg, A::Ready { .. }, E::AgentLeft { at }) => {
             next.agent = A::Left { at: *at };
             match leg {

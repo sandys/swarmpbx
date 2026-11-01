@@ -56,6 +56,7 @@ call path:     trunk <-SIP-> Kamailio <-SIP-> node (ad_sip)
                node <-WebRTC-> LiveKit room <-WebRTC-> agent
 control path:  leader -> Postgres (claim, gate) -> kine (a call key) -> node
 outcome path:  agent -gRPC-> api role (ad_session) -> Postgres -> leader (settle)
+the wake:      NOTIFY, a due time, or a free place -> leader (no poll)
 ```
 
 - **The call path (decision D-9, `PLAN.md` §0.0).** The node that runs a call
@@ -83,7 +84,12 @@ outcome path:  agent -gRPC-> api role (ad_session) -> Postgres -> leader (settle
   it (`ad_disposition`), saves it (`ad_db::outcomes`), and writes the event
   `agent_outcome`. The agent never reaches the database.
 - **Events (decision D-3).** Postgres is the event layer: an event table with
-  LISTEN/NOTIFY, and a sweep. There is no Redis.
+  LISTEN/NOTIFY. There is no Redis. The `leads` table is the queue of the
+  waiting leads (`next_eligible_at`, `priority`, `FOR UPDATE SKIP LOCKED`).
+- **The wake (README "How the leader wakes").** The leader works on an event,
+  at a due time, or when a place frees. One timer (`DueTimes`) sleeps until
+  the next due lead or the end of the next outcome wait. The repair sweep
+  (`AD_REPAIR_SWEEP_MS`, 10 s) recovers only lost work.
 - **Time (decision D-11).** The roles take the time from Postgres plus the
   monotonic clock (`ad_db::PgClock`). Each call reads that clock one time
   (`CallTimes`), and then it uses only the monotonic clock.
@@ -97,6 +103,13 @@ LiveKit Cloud SIP is the primary target. A new user starts the stack in
 Docker Compose, connects it to LiveKit Cloud SIP with a LiveKit phone number,
 and places calls. README "Quickstart: place calls through LiveKit Cloud SIP"
 teaches it. This use must not break.
+
+The user uses the system through the HTTP API only (README "The API"). The
+recipes in `examples/` are Python programs that run each kind of campaign
+through the API. `examples/agentdialer.py` is their client, with the Python
+standard library only. When you add an endpoint, add its client method and
+its README row. When you change what a user does, change the recipe that
+shows it.
 
 - Use `e2e/livekit-cloud/run.sh` for every LiveKit Cloud API call. Do not run
   a one-off command against LiveKit Cloud.
@@ -119,7 +132,8 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
 - `ad_core`: typed ids, errors, and the `Clock` trait.
 - `ad_compliance`: safe hours, DNC, the abandonment ledger. It fails closed.
   See `compliance-engine`.
-- `ad_campaign`: the campaign and its lifecycle state machine.
+- `ad_campaign`: the campaign, its lifecycle state machine, and its `retry`
+  settings (`retry.rs`: the defaults, the ranges, the merge of a change).
 - `ad_lead`: the lead and the lead repository trait.
 - `ad_routing`: the routing rule engine. See `routing-engine`.
 - `ad_hopper`: lead selection (status, call count, DNC, safe hours, routing).
@@ -128,9 +142,11 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
   part, both dial orders, and the 2 s limit. Read `PLAN.md` §0.10.7a.
 - `ad_pacing`: the window of each agent pool. `observe` learns from one join
   time. `limit` gives the window for a mode. Read `PLAN.md` §0.10.6.
-- `ad_orchestrator`: the scheduling gate, the run loop, the event reactor,
-  the retry decision (`retry.rs`), and the settlement (`settle.rs`;
-  `settle_with` also takes the agent's outcome).
+- `ad_orchestrator`: the scheduling gate, the run loop, the event reactor
+  (`reactor.rs`: an event to dispatch, or settle and dispatch), the retry
+  decision (`retry.rs`: `RetryPolicy::of` the campaign's settings), the
+  settlement (`settle.rs`; `settle_with` also takes the agent's outcome), and
+  the due times (`due.rs`: `DueTimes`).
 - `ad_contact`: phone numbers (E.164) and postal codes, behind one backend
   (the vendored `phonenumber`). Read every number through it, never with
   your own parser, so that one change replaces the library everywhere.
@@ -177,7 +193,9 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
    `/agentdialer/nodes/{node}` again every third of the TTL.
 2. One node holds `/agentdialer/leader`. It reads the campaign events
    (`LISTEN campaign_events`), and it claims due leads from `leads`
-   (`FOR UPDATE SKIP LOCKED`). The claim stays within the campaign's
+   (`FOR UPDATE SKIP LOCKED`). `campaign_running`, `leads_added`,
+   `settings_changed`, and `agent_joined` dispatch the campaign.
+   `attempt_ended` and `agent_outcome` settle the call, and then dispatch. The claim stays within the campaign's
    `concurrency_cap`, the free capacity of the cluster, and the window of the
    agent pool. A campaign above the 3% abandonment cap claims agent first.
 3. The leader gates each claimed lead (`gate()` in `leader.rs`). It reads the
@@ -194,7 +212,8 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
      in the room 2 s after the answer, it hangs up, and the outcome is
      `abandoned`.
    - `agent_first`: it starts the agent, waits until the agent is in the
-     room, and then sends the INVITE.
+     room, and then sends the INVITE. If the agent left before the answer,
+     it hangs up at the answer, and the outcome is `abandoned`.
    - It saves each result with its node and assignment generation
      (`apply_owned`). A node that lost the call cannot save.
 6. The call ends on its node: the callee's BYE, the agent leaves the room, or
@@ -208,8 +227,12 @@ one match arm in `telephony.rs`, and its settings in `config.rs`.
    assignment, and dials into the free capacity. The transaction that saves
    the agent in the room writes `agent_joined`, so the leader claims into the
    free place of the window.
-9. The leader's sweep (`AD_RETRY_SWEEP_MS`) settles ended attempts, moves the
-   calls of a dead node, dials due retries, and completes idle campaigns.
+9. The leader keeps the next due time of each campaign (a retry, a
+   callback, or a hold) and of each outcome wait (`ad_orchestrator::DueTimes`).
+   It wakes at that time: it dispatches the campaign, or settles the call. A
+   campaign that the cluster or its agent pool held back dispatches when the
+   capacity frees. The repair sweep (`AD_REPAIR_SWEEP_MS`, 10 s) recovers only
+   what no event and no due time started.
 
 Each state change and its event commit in one transaction
 (`ad_db::events::publish_in`).
@@ -237,7 +260,8 @@ KeepAlive, Election, a plain Put, a plain delete, or keys-only reads.
 
 Built and tested: the call path, the cluster, both agent runtimes and both
 dial orders, the abandonment ledger, pacing by join time and the pool
-breaker, the event layer, retries, the breaker, time from Postgres, the
+breaker, the event layer, the wake on events and due times, retries with the
+`retry` settings of each campaign, the breaker, time from Postgres, the
 agent's outcome on the session stream (dispositions, callbacks, DNC
 requests), the DNC list in Postgres, E.164 numbers at the lead load, and the
 quickstart on LiveKit Cloud SIP. README "Status" has the proof of each part.
@@ -257,6 +281,11 @@ them.
 - Keep the pure engines pure.
 - Add a variant through its registry, with no migration.
 - Take the time from the role's `Clock`. Measure a duration with `Instant`.
+- Start work on an event or at its due time. Do not add a poll loop or a
+  fixed wait. If a sweep must exist, it recovers lost work only.
+- Make a policy value (a wait, a limit) a campaign setting that the API
+  changes at run time, with its default in one place. Do not make it an
+  environment variable or a constant.
 - Run every tool in a container. The host runs only bash, git, the Docker
   CLI, and basic shell tools.
 - Keep the environment contract in step: `config.rs`, the README
@@ -286,10 +315,11 @@ its stack, checks it, and stops it.
 
 | You changed | Run |
 |---|---|
-| Anything that a role does at run time | `e2e/run_twilio_e2e.sh --sim` (on every change) |
+| Anything that a role does at run time, the API, or a recipe of `examples/` | `e2e/run_twilio_e2e.sh --sim` (on every change; it runs every recipe) |
 | The call path, an agent adapter, the dial order, pacing, the gate, or the outcome path | `e2e/run_e2e.sh` |
 | The cluster, the leader, assignment, or time | `e2e/run_cluster_e2e.sh` |
 | Events, retries, the breaker, or campaign completion | `e2e/run_events_e2e.sh` |
+| The leader's wake: an event, a due time, the `retry` settings, or the repair sweep | `e2e/run_twilio_e2e.sh --sim`. It sets the repair sweep to 10 min, so a check passes only when an event or a due time starts the work. Keep it so. |
 | The WebRTC participant | `e2e/run_webrtc_e2e.sh` |
 | Click-to-call or `ad_sip` inbound calls | `e2e/run_twilio_c2c_e2e.sh --sim` |
 | The quickstart (with the LiveKit Cloud keys in `.env`) | `e2e/run_lkcloud_e2e.sh` |
@@ -305,8 +335,11 @@ the tier, the work is not done.
   are in `_research/scratch/media/asterisk-freeswitch.md`.
 - The orchestrator, the cluster, and the attempts: `PLAN.md` §0.10.7a,
   §0.10.8a, §0.10.8b; `crates/ad_bin/src/orchestrator/` (`mod.rs`,
-  `calls.rs`, `leader.rs`); `crates/ad_cluster/`; `crates/ad_attempt/`;
-  `crates/ad_db/src/attempts.rs`.
+  `calls.rs`, `leader.rs`: `waker`, `run_due`, `wake_starved`);
+  `crates/ad_cluster/`; `crates/ad_attempt/`; `crates/ad_db/src/attempts.rs`.
+- The waiting leads and the retry settings: `crates/ad_db/src/leads.rs`
+  (`next_due`, `next_due_running`), `crates/ad_campaign/src/retry.rs`,
+  `crates/ad_orchestrator/src/retry.rs`, `crates/ad_orchestrator/src/due.rs`.
 - Pacing: `crates/ad_pacing/`, `crates/ad_db/src/pacing.rs`,
   `crates/ad_api/src/pacing.rs`.
 - The outcome path: `proto/agentdialer/session/v1/session.proto`,

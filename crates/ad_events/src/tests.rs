@@ -53,6 +53,11 @@ fn every_variant(campaign_id: i64) -> Vec<CampaignEvent> {
             dnc: false,
         },
         CampaignEvent::CampaignCompleted { campaign_id },
+        CampaignEvent::LeadsAdded {
+            campaign_id,
+            count: 3,
+        },
+        CampaignEvent::SettingsChanged { campaign_id },
     ]
 }
 

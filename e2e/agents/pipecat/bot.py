@@ -8,9 +8,9 @@ POST /start takes the dialer's start request (ad_agent, runtime `pipecat`):
 
 and starts one bot that joins the room with pipecat's LiveKit transport. The
 bot needs no AI service: it counts the audio frames of the callee, plays a
-tone back, and ends when the callee leaves or the room closes. When the callee
-leaves, it reports the outcome of the call on the session stream
-(agent_session.py). GET /stats reports per room, in the same shape as the e2e
+tone back, and ends when the callee leaves, when the room closes, or after
+the talk time (MAX_CALL_S, or "talk_s" in the lead context). Then it reports
+the outcome of the call on the session stream (agent_session.py). GET /stats reports per room, in the same shape as the e2e
 LiveKit agent.
 """
 
@@ -26,9 +26,11 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
 from pipecat.workers.runner import WorkerRunner
 
-from agent_session import Session, planned_outcome
+from agent_session import Session, planned_outcome, talk_seconds
 
 PORT = int(os.environ.get("PORT", "8089"))
+# Leave the call after this many seconds (0: stay until the callee leaves).
+MAX_CALL_S = float(os.environ.get("MAX_CALL_S", "0"))
 TONE_RATE = 16000
 
 stats: dict = {}
@@ -121,9 +123,16 @@ async def run_bot(req: dict) -> None:
 
     # Pipecat also reports the participants already in the room (customer
     # first) as connected.
+    talk = talk_seconds(call, MAX_CALL_S)
+    timer = None
+
     @transport.event_handler("on_participant_connected")
     async def _joined(_transport, participant_id):
+        nonlocal timer
         if participant_id == callee:
+            # The talk time starts when the callee is in the room.
+            if talk > 0 and timer is None:
+                timer = asyncio.create_task(leave_after(talk))
             await worker.queue_frames([tone() for _ in range(30)])
             stats[room]["frames_out"] += 30
 
@@ -137,9 +146,16 @@ async def run_bot(req: dict) -> None:
     async def _gone(_transport):
         await worker.cancel()
 
+    async def leave_after(seconds: float) -> None:
+        await asyncio.sleep(seconds)
+        await report()
+        await worker.cancel()
+
     try:
         await runner.run()
     finally:
+        if timer:
+            timer.cancel()
         session = await opening
         if session:
             await session.close()

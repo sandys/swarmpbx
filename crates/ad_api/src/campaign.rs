@@ -4,6 +4,11 @@
 //!   POST   /v1/campaigns                 create (201)
 //!   GET    /v1/campaigns?org_id=N        list for an org
 //!   GET    /v1/campaigns/:id             get one (404 if missing)
+//!   PATCH  /v1/campaigns/:id             change the name, the concurrency cap,
+//!                                         the agent, or retry settings, in any
+//!                                         state; the next claim and the next
+//!                                         settlement use them (400 if invalid,
+//!                                         404 if missing)
 //!   POST   /v1/campaigns/:id/transition  apply a lifecycle transition
 //!                                         (404 if missing, 409 if illegal)
 //!   GET    /v1/campaigns/:id/abandonment the abandonment ledger: answered
@@ -21,8 +26,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ad_agent::AgentSpec;
-use ad_campaign::repo::{NewCampaign, RepoError};
-use ad_campaign::{Campaign, CampaignState, Counters, Transition, DEFAULT_CONCURRENCY_CAP};
+use ad_campaign::repo::{CampaignChange, NewCampaign, RepoError};
+use ad_campaign::{Campaign, CampaignState, Counters, Retry, Transition, DEFAULT_CONCURRENCY_CAP};
 use ad_compliance::abandon::JurisdictionRule;
 use ad_core::{CampaignId, OrgId};
 
@@ -31,7 +36,7 @@ use crate::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/campaigns", post(create).get(list))
-        .route("/v1/campaigns/:id", get(get_one))
+        .route("/v1/campaigns/:id", get(get_one).patch(update))
         .route("/v1/campaigns/:id/transition", post(transition))
         .route("/v1/campaigns/:id/abandonment", get(abandonment))
 }
@@ -50,6 +55,10 @@ pub struct CreateRequest {
     /// `{"runtime": "pipecat", "start_url": "http://bots:7860/start"}`.
     #[serde(default)]
     pub agent: Option<serde_json::Value>,
+    /// The retry settings that differ from the defaults, for example
+    /// `{"busy_s": 60, "max_calls": 5}`.
+    #[serde(default)]
+    pub retry: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +70,8 @@ pub struct CampaignDto {
     pub counters: Counters,
     pub concurrency_cap: u32,
     pub agent: Option<serde_json::Value>,
+    /// Every retry setting, with the defaults filled in.
+    pub retry: Retry,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -75,6 +86,7 @@ impl From<Campaign> for CampaignDto {
             counters: c.counters,
             concurrency_cap: c.concurrency_cap,
             agent: c.agent,
+            retry: c.retry,
             created_at: c.created_at.to_rfc3339(),
             updated_at: c.updated_at.to_rfc3339(),
         }
@@ -101,6 +113,22 @@ pub struct AbandonmentDto {
     pub customer_first_allowed: bool,
 }
 
+/// The settings to change. A setting that you do not give keeps its value.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub concurrency_cap: Option<u32>,
+    /// The new agent. It replaces the whole agent.
+    #[serde(default)]
+    pub agent: Option<serde_json::Value>,
+    /// The retry settings to change. The others keep their values.
+    #[serde(default)]
+    pub retry: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     pub org_id: i64,
@@ -118,6 +146,18 @@ pub struct ErrorDto {
 
 fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorDto>) {
     (status, Json(ErrorDto { error: msg.into() }))
+}
+
+/// Each retry setting has its own range, so a change that passes on the
+/// defaults also passes on the stored settings.
+fn check_retry(retry: &Option<serde_json::Value>) -> Result<(), (StatusCode, Json<ErrorDto>)> {
+    match retry {
+        Some(r) => Retry::default()
+            .changed(r)
+            .map(|_| ())
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string())),
+        None => Ok(()),
+    }
 }
 
 // ---- handlers ----
@@ -139,6 +179,7 @@ async fn create(
     if let Some(agent) = &req.agent {
         AgentSpec::parse(agent).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     }
+    check_retry(&req.retry)?;
     let campaign = state
         .campaigns
         .create(NewCampaign {
@@ -146,10 +187,43 @@ async fn create(
             name: req.name,
             concurrency_cap,
             agent: req.agent,
+            retry: req.retry,
         })
         .await
         .map_err(repo_err)?;
     Ok((StatusCode::CREATED, Json(campaign.into())))
+}
+
+async fn update(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateRequest>,
+) -> Result<Json<CampaignDto>, (StatusCode, Json<ErrorDto>)> {
+    if req.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+        return Err(err(StatusCode::BAD_REQUEST, "name must not be empty"));
+    }
+    if req.concurrency_cap == Some(0) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "concurrency_cap must be at least 1",
+        ));
+    }
+    if let Some(agent) = &req.agent {
+        AgentSpec::parse(agent).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+    check_retry(&req.retry)?;
+    let change = CampaignChange {
+        name: req.name,
+        concurrency_cap: req.concurrency_cap,
+        agent: req.agent,
+        retry: req.retry,
+    };
+    let saved = state
+        .campaigns
+        .update(CampaignId(id), change, state.clock.now_utc())
+        .await
+        .map_err(repo_err)?;
+    Ok(Json(saved.into()))
 }
 
 async fn list(

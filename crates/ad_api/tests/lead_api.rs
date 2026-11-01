@@ -70,6 +70,15 @@ async fn bulk_load_returns_201_and_leads() {
     assert_eq!(v["created"], 2);
     assert_eq!(v["leads"][0]["status"], "new");
     assert_eq!(v["leads"][0]["context"]["customer_name"], "Jane");
+    let lead = &v["leads"][0];
+    assert_eq!(
+        (
+            &lead["priority"],
+            &lead["next_eligible_at"],
+            &lead["retry_reason"]
+        ),
+        (&json!(0), &Value::Null, &Value::Null)
+    );
 }
 
 #[tokio::test]

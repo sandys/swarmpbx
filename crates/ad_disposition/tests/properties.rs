@@ -52,7 +52,7 @@ proptest! {
             callback: Some(CallbackRequest { at: local.format("%Y-%m-%dT%H:%M").to_string(), zone: Some(zone.into()) }),
             ..Report::default()
         };
-        if let Ok(o) = check(&r, &Catalog::default(), None, now()) {
+        if let Ok(o) = check(&r, &Catalog::default(), None, now(), Duration::seconds(60)) {
             let at = o.callback.unwrap().at_utc;
             prop_assert!(at >= now() + Duration::minutes(1));
             prop_assert!(at <= now() + Duration::days(90));
@@ -75,7 +75,7 @@ proptest! {
             ..Report::default()
         };
         let wants = code == "DNC" || ask.is_some();
-        let checked = check(&r, &Catalog::default(), Some("America/New_York"), now());
+        let checked = check(&r, &Catalog::default(), Some("America/New_York"), now(), Duration::seconds(60));
         prop_assert!(checked.is_ok(), "{checked:?}");
         let o = checked.unwrap();
         prop_assert_eq!(o.dnc.is_some(), wants);

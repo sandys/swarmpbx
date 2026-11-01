@@ -144,6 +144,7 @@ async fn calls(db: &Db, n: usize, agent: Option<Value>) -> Vec<ClaimedAttempt> {
             name: "webhook".into(),
             concurrency_cap: 10,
             agent: agent.clone(),
+            retry: None,
         })
         .await
         .unwrap()

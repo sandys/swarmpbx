@@ -5,6 +5,9 @@
 //! aggregate; the state machine only decides whether a change is legal.
 
 pub mod repo;
+pub mod retry;
+
+pub use retry::{Retry, RetryError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -128,6 +131,7 @@ pub struct Campaign {
     /// The agent of the campaign as data (`runtime` names the adapter), or
     /// `None` for no agent. `ad_agent::AgentSpec` reads it.
     pub agent: Option<serde_json::Value>,
+    pub retry: Retry,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -143,6 +147,7 @@ impl Campaign {
             counters: Counters::default(),
             concurrency_cap: DEFAULT_CONCURRENCY_CAP,
             agent: None,
+            retry: Retry::default(),
             created_at: now,
             updated_at: now,
         }

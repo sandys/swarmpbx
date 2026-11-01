@@ -18,6 +18,9 @@ use ad_circuit_breaker::{CircuitBreaker, Config as BreakerConfig};
 pub mod run_loop;
 pub use run_loop::{CampaignScheduler, Leadership, OrchestratorLoop, TickSummary};
 
+pub mod due;
+pub use due::{Due, DueTimes};
+
 pub mod reactor;
 pub use reactor::{react, ReactorAction};
 

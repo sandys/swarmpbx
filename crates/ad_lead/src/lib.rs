@@ -74,6 +74,13 @@ pub struct Lead {
     pub postal_code: Option<String>,
     pub status: LeadStatus,
     pub called_count: u32,
+    /// The claim takes a lead with a higher priority first. A callback
+    /// waits at a higher priority.
+    pub priority: i16,
+    /// The lead does not dial before this time: a retry or a callback.
+    pub next_eligible_at: Option<DateTime<Utc>>,
+    /// Why the lead waits, for example `busy`, `no_answer`, or `callback`.
+    pub retry_reason: Option<String>,
     pub last_local_call_time: Option<DateTime<Utc>>,
     /// CSV extra columns → agent template variables.
     pub context: BTreeMap<String, String>,

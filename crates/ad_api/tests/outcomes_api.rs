@@ -50,6 +50,7 @@ async fn setup() -> Option<(Db, axum::Router, CampaignId)> {
             name: "outcomes".into(),
             concurrency_cap: 10,
             agent: None,
+            retry: None,
         })
         .await
         .unwrap()
@@ -131,10 +132,11 @@ async fn a_dnc_entry_takes_any_form_of_the_number_and_stops_waiting_leads() {
         (v["phone_number"].as_str(), v["cancelled"].as_u64()),
         (Some(number.as_str()), Some(1))
     );
+    let id = v["id"].clone();
     let (status, v) = send(app.clone(), "POST", "/v1/dnc", Some(add)).await;
     assert_eq!(
-        (status, v["created"].as_bool()),
-        (StatusCode::OK, Some(false))
+        (status, v["created"].as_bool(), &v["id"]),
+        (StatusCode::OK, Some(false), &id)
     );
 
     let (_, leads) = send(
@@ -165,6 +167,7 @@ async fn a_dnc_entry_takes_any_form_of_the_number_and_stops_waiting_leads() {
         (Some("campaign"), Some("api"))
     );
     assert_eq!(entry["evidence"]["note"], "asked by letter");
+    assert_eq!(entry["id"], id, "the reply of the add names the entry");
 
     for bad in [
         json!({"phone_number": "312-555-0100"}),

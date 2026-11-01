@@ -52,6 +52,8 @@ pub struct DncEntry {
 /// What an add did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Added {
+    /// The id of the entry: the new entry, or the entry that existed.
+    pub id: i64,
     /// The entry is new. An entry of the same number and scope can exist.
     pub created: bool,
     /// The waiting leads that became `dnc`.
@@ -82,6 +84,16 @@ pub(crate) async fn add_in(
     .map_err(err)?
     .rows_affected()
         == 1;
+    let id: i64 = sqlx::query_scalar(
+        "SELECT id FROM dnc_numbers \
+         WHERE phone_number = $1 AND scope = $2 AND COALESCE(campaign_id, 0) = COALESCE($3, 0)",
+    )
+    .bind(new.phone_number.as_str())
+    .bind(new.scope.as_str())
+    .bind(new.campaign_id.map(|c| c.0))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(err)?;
     let cancelled = sqlx::query(
         "UPDATE leads SET status = 'dnc', next_eligible_at = NULL, retry_reason = NULL, \
              priority = 0, updated_at = now() \
@@ -94,7 +106,11 @@ pub(crate) async fn add_in(
     .await
     .map_err(err)?
     .rows_affected();
-    Ok(Added { created, cancelled })
+    Ok(Added {
+        id,
+        created,
+        cancelled,
+    })
 }
 
 #[derive(Clone)]

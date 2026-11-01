@@ -19,6 +19,7 @@
 //	tone        answer, send a 1 kHz tone, BYE after SIM_HOLD_MS
 //	busy        486    decline  603    unavailable  480    fail  503
 //	noanswer    180, never answer (the caller cancels)
+//	slow        180, answer after SIM_SLOW_MS (default 6000), then like tone
 //
 // GET /calls on SIM_HTTP_ADDR returns what the carrier saw, per call:
 // the INVITEs, the auth result, the status, the RTP counts, and how many
@@ -85,6 +86,7 @@ type sim struct {
 	callerIDs map[string]bool
 	nat       int
 	hold      time.Duration
+	slow      time.Duration
 	numbers   map[string]string
 	fallback  string
 
@@ -135,6 +137,8 @@ func load() *sim {
 	}
 	ms, _ := strconv.Atoi(env("SIM_HOLD_MS", "8000"))
 	s.hold = time.Duration(ms) * time.Millisecond
+	ms, _ = strconv.Atoi(env("SIM_SLOW_MS", "6000"))
+	s.slow = time.Duration(ms) * time.Millisecond
 	return s
 }
 
@@ -258,14 +262,27 @@ func (s *sim) handle(d *diago.DialogServerSession) {
 		_ = d.Ringing()
 		s.update(c, func(c *Call) { c.Status = "ringing" })
 		<-d.Context().Done()
-		s.update(c, func(c *Call) {
-			now := time.Now()
-			c.Status, c.EndedAt, c.EndedBy = "canceled", &now, "caller"
-		})
+		s.canceled(c)
+	case "slow":
+		_ = d.Ringing()
+		s.update(c, func(c *Call) { c.Status = "ringing" })
+		select {
+		case <-time.After(s.slow):
+			s.answer(d, c)
+		case <-d.Context().Done():
+			s.canceled(c)
+		}
 	default:
 		_ = d.Ringing()
 		s.answer(d, c)
 	}
+}
+
+func (s *sim) canceled(c *Call) {
+	s.update(c, func(c *Call) {
+		now := time.Now()
+		c.Status, c.EndedAt, c.EndedBy = "canceled", &now, "caller"
+	})
 }
 
 func (s *sim) answer(d *diago.DialogServerSession, c *Call) {
@@ -290,7 +307,7 @@ func (s *sim) answer(d *diago.DialogServerSession, c *Call) {
 	pt := props.Codec.PayloadType
 
 	go s.receive(c, reader, writer, pt, c.Behavior == "echo")
-	if c.Behavior == "tone" {
+	if c.Behavior == "tone" || c.Behavior == "slow" {
 		go s.tone(d.Context(), c, writer, pt)
 	}
 

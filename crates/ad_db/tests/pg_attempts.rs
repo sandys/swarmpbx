@@ -792,3 +792,58 @@ async fn the_ledger_counts_the_answered_calls_in_the_window() {
         "outside the window"
     );
 }
+
+#[tokio::test]
+async fn the_attempt_list_shows_the_dial_order_of_each_call() {
+    let Some(db) = common::db().await else {
+        return;
+    };
+    let c = db
+        .campaigns()
+        .create(ad_campaign::repo::NewCampaign {
+            org_id: common::unique_org(),
+            name: "orders".into(),
+            concurrency_cap: 10,
+            agent: Some(serde_json::json!({"runtime": "livekit", "agent_name": "a"})),
+            retry: None,
+        })
+        .await
+        .unwrap()
+        .id;
+    for t in [Transition::Start, Transition::SyncComplete] {
+        db.campaigns()
+            .transition(c, t, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    leads(&db, c, 2).await;
+    let first = db
+        .attempts()
+        .claim(c, "w", 1, "room", Utc::now(), Some(2000))
+        .await
+        .unwrap();
+    let second = db
+        .attempts()
+        .claim(c, "w", 1, "room", Utc::now(), None)
+        .await
+        .unwrap();
+    assert_eq!((first.len(), second.len()), (1, 1));
+    let none = running_campaign(&db, 10).await;
+    leads(&db, none, 1).await;
+    claim(&db, none, 1).await;
+
+    let orders = |rows: Vec<ad_db::AttemptView>| {
+        rows.into_iter()
+            .map(|v| v.dial_order)
+            .collect::<Vec<Option<String>>>()
+    };
+    assert_eq!(
+        orders(db.attempts().page(c, None, 0, 10).await.unwrap()),
+        [Some("customer_first".into()), Some("agent_first".into())]
+    );
+    assert_eq!(
+        orders(db.attempts().page(none, None, 0, 10).await.unwrap()),
+        [None]
+    );
+}

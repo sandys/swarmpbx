@@ -47,6 +47,8 @@ pub struct CallFacts<'a> {
     /// The identity of the callee's SIP participant in the room.
     pub callee_identity: &'a str,
     pub phone_number: &'a str,
+    /// The calls placed to the lead before this one: 0 on the first call.
+    pub called_count: u32,
     /// `leads.context` (the CSV extra columns).
     pub lead_context: &'a serde_json::Value,
     pub session: Option<SessionFacts<'a>>,
@@ -72,6 +74,7 @@ pub fn call_metadata(spec: &AgentSpec, call: &CallFacts<'_>) -> serde_json::Valu
         "lead": {
             "id": call.lead_id,
             "phone_number": call.phone_number,
+            "called_count": call.called_count,
             "context": call.lead_context,
         },
         "metadata": spec.metadata(),
@@ -270,6 +273,7 @@ mod tests {
             room: "campaign-42",
             callee_identity: "sip-attempt-42",
             phone_number: "+15550100",
+            called_count: 2,
             lead_context: &context,
             session: Some(SessionFacts {
                 url: "http://api:9090",
@@ -292,6 +296,7 @@ mod tests {
         assert_eq!(lk["attempt_id"], 42);
         assert_eq!(lk["callee_identity"], "sip-attempt-42");
         assert_eq!(lk["lead"]["context"]["first_name"], "Ada");
+        assert_eq!(lk["lead"]["called_count"], 2);
         assert_eq!(lk["metadata"]["script"], "a");
         let pc = call_metadata(
             &AgentSpec::parse(&json!({"runtime": "pipecat", "start_url": "http://x/start"}))

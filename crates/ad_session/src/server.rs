@@ -150,6 +150,7 @@ async fn outcome<S: Store>(
         catalog,
         session.lead_timezone.as_deref(),
         now,
+        session.callback_min,
     ) {
         Ok(o) => o,
         Err(e) => return rejected(e.to_string()),

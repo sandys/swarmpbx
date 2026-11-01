@@ -10,8 +10,6 @@ use crate::catalog::{Catalog, Disposition};
 /// The version of the report that this dialer reads.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// A callback must be at least this far in the future.
-pub const MIN_CALLBACK_LEAD: Duration = Duration::minutes(1);
 /// A callback must be at most this far in the future.
 pub const MAX_CALLBACK_LEAD: Duration = Duration::days(90);
 
@@ -131,8 +129,8 @@ pub enum Rejection {
     CallbackZone(String),
     #[error("a callback needs a zone, and the lead has none")]
     CallbackNoZone,
-    #[error("the callback must be between 1 minute and 90 days from now")]
-    CallbackRange,
+    #[error("the callback must be at least {0} s and at most 90 days from now")]
+    CallbackRange(i64),
     #[error("DNC scope '{0}': use system or campaign")]
     DncScope(String),
     #[error("{0} is too long")]
@@ -140,12 +138,14 @@ pub enum Rejection {
 }
 
 /// Check a report against the catalog of the campaign at `now`. `lead_zone`
-/// is the IANA zone of the lead.
+/// is the IANA zone of the lead. A callback must be at least `callback_min`
+/// in the future (the campaign's `callback_min_s`).
 pub fn check(
     report: &Report,
     catalog: &Catalog,
     lead_zone: Option<&str>,
     now: DateTime<Utc>,
+    callback_min: Duration,
 ) -> Result<AgentOutcome, Rejection> {
     if report.schema_version != SCHEMA_VERSION {
         return Err(Rejection::Version(report.schema_version));
@@ -177,7 +177,7 @@ pub fn check(
             if dnc.is_some() {
                 return Err(Rejection::CallbackAndDnc);
             }
-            Some(callback(req, lead_zone, now)?)
+            Some(callback(req, lead_zone, now, callback_min)?)
         }
         None if flags.scheduled_callback => {
             let code = disposition.as_ref().map(|d| d.code.clone());
@@ -216,6 +216,7 @@ fn callback(
     req: &CallbackRequest,
     lead_zone: Option<&str>,
     now: DateTime<Utc>,
+    min: Duration,
 ) -> Result<Callback, Rejection> {
     let zone_name = req
         .zone
@@ -231,8 +232,8 @@ fn callback(
         .ok_or_else(|| Rejection::CallbackTime(req.at.clone()))?;
     let at_utc =
         local_to_utc(local, zone).ok_or_else(|| Rejection::CallbackTime(req.at.clone()))?;
-    if at_utc < now + MIN_CALLBACK_LEAD || at_utc > now + MAX_CALLBACK_LEAD {
-        return Err(Rejection::CallbackRange);
+    if at_utc < now + min || at_utc > now + MAX_CALLBACK_LEAD {
+        return Err(Rejection::CallbackRange(min.num_seconds()));
     }
     Ok(Callback {
         at_utc,

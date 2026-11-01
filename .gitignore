@@ -28,3 +28,6 @@ spike/livekit/agent.ogg
 .env.twilio-c2c.tmp
 .env.lkcloud
 .env.lkcloud.tmp
+
+# Python byte code (the examples, the e2e agents).
+__pycache__/

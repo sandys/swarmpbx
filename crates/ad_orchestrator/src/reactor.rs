@@ -27,7 +27,9 @@ pub enum ReactorAction {
 pub fn react(event: &CampaignEvent) -> ReactorAction {
     match event {
         CampaignEvent::CampaignRunning { campaign_id }
-        | CampaignEvent::AgentJoined { campaign_id, .. } => ReactorAction::Dispatch {
+        | CampaignEvent::AgentJoined { campaign_id, .. }
+        | CampaignEvent::LeadsAdded { campaign_id, .. }
+        | CampaignEvent::SettingsChanged { campaign_id } => ReactorAction::Dispatch {
             campaign_id: *campaign_id,
         },
         // An outcome that comes after the end of the call settles it now;

@@ -13,6 +13,12 @@
 //!   assignment key; then the freed capacity dials again.
 //! - Repair: move the calls of nodes that are gone, remove keys of ended or
 //!   moved calls, and assign calls that never reached a node.
+//! - Wake: at the time when a waiting lead becomes due (a retry, a callback,
+//!   or a hold), dispatch its campaign; when the wait for an agent's outcome
+//!   ends, settle the call. A campaign that the cluster or its agent pool
+//!   held back dispatches again when that capacity frees. The repair sweep
+//!   (`AD_REPAIR_SWEEP_MS`) recovers only what no event and no due time
+//!   started.
 //!
 //! A node that loses the leader key stops all of this at once.
 
@@ -32,9 +38,10 @@ use ad_db::{ClaimRequest, ClaimedAttempt, LeadUpdate, PaceClaim, PgEventConsumer
 use ad_dispatch::Pacer;
 use ad_events::{BreakerStore, CampaignEvent, Consumer, EventError};
 use ad_hopper::{select, ExcludeReason, Order, SelectionInput};
-use ad_orchestrator::{react, settle_with, ReactorAction};
+use ad_orchestrator::{react, settle_with, DueTimes, ReactorAction, RetryPolicy};
 use ad_pacing::{Mode, State as PoolState};
-use tokio::sync::{mpsc, watch};
+use chrono::{DateTime, Utc};
+use tokio::sync::{mpsc, watch, Notify};
 
 use super::{every, warn_err, AbortOnDrop, Node};
 
@@ -44,6 +51,9 @@ const UNASSIGNED_GRACE: Duration = Duration::from_secs(10);
 const RECENT_TTL: Duration = Duration::from_secs(10);
 /// Rows read per repair pass.
 const PASS_LIMIT: i64 = 5000;
+/// The longest sleep of the waker when no time is due. A new due time wakes
+/// it before this.
+const IDLE_WAKE: Duration = Duration::from_secs(3600);
 
 /// Lead while this node holds the leader key.
 pub(super) async fn serve(node: Arc<Node>, mut leading: watch::Receiver<bool>) {
@@ -87,6 +97,21 @@ struct Scheduler {
     /// Assignments written but not yet in the calls mirror.
     recent: Mutex<HashMap<String, Instant>>,
     pacer: Pacer,
+    /// The next times of due leads and of outcome waits.
+    due: Mutex<DueTimes>,
+    /// A new due time: the waker computes its sleep again.
+    due_changed: Notify,
+    /// Campaigns that stopped because the cluster had no free place.
+    starved: Mutex<HashSet<CampaignId>>,
+    /// Campaigns that the pacing window of their agent pool held back, with
+    /// the pool.
+    held: Mutex<HashMap<CampaignId, String>>,
+    /// The agent pool of each campaign, from its last dispatch.
+    pools: Mutex<HashMap<CampaignId, String>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 async fn lead(node: Arc<Node>) {
@@ -103,10 +128,16 @@ async fn lead(node: Arc<Node>) {
         queue,
         queued: Mutex::default(),
         recent: Mutex::default(),
+        due: Mutex::default(),
+        due_changed: Notify::new(),
+        starved: Mutex::default(),
+        held: Mutex::default(),
+        pools: Mutex::default(),
     });
     let _assigner = AbortOnDrop(tokio::spawn(assigner(s.clone(), jobs)));
+    let _waker = AbortOnDrop(tokio::spawn(waker(s.clone())));
     let sweeper = s.clone();
-    let _sweep = every(node.settings.retry_sweep, "sweep", move || {
+    let _sweep = every(node.settings.repair_sweep, "sweep", move || {
         let s = sweeper.clone();
         async move { s.sweep().await }
     });
@@ -135,6 +166,33 @@ async fn lead(node: Arc<Node>) {
             Err(e) => tracing::error!(error = %e, "event listener connect failed; retrying"),
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Do the work at each due time. Dispatch the starved campaigns when the
+/// cluster gets a free place, and repair when a node joins or leaves.
+async fn waker(s: Arc<Scheduler>) {
+    let mut calls = s.calls.subscribe();
+    let mut nodes = s.nodes.subscribe();
+    loop {
+        let sleep = s.until_due();
+        tokio::select! {
+            _ = tokio::time::sleep(sleep) => s.run_due().await,
+            _ = s.due_changed.notified() => {}
+            changed = calls.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                s.wake_starved().await;
+            }
+            changed = nodes.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                warn_err(s.repair().await, "repair");
+                s.wake_starved().await;
+            }
+        }
     }
 }
 
@@ -242,16 +300,111 @@ impl Scheduler {
     }
 
     async fn handle(self: &Arc<Self>, event: &CampaignEvent) -> anyhow::Result<()> {
-        match react(event) {
-            ReactorAction::Dispatch { campaign_id } => self.dispatch(CampaignId(campaign_id)).await,
+        let campaign = match react(event) {
+            ReactorAction::Dispatch { campaign_id } => CampaignId(campaign_id),
             ReactorAction::SettleAndDispatch {
                 campaign_id,
                 attempt_id,
             } => {
                 self.settle(AttemptId(attempt_id)).await?;
-                self.dispatch(CampaignId(campaign_id)).await
+                CampaignId(campaign_id)
             }
-            ReactorAction::Noop => Ok(()),
+            ReactorAction::Noop => return Ok(()),
+        };
+        self.dispatch(campaign).await?;
+        // The event can free a place in the cluster or in the agent pool, so
+        // the campaigns that wait for it dispatch too.
+        let pool = lock(&self.pools).get(&campaign).cloned();
+        if let Some(pool) = pool {
+            self.wake_held(&pool, campaign).await;
+        }
+        self.wake_starved().await;
+        Ok(())
+    }
+
+    /// Dispatch the campaign at `at`.
+    fn campaign_due(&self, campaign: CampaignId, at: DateTime<Utc>) {
+        lock(&self.due).campaign_at(campaign, at);
+        self.due_changed.notify_one();
+    }
+
+    /// The time until the next due work.
+    fn until_due(&self) -> Duration {
+        match lock(&self.due).next() {
+            Some(at) => (at - self.node.clock.now_utc())
+                .to_std()
+                .unwrap_or(Duration::ZERO),
+            None => IDLE_WAKE,
+        }
+    }
+
+    /// Settle the attempts whose outcome wait ended, and dispatch the
+    /// campaigns whose leads became due. Then put in the next due time of
+    /// each of these campaigns.
+    async fn run_due(&self) {
+        let now = self.node.clock.now_utc();
+        let due = lock(&self.due).take_due(now);
+        for (attempt, campaign) in due.attempts {
+            warn_err(self.settle(attempt).await, "settle");
+            warn_err(self.dispatch(campaign).await, "dispatch");
+        }
+        for campaign in due.campaigns {
+            warn_err(self.dispatch(campaign).await, "dispatch");
+            let next = self.node.db.leads().next_due(campaign, now).await;
+            if let Some(Some(at)) = warn_err(next, "next due lead") {
+                self.campaign_due(campaign, at);
+            }
+        }
+    }
+
+    /// Read the next due time of each running campaign. A new leader, and
+    /// each repair sweep, do this; the settlements put in the others.
+    async fn load_due(&self) -> anyhow::Result<()> {
+        let now = self.node.clock.now_utc();
+        for (campaign, at) in self.node.db.leads().next_due_running(now).await? {
+            self.campaign_due(campaign, at);
+        }
+        Ok(())
+    }
+
+    /// Dispatch the starved campaigns while the cluster has a free place.
+    async fn wake_starved(&self) {
+        loop {
+            // Each change of a call key comes here, so look at the set before
+            // the load of the cluster.
+            if lock(&self.starved).is_empty() || self.free() <= 0 {
+                return;
+            }
+            let next = {
+                let mut starved = lock(&self.starved);
+                let first = starved.iter().next().copied();
+                first.inspect(|c| {
+                    starved.remove(c);
+                })
+            };
+            let Some(campaign) = next else {
+                return;
+            };
+            warn_err(self.dispatch(campaign).await, "dispatch");
+        }
+    }
+
+    /// Dispatch the campaigns that `pool` held back, other than `except`.
+    async fn wake_held(&self, pool: &str, except: CampaignId) {
+        let woken: Vec<CampaignId> = {
+            let mut held = lock(&self.held);
+            let of_pool: Vec<CampaignId> = held
+                .iter()
+                .filter(|(c, p)| p.as_str() == pool && **c != except)
+                .map(|(c, _)| *c)
+                .collect();
+            for c in &of_pool {
+                held.remove(c);
+            }
+            of_pool
+        };
+        for campaign in woken {
+            warn_err(self.dispatch(campaign).await, "dispatch");
         }
     }
 
@@ -260,6 +413,12 @@ impl Scheduler {
     /// Complete the campaign when it is idle.
     async fn dispatch(&self, campaign_id: CampaignId) -> anyhow::Result<()> {
         let node = &self.node;
+        lock(&self.held).remove(&campaign_id);
+        if self.free() <= 0 {
+            lock(&self.starved).insert(campaign_id);
+            return Ok(());
+        }
+        lock(&self.starved).remove(&campaign_id);
         if self.pause_if_breaker_open(campaign_id).await? {
             return Ok(());
         }
@@ -269,9 +428,10 @@ impl Scheduler {
         loop {
             let limit = node.settings.batch_limit.min(self.free());
             if limit <= 0 {
+                lock(&self.starved).insert(campaign_id);
                 return Ok(());
             }
-            let claimed = node
+            let claim = node
                 .attempts
                 .claim_paced(
                     campaign_id,
@@ -285,15 +445,20 @@ impl Scheduler {
                     },
                 )
                 .await?;
-            if claimed.is_empty() {
+            if claim.held_by_pool {
+                if let Some(pace) = &plan.pace {
+                    lock(&self.held).insert(campaign_id, pace.pool.clone());
+                }
+            }
+            if claim.attempts.is_empty() {
                 if node.db.campaigns().complete_if_idle(campaign_id).await? {
                     tracing::info!(campaign = campaign_id.0, "campaign completed");
                 }
                 return Ok(());
             }
-            let n = claimed.len() as i64;
-            self.gate(campaign_id, claimed).await;
-            if n < limit {
+            let n = claim.attempts.len() as i64;
+            self.gate(campaign_id, claim.attempts).await;
+            if n < limit || claim.held_by_pool {
                 return Ok(());
             }
         }
@@ -331,6 +496,7 @@ impl Scheduler {
             }
         };
         let pool = spec.pool();
+        lock(&self.pools).insert(campaign_id, pool.clone());
         // The claim still uses the saved limit when this fails.
         match node.db.pacing().ingest(&pool, connect_within_ms).await {
             Ok(state) => {
@@ -534,20 +700,21 @@ impl Scheduler {
 
     /// Update the lead from an ended attempt once, then close the room and
     /// remove the assignment. An answered call that its agent joined waits
-    /// for the agent's outcome, at most `outcome_wait_s` after its end.
+    /// for the agent's outcome, at most `outcome_wait_s` after its end. The
+    /// retry settings of the campaign decide a retry.
     async fn settle(&self, attempt_id: AttemptId) -> anyhow::Result<()> {
         let node = &self.node;
-        let policy = node.settings.retry;
         let now = node.clock.now_utc();
         let mut report = None;
-        let mut waits = false;
+        let mut waits = None;
         let done = node
             .attempts
             .settle_or_wait(attempt_id, |input| {
-                if waits_for_outcome(input, now) {
-                    waits = true;
+                if let Some(until) = waits_for_outcome(input, now) {
+                    waits = Some((input.campaign_id, until));
                     return None;
                 }
+                let policy = RetryPolicy::of(&input.retry);
                 let s = settle_with(
                     input.outcome,
                     input.agent_outcome,
@@ -595,12 +762,22 @@ impl Scheduler {
         let Some(update) = done else {
             // While it waits for the outcome, the call frees its place on the
             // node. The room stays for the agent.
-            if waits {
+            if let Some((campaign, until)) = waits {
+                tracing::info!(
+                    attempt = attempt_id.0,
+                    until = %until.to_rfc3339(),
+                    "the call waits for the agent's outcome"
+                );
+                lock(&self.due).attempt_at(attempt_id, campaign, until);
+                self.due_changed.notify_one();
                 self.cleanup(attempt_id, false).await?;
             }
             return Ok(());
         };
         if let Some((campaign, lead, outcome, exhausted, disposition)) = report {
+            if let Some(at) = update.next_eligible_at {
+                self.campaign_due(campaign, at);
+            }
             tracing::info!(
                 campaign = campaign.0,
                 lead = lead.0,
@@ -640,9 +817,10 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Settle ended attempts, repair the assignments, and dispatch every
-    /// running campaign. This dials the leads whose retry or hold became due,
-    /// and it recovers work that a lost event or a stopped node left.
+    /// Settle ended attempts, repair the assignments, dispatch every running
+    /// campaign, and read the due times again. This recovers the work that a
+    /// lost event, a stopped node, or a change that the leader did not see
+    /// left.
     async fn sweep(&self) -> anyhow::Result<()> {
         let node = &self.node;
         for id in node.attempts.unsettled(PASS_LIMIT).await? {
@@ -663,7 +841,7 @@ impl Scheduler {
         for campaign in node.db.campaigns().list_running().await? {
             warn_err(self.dispatch(campaign.id).await, "dispatch");
         }
-        Ok(())
+        self.load_due().await
     }
 
     /// Make kine agree with Postgres.
@@ -731,24 +909,23 @@ impl Scheduler {
 }
 
 /// An answered call that its agent joined, with a session and no outcome
-/// yet, waits for the outcome until `outcome_wait_s` after its end.
-fn waits_for_outcome(input: &SettleInput<'_>, now: chrono::DateTime<chrono::Utc>) -> bool {
+/// yet, waits for the outcome until `outcome_wait_s` after its end. Returns
+/// the end of the wait while it waits.
+fn waits_for_outcome(input: &SettleInput<'_>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     if input.agent_outcome.is_some()
         || !input.session
         || input.attempt.agent_ready_at.is_none()
         || !matches!(input.outcome, Outcome::Completed { .. })
     {
-        return false;
+        return None;
     }
     let wait = input
         .agent
         .as_ref()
         .and_then(|a| AgentSpec::parse(a).ok())
         .map_or(ad_agent::DEFAULT_OUTCOME_WAIT_S, |s| s.outcome_wait_s());
-    input
-        .attempt
-        .ended_at()
-        .is_some_and(|end| now < end + chrono::Duration::seconds(wait.into()))
+    let until = input.attempt.ended_at()? + chrono::Duration::seconds(wait.into());
+    (now < until).then_some(until)
 }
 
 /// Map a dispatch-gate exclusion to the attempt's end.
@@ -844,6 +1021,7 @@ mod tests {
             agent_outcome: None,
             session: true,
             agent,
+            retry: ad_campaign::Retry::default(),
         }
     }
 
@@ -853,21 +1031,23 @@ mod tests {
         assert!(matches!(a.outcome(), Some(Outcome::Completed { .. })));
         let end = at(10);
         let default = ad_agent::DEFAULT_OUTCOME_WAIT_S as i64;
-        assert!(waits_for_outcome(&input(&a, None), end));
+        assert_eq!(
+            waits_for_outcome(&input(&a, None), end),
+            Some(end + Duration::seconds(default)),
+            "the leader wakes at the end of the wait"
+        );
         assert!(waits_for_outcome(
             &input(&a, None),
             end + Duration::seconds(default) - Duration::milliseconds(1)
-        ));
-        assert!(!waits_for_outcome(
-            &input(&a, None),
-            end + Duration::seconds(default)
-        ));
+        )
+        .is_some());
+        assert!(waits_for_outcome(&input(&a, None), end + Duration::seconds(default)).is_none());
 
         let spec = serde_json::json!({"runtime": "pipecat", "start_url": "http://bot/start", "outcome_wait_s": 3});
-        assert!(waits_for_outcome(&input(&a, Some(spec.clone())), at(12)));
-        assert!(!waits_for_outcome(&input(&a, Some(spec)), at(13)));
+        assert!(waits_for_outcome(&input(&a, Some(spec.clone())), at(12)).is_some());
+        assert!(waits_for_outcome(&input(&a, Some(spec)), at(13)).is_none());
         let none = serde_json::json!({"runtime": "pipecat", "start_url": "http://bot/start", "outcome_wait_s": 0});
-        assert!(!waits_for_outcome(&input(&a, Some(none)), end));
+        assert!(waits_for_outcome(&input(&a, Some(none)), end).is_none());
     }
 
     #[test]
@@ -887,19 +1067,19 @@ mod tests {
             agent_outcome: Some(&reported),
             ..input(&a, None)
         };
-        assert!(!waits_for_outcome(&with_outcome, at(10)));
+        assert!(waits_for_outcome(&with_outcome, at(10)).is_none());
         let no_session = SettleInput {
             session: false,
             ..input(&a, None)
         };
-        assert!(!waits_for_outcome(&no_session, at(10)));
+        assert!(waits_for_outcome(&no_session, at(10)).is_none());
         // The agent never joined, so it has nothing to report.
         let not_joined = ended_before_the_agent();
         assert!(matches!(
             not_joined.outcome(),
             Some(Outcome::Completed { .. })
         ));
-        assert!(!waits_for_outcome(&input(&not_joined, None), at(3)));
+        assert!(waits_for_outcome(&input(&not_joined, None), at(3)).is_none());
         // The agent joined, but the callee was busy: the dialer knows the result.
         let busy = run(
             Attempt::with_agent(),
@@ -921,6 +1101,6 @@ mod tests {
             ],
         );
         assert!(busy.agent_ready_at.is_some());
-        assert!(!waits_for_outcome(&input(&busy, None), at(2)));
+        assert!(waits_for_outcome(&input(&busy, None), at(2)).is_none());
     }
 }

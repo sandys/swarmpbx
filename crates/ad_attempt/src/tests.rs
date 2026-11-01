@@ -337,6 +337,33 @@ fn the_agent_leaving_ends_a_connected_call() {
 }
 
 #[test]
+fn an_answer_after_the_agent_left_abandons_the_call() {
+    let connected = replay(
+        with_agent_ready(),
+        &[
+            AttemptEvent::DialStarted { at: t(2) },
+            AttemptEvent::Answered { at: t(12) },
+        ],
+    )
+    .unwrap();
+    let ended = apply(
+        &connected,
+        &AttemptEvent::AgentFailed {
+            at: t(12),
+            detail: "the agent left the room before the answer".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(ended.agent.name(), "failed");
+    assert_eq!(
+        ended.outcome(),
+        Some(&Outcome::Abandoned {
+            detail: "the agent left the room before the answer".into()
+        })
+    );
+}
+
+#[test]
 fn the_agent_leaving_before_the_dial_releases_the_lead() {
     let ended = apply(&with_agent_ready(), &AttemptEvent::AgentLeft { at: t(3) }).unwrap();
     assert!(matches!(

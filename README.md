@@ -59,6 +59,7 @@ After the call:
   callback time, or a DNC request. A DNC request stops the calls to that
   number at once.
 - It saves the result of each call, and it schedules retries and callbacks.
+  It calls each waiting lead at its due time. It does not poll.
 - It pauses a campaign whose calls fail too often, or whose agents do not
   start (circuit breakers).
 
@@ -72,7 +73,8 @@ AgentDialer has three paths:
 - **The call path** carries the call. SIP and RTP go between the trunk and a
   node. WebRTC audio goes between the node and the call's LiveKit room.
 - **The control path** decides which lead to call, when, and on which node.
-  The leader node does this through Postgres and kine.
+  The leader node does this through Postgres and kine. It acts on events and
+  at due times. It does not poll.
 - **The outcome path** brings the result of the talk back from the agent. The
   agent sends it to the `api` role on a gRPC stream.
 
@@ -80,7 +82,7 @@ AgentDialer has three paths:
 
 ```mermaid
 flowchart LR
-    you(["you<br/>scripts/api.sh"]) -->|HTTP| api["api role"]
+    you(["you<br/>a recipe or your flow"]) -->|HTTP| api["api role"]
     agent["AI agent<br/>LiveKit agent or pipecat bot"] -->|"gRPC: the outcome"| api
     api -->|"campaigns, leads,<br/>outcomes, DNC"| pg[("Postgres")]
     orch["orchestrator nodes<br/>one is the leader"] <-->|"claims, attempts,<br/>events, time"| pg
@@ -148,8 +150,8 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    you(["you<br/>scripts/api.sh"]) -->|HTTP| api["api role"]
-    api -->|"campaigns, leads, pacing"| pg[("Postgres")]
+    you(["you<br/>a recipe or your flow"]) -->|HTTP| api["api role"]
+    api -->|"campaigns, leads, pacing,<br/>and their events"| pg[("Postgres")]
     subgraph orch["orchestrator pods"]
         leader["node 1, the leader<br/>claims, gates, assigns, settles"]
         node2["node 2"]
@@ -174,11 +176,52 @@ flowchart TB
 - **Fencing.** Postgres is the record of every call. A node changes an
   attempt only while the attempt row names that node and its assignment
   generation. A node that lost a call cannot dial it or change it.
-- **Events** go through Postgres: an event table with LISTEN/NOTIFY, and a
-  sweep that finds what a lost notification left. There is no Redis.
+- **Events** go through Postgres: an event table with LISTEN/NOTIFY. There
+  is no Redis and no other queue. The `leads` table is the queue of the
+  waiting leads, with the due time of each lead.
 - **Managed services.** The dialer treats Postgres and kine as services that
   it reaches by URL. A role waits for them with backoff. It does not depend
   on a host, a start order, or a health check.
+
+### How the leader wakes
+
+The leader does work only when something changes, or when a time comes:
+
+```mermaid
+flowchart LR
+    ev["an event<br/>NOTIFY from Postgres"] --> leader["the leader"]
+    due["a due time<br/>one timer"] --> leader
+    free["a free place<br/>a call key goes, a node joins"] --> leader
+    sweep["the repair sweep<br/>every 10 s"] -.->|"recovery only"| leader
+    leader --> settle["settle an ended call"]
+    leader --> dial["claim the due leads,<br/>gate them, and dial"]
+```
+
+| The leader wakes on | Because | Then it |
+|---|---|---|
+| `campaign_running` | You started or resumed a campaign. | dials its due leads. |
+| `leads_added` | You loaded leads. | dials them at once. |
+| `settings_changed` | You changed the cap, the agent, the `retry` settings, or the pacing. | dials with the new values. |
+| `agent_joined` | An agent is in its room, so its call left the pool window. | dials into the free place of the window. |
+| `attempt_ended` | A call ended. | settles the lead, and dials into the free place. |
+| `agent_outcome` | An agent reported. | settles the lead, if its call ended. |
+| the due time of a lead | A retry, a callback, or a hold is due. | dials the campaign. |
+| the end of an outcome wait | The agent did not report in `outcome_wait_s`. | settles the lead by the call result. |
+| a free place in the cluster | A call key went away, or a node joined. | dials the campaigns that had no place. |
+
+- **One timer.** The leader keeps the next due time of each running campaign
+  and the end of each outcome wait (`ad_orchestrator::DueTimes`). One timer
+  sleeps until the first of them. A settlement that queues a lead puts its
+  time in. A new leader reads the due times from Postgres.
+- **The events.** Each state change and its event commit in one
+  transaction. A NOTIFY wakes the leader. If a notification is lost, the
+  leader reads the event table again in `AD_EVENT_SWEEP_MS` (2 s).
+- **The repair sweep** (`AD_REPAIR_SWEEP_MS`, 10 s) recovers only the work
+  that no event and no due time started. It moves the calls of a node that
+  is gone, removes the keys of ended calls, gives a node each call that did
+  not reach one, and reads the due times again. The e2e test of each change
+  sets the sweep to 10 min, so its checks pass only when the events and the
+  due times start the work.
 
 ### Before the dial: the claim and the gate
 
@@ -187,7 +230,7 @@ The leader does these checks for each due lead:
 ```mermaid
 flowchart TD
     due(["a due lead"]) --> claim{"Can the campaign claim it?<br/>running, breakers closed, under its cap,<br/>free node capacity, a place in the pool window"}
-    claim -->|no| later(["the lead waits for the next event"])
+    claim -->|no| later(["the lead waits:<br/>a free place wakes the leader"])
     claim -->|yes| order{"dial_order is customer_first,<br/>and the abandonment rate<br/>is at or under 3%?"}
     order -->|yes| cf["customer first"]
     order -->|"no, or the ledger does not read"| af["agent first"]
@@ -243,12 +286,15 @@ sequenceDiagram
     Note over T,A: audio: trunk, RTP, node, WebRTC, room, agent
     T->>N: BYE
     N->>PG: save hangup: the attempt ends, with attempt_ended
+    PG-->>L: NOTIFY attempt_ended
+    Note over L: no outcome yet: a timer for outcome_wait_s
     A->>API: Outcome, for example CALLBK
     API->>PG: save the outcome, with agent_outcome
     API-->>A: Ack
-    PG-->>L: NOTIFY
-    L->>PG: settle the lead by the outcome, claim the next lead
+    PG-->>L: NOTIFY agent_outcome
+    L->>PG: settle the lead by the outcome, and claim the next lead
     L->>R: close the room
+    Note over L: the callback time goes into the timer
 ```
 
 1. The leader claims a due lead and gates it ("Before the dial"). The claim
@@ -267,15 +313,21 @@ sequenceDiagram
 6. The audio flows until the callee sends BYE, the agent leaves, or no RTP
    comes for 30 s.
 7. The transaction that ends the attempt also writes the event
-   `attempt_ended`. The leader wakes on the NOTIFY.
+   `attempt_ended`. The leader wakes on the NOTIFY. The agent did not report
+   yet, so the leader sets a timer for the end of `outcome_wait_s`.
 8. The agent sends the outcome of the call, during the call or after it. The
    `api` role checks the outcome against the campaign's dispositions, saves
    it, and writes the event `agent_outcome`.
-9. The leader settles the lead one time ("After the call"). Then it closes
-   the room, and it dials into the free capacity.
+9. The leader settles the lead one time ("After the call"): at the
+   `agent_outcome` event, or at the end of the timer. Then it closes the
+   room, and it dials into the free capacity.
+10. The lead waits for its callback. The leader puts the callback time into
+    its timer, and it dials the lead at that time.
 
 With `"dial_order": "agent_first"` in the campaign's `agent`, the node starts
-the agent first. It sends the INVITE when the agent is in the room.
+the agent first. It sends the INVITE when the agent is in the room. If the
+agent leaves the room before the answer, the node hangs up at the answer,
+and the outcome is `abandoned`.
 
 ### After the call: the settlement
 
@@ -285,7 +337,7 @@ The leader updates the lead one time for each ended attempt:
 flowchart TD
     ended(["the attempt ended"]) --> waits{"Answered, the agent joined,<br/>no outcome yet, and less than<br/>outcome_wait_s since the end?"}
     waits -->|yes| wait(["wait: the agent can still report"])
-    wait -.->|"agent_outcome, or the sweep"| waits
+    wait -.->|"agent_outcome, or the end of the wait"| waits
     waits -->|no| dncq{"Did the agent ask for DNC?"}
     dncq -->|yes| dnc(["dnc: the number goes on the DNC list"])
     dncq -->|no| answered{"Did the callee answer,<br/>and did the agent report?"}
@@ -293,22 +345,39 @@ flowchart TD
     answered -->|yes| cb{"a callback time?"}
     cb -->|yes| queued(["queued at that time, priority 50"])
     cb -->|no| am{"a machine answer?"}
-    am -->|yes| vm(["voicemail retry in 60 min"])
+    am -->|yes| vm(["voicemail retry: voicemail_s"])
     am -->|no| result
     result -->|"completed, declined"| disp(["dispositioned"])
-    result -->|busy| r5(["retry in 5 min"])
-    result -->|"no answer"| r30(["retry in 30 min"])
-    result -->|"failed, abandoned, error"| r15(["retry in 15 min"])
+    result -->|busy| r5(["retry: busy_s"])
+    result -->|"no answer"| r30(["retry: no_answer_s"])
+    result -->|"failed, abandoned, error"| r15(["retry: failed_s, abandoned_s, error_s"])
     result -->|"invalid number"| done(["done"])
 ```
 
 - A DNC request takes effect when the agent sends it, not at the settlement.
   The `api` role puts the number on the DNC list, and every waiting lead with
   that number stops at once.
-- A lead gets at most 3 calls. After the third call, a retry becomes
-  `dispositioned`.
-- A retry or a callback goes on the lead row as `next_eligible_at`. The claim
-  takes a lead with a higher priority first.
+- The waits and the limit of calls are the campaign's `retry` settings. You
+  set them when you create the campaign, and you change them at any time
+  with `PATCH /v1/campaigns/:id` (`{"retry": {"busy_s": 60}}`). The next
+  settlement uses them. A key that you do not give keeps its value.
+
+  | Setting | Default | What it is |
+  |---|---|---|
+  | `busy_s` | 300 | The wait after a busy signal. |
+  | `no_answer_s` | 1800 | The wait after a call that nobody answered. |
+  | `voicemail_s` | 3600 | The wait after the agent reported a machine. |
+  | `failed_s` | 900 | The wait after a call that the carrier refused. |
+  | `error_s` | 900 | The wait after a setup error. |
+  | `abandoned_s` | 900 | The wait after an abandoned call. |
+  | `max_calls` | 3 | A lead gets no retry after this many calls. |
+  | `callback_min_s` | 60 | The soonest callback that the dialer takes from an agent. |
+
+  Each wait is 1 s to 90 days. `max_calls` is 1 to 100. `callback_min_s` is
+  1 s to 1 day.
+- A retry or a callback goes on the lead row as `next_eligible_at`. The
+  leader keeps the next of these times for each campaign, and it dials the
+  lead at that time. The claim takes a lead with a higher priority first.
 - The retry of an `abandoned` lead dials agent first.
 - While the leader waits for an outcome, the call frees its place on the
   node. The room stays open for the agent.
@@ -330,7 +399,7 @@ stateDiagram-v2
     dialing --> ended: busy, no answer, declined, failed
     uncertain --> connected: the check finds the call
     uncertain --> ended: the check finds no call
-    connected --> ended: BYE, agent left, no RTP for 30 s, no agent at 2 s
+    connected --> ended: BYE, agent left, no RTP for 30 s, no agent
     ended --> settled: the leader updates the lead
     settled --> [*]
 ```
@@ -339,7 +408,9 @@ An ended attempt has an outcome: `completed`, `busy`, `no_answer`,
 `declined`, `invalid_number`, `failed`, `abandoned`, `setup_error`,
 `uncertain`, or `not_dialed`. The node maps the SIP final code to the outcome.
 An `uncertain` attempt keeps its capacity until the node's check finds the
-call in its room, or not.
+call in its room, or not. "No agent" is `abandoned`: with customer first, no
+agent was in the room 2 s after the answer; with agent first, the agent left
+before the answer.
 
 ### The data
 
@@ -347,8 +418,8 @@ Postgres holds all the state. Each role reaches it by URL.
 
 | Table | What it holds | Who writes it |
 |---|---|---|
-| `campaigns` | Each campaign: its state, its agent, its disposition codes. | the `api` role, the leader |
-| `leads` | Each lead: its number, timezone, status, priority, and next due time. | the `api` role, the leader |
+| `campaigns` | Each campaign: its state, its agent, its `retry` settings, its disposition codes. | the `api` role, the leader |
+| `leads` | Each lead: its number, timezone, status, priority, and next due time. It is the queue of the waiting leads. | the `api` role, the leader |
 | `call_attempts` | Each call: the saved state machine, the node and generation that own it, the outcome, and the agent's outcome. | the nodes, the leader, the `api` role |
 | `attempt_events` | The events of each call, in order. | the nodes, the leader |
 | `campaign_events` | The event layer, with LISTEN/NOTIFY. | all roles |
@@ -397,6 +468,14 @@ The roles take the time from Postgres, not from the OS clock of their node
   or the 2 s test.
 - The LiveKit tokens get their times from the same clock. Only the log lines
   use the OS clock.
+- The leader's timer sleeps by the monotonic clock until a due time of the
+  Postgres clock.
+- The dialer does not correct the rate of the monotonic clock yet. On a
+  WSL2 laptop, the kernel clock ran 5.5% fast, and Hyper-V stepped the wall
+  clock back by up to 1.7 s every 30 s. Postgres uses that wall clock too.
+  So between two reads, a role's time was up to one step ahead of Postgres.
+  A call reads Postgres only at its start, so a 5-minute call ended about
+  16 s late on the Postgres clock (`GAPS.md` OPS-9).
 
 ## Quickstart: place calls through LiveKit Cloud SIP
 
@@ -493,49 +572,56 @@ $QS up -d --build
 ```
 
 The stack has Postgres, kine, LiveKit (the dialer's rooms), Kamailio (the SIP
-edge), the migrate job, the API (on `127.0.0.1:8080`), one dialer node, a demo
-agent, and the callee agent.
+edge), the migrate job, the API (on `127.0.0.1:8080`), one dialer node, two
+demo agents, and the callee agent.
 
-- The demo agent joins each call on the dialer's side. It plays a tone, and
-  it leaves after `DEMO_AGENT_MAX_CALL_S` (default 30 s). The node then ends
-  the call.
+- A demo agent joins each call on the dialer's side: the LiveKit agent
+  `demo`, or the pipecat bot `pipecat-bot`. It plays a tone, and it leaves
+  after `DEMO_AGENT_MAX_CALL_S` (default 30 s). The node then ends the call.
 - The callee agent connects to LiveKit Cloud and joins each call's room
   there. It plays a tone too.
 
 ### 3. Place calls
 
-`scripts/api.sh` calls the API from a container on the stack's network. Put
-your LiveKit number in the lead:
+The recipes in `examples/` are short Python programs. They use only the API.
+Run the first one:
 
 ```bash
-NUMBER=$(sed -n 's/^LKCLOUD_NUMBER=//p' .env.lkcloud)
-scripts/api.sh POST /v1/campaigns \
-  '{"org_id": 1, "name": "first-calls", "concurrency_cap": 1,
-    "agent": {"runtime": "livekit", "agent_name": "demo"}}'
-# -> {"id":1, ... "state":"draft"}
-scripts/api.sh POST /v1/campaigns/1/leads \
-  "{\"leads\": [{\"phone_number\": \"$NUMBER\", \"timezone\": \"America/New_York\"}]}"
-scripts/api.sh POST /v1/campaigns/1/transition '{"transition": "start"}'
-scripts/api.sh POST /v1/campaigns/1/transition '{"transition": "sync_complete"}'
+RUN="$QS run --rm examples"
+$RUN first_call.py
 ```
 
-The campaign starts to dial when it is `running`.
+The recipe makes a campaign with one lead and starts it. It waits for the
+call to end, prints the call and the lead, and checks the result:
 
-- Write each phone number with its country code, or add `"default_region":
-  "US"` next to `"leads"`. The dialer keeps the number in E.164. It refuses
-  the whole list if one number is bad, and it tells you which leads to
-  correct.
-- Give each lead an IANA timezone. A lead without one does not dial, because
-  compliance fails closed.
-- To keep a number from every call, add it to the DNC list:
-  `scripts/api.sh POST /v1/dnc '{"phone_number": "+12025550123"}'`.
+```
+Campaign 7 runs. Each line is a call when it settles:
+      8 s  call 6 to first: completed, disposition DONE, agent in the room 0.36 s after the answer
+call  lead   dial order      result     disposition  join s  pool
+----  -----  --------------  ---------  -----------  ------  ----
+6     first  customer_first  completed  DONE         0.36    1/4
+lead  name   status         calls  waits for  next call at
+----  -----  -------------  -----  ---------  ------------
+9     first  dispositioned  1      -          -
+ok:   the dialer called the customer first
+ok:   the call connected and ended
+ok:   the agent reported DONE
+ok:   the lead is dispositioned
+```
+
+The numbers of the campaign, the call, and the lead depend on what the stack
+did before. This output comes from a run after other recipes.
+
+The `examples` service runs the recipe in a Python container on the stack's
+network. The lead calls your LiveKit number (`LKCLOUD_NUMBER` in
+`.env.lkcloud`). To call another number, add `--to <number>`.
 
 ### 4. Watch
 
 ```bash
 $QS logs -f node
-scripts/api.sh GET /v1/campaigns/1
-scripts/api.sh GET /v1/campaigns/1/attempts   # each call, with the agent's disposition
+$RUN agentdialer.py GET /v1/campaigns/1
+$RUN agentdialer.py GET /v1/campaigns/1/attempts   # each call, with the agent's disposition
 e2e/livekit-cloud/run.sh call
 ```
 
@@ -556,12 +642,82 @@ e2e/livekit-cloud/run.sh teardown   # optional: delete the trunks and the rule
 Teardown keeps the number. If you do not need the number, release it in the
 LiveKit Cloud dashboard.
 
+### Recipes
+
+Each recipe shows one way to run a campaign. Run it as in step 3, for example
+`$RUN outcomes.py`.
+
+| Recipe | What it shows |
+|---|---|
+| `first_call.py` | One call. The dialer calls the customer first, and the agent joins at the answer. The agent reports `DONE`. |
+| `agent_first.py` | The dialer starts the agent, waits until it is in the room, and then dials. |
+| `outcomes.py` | Four outcomes: a `SALE` with a summary, a callback that calls the lead again 20 s later, no outcome, and `NI`. |
+| `dnc.py` | The DNC list. An entry from the API stops a lead before its dial. A DNC request from the agent stops the next lead with that number. |
+| `dispositions.py` | The campaign's own disposition codes. The dialer refuses a code that the campaign does not have. |
+| `pacing.py` | Six leads and a cap of 3. The pool's limit grows with fast joins. While the campaign runs, the recipe changes the cap and the pacing mode. |
+| `pipecat.py` | A pipecat bot as the agent. |
+| `changes.py` | Changes to a running campaign. A lead that you add is called at once. A change of the `retry` settings applies to the next outcome. |
+
+- The demo agents do not talk. The recipe puts two controls in the lead's
+  context: `outcome` (what the agent reports) and `talk_s` (when it leaves).
+  A real agent decides the outcome from the talk.
+- Each recipe prints `ok` or `FAIL` for each check. It exits with a non-zero
+  status after a `FAIL`. `e2e/run_twilio_e2e.sh --sim` runs every recipe on
+  every change, and `e2e/run_lkcloud_e2e.sh` runs them against LiveKit Cloud.
+- All the recipes together place about 21 calls. Each call uses LiveKit Cloud
+  SIP minutes.
+- LiveKit Cloud answers every call. So a recipe cannot show a busy line, no
+  answer, or a failed call. The carrier simulator tests those paths
+  (`e2e/run_e2e.sh`).
+
+### Write your own flow
+
+`examples/agentdialer.py` is the client of the recipes. It uses only the
+Python standard library. It has one method for each endpoint ("The API"). For
+example:
+
+```python
+from agentdialer import Dialer
+
+api = Dialer()  # AD_API_URL, else http://127.0.0.1:8080
+c = api.create_campaign("my-calls", {"runtime": "livekit", "agent_name": "demo"}, concurrency_cap=2)
+api.add_leads(c["id"], [
+    {"phone_number": "+12025550123", "timezone": "America/New_York", "context": {"first_name": "Ada"}},
+])
+api.start(c["id"])
+api.wait_until_done(c["id"])
+for call in api.attempts(c["id"]):
+    print(call["outcome"], call["disposition"])
+```
+
+Put the file in `examples/`, and run it with `$RUN my_flow.py`. You can also
+run it with your own Python (3.9 or later) on the host:
+`AD_API_URL=http://127.0.0.1:8080 python3 examples/my_flow.py`.
+
+To send one request, give the method, the path, and the JSON body:
+`$RUN agentdialer.py PATCH /v1/campaigns/1 '{"concurrency_cap": 4}'`.
+
+The leads:
+
+- Write each phone number with its country code, or give
+  `default_region="US"` to `add_leads`. The dialer keeps the number in E.164.
+  It refuses the whole list if one number is bad, and it tells you which
+  leads to correct.
+- Give each lead an IANA timezone. A lead without one does not dial, because
+  compliance fails closed.
+- `context` holds strings. The agent gets them in the call facts.
+- To keep a number from every call, add it to the DNC list:
+  `api.add_dnc("+12025550123")`.
+
 ### Your own agents
 
 **The agent.** Put your agent in the campaign:
 
 - a LiveKit agent: `{"runtime": "livekit", "agent_name": "<name>"}`;
 - a pipecat bot: `{"runtime": "pipecat", "start_url": "<url>"}`.
+
+To change the agent of a campaign, even while it runs, send
+`PATCH /v1/campaigns/:id` with the new `agent`. The next call uses it.
 
 The agent must reach the stack's LiveKit server. Run it on the stack's
 network (`agentdialer-quickstart_default`) with `LIVEKIT_URL=ws://livekit:7880`.
@@ -574,8 +730,10 @@ agent starts. For example:
   customer answers, the dialer starts the agent in the call's room. An agent
   starts only for an answered call.
 - `"agent_first"`: the dialer starts the agent, waits until it is in the room
-  (`join_timeout_s`, default 20), and then dials. No call is abandoned, but
-  each call that rings uses an agent.
+  (`join_timeout_s`, default 20), and then dials. Each call that rings uses
+  an agent. The agent must stay in the room until the callee is there. If
+  the agent leaves before the answer, the dialer hangs up at the answer, and
+  the outcome is `abandoned`.
 
 CAUTION: With `customer_first`, the agent must be in the room 2 s after the
 answer (the US TSR rule). If it is not, the dialer hangs up, and the outcome
@@ -606,11 +764,12 @@ of each call give the URL of the stream and a token for that call.
 - The node gives each agent the URL `http://api:9090`. If your agent runs in
   another place, set `AD_SESSION_URL` to a URL that it reaches before you
   start the stack.
-- `scripts/api.sh GET /v1/campaigns/1/dispositions` lists the codes. To add
-  codes for a campaign, `PUT` a list of `{"code", "name", "flags"}` there.
+- `$RUN agentdialer.py GET /v1/campaigns/1/dispositions` lists the codes.
+  To add codes for a campaign, `PUT` a list of `{"code", "name", "flags"}`
+  there (`dispositions.py`).
 
 **Abandonment.** The ledger counts the answered and abandoned calls of the
-campaign for 30 days: `scripts/api.sh GET /v1/campaigns/1/abandonment`. When
+campaign for 30 days: `$RUN agentdialer.py GET /v1/campaigns/1/abandonment`. When
 the rate is above 3%, the campaign dials agent first until the rate is at or
 under 3%. The retry of an abandoned lead dials agent first.
 
@@ -627,11 +786,11 @@ join ("Pacing by join time"). Campaigns with the same agent share one pool.
   uses it:
 
   ```bash
-  scripts/api.sh GET /v1/campaigns/1/pacing
-  scripts/api.sh PUT /v1/campaigns/1/pacing \
+  $RUN agentdialer.py GET /v1/campaigns/1/pacing
+  $RUN agentdialer.py PUT /v1/campaigns/1/pacing \
     '{"mode": "strict", "pool": {"target_ms": 800, "backoff_ms": 1200, "first_k": 2, "max_k": 8}}'
-  scripts/api.sh PUT /v1/campaigns/1/pacing '{"reset": true}'
-  scripts/api.sh GET /v1/agent-pools
+  $RUN agentdialer.py PUT /v1/campaigns/1/pacing '{"reset": true}'
+  $RUN agentdialer.py GET /v1/agent-pools
   ```
 
   `pool` replaces the settings of the pool, for all its campaigns. A value
@@ -653,9 +812,10 @@ without `-f docker-compose.livekit-cloud.yml`.
 | The campaign does not dial | The campaign is not `running`, or the lead has no timezone. |
 | The call connects, but the demo agent hears nothing | The callee agent did not join the room in LiveKit Cloud. Read `$QS logs callee`. |
 | The attempt's outcome is `abandoned` | The agent was not in the room 2 s after the answer. Check that the agent worker runs and has a free process (`$QS logs agent`), or set `"dial_order": "agent_first"` in the campaign's `agent`. |
+| The outcome is `abandoned`, with "the agent left the room before the answer" | The campaign dials agent first, and the agent left while the phone rang. Keep the agent in the room until the callee joins. |
 | The attempt has no `disposition` | The agent did not report in `outcome_wait_s`. Check that the agent reaches `AD_SESSION_URL` (default `http://api:9090`), and read `$QS logs api` for `agent session open`. |
 | The agent's outcome comes back `Rejected` | The code is not in the campaign's catalog, or the callback time is wrong. The reason says which. |
-| The campaign dials one call at a time | The pool's limit `k` is 1, because its agents are slow to join. Read `scripts/api.sh GET /v1/campaigns/1/pacing` (`recent.p95_ms`, `slow`). Keep the agent's workers ready for a job. |
+| The campaign dials one call at a time | The pool's limit `k` is 1, because its agents are slow to join. Read `$RUN agentdialer.py GET /v1/campaigns/1/pacing` (`recent.p95_ms`, `slow`). Keep the agent's workers ready for a job. |
 | `GET /v1/campaigns/1/pacing` answers 409 "invalid pacing settings" | The saved settings of the pool do not agree with the 2 s limit. The pool dials one call at a time. Send new settings, or `{"reset": true}`. |
 
 ## Call through Twilio
@@ -725,15 +885,20 @@ This is the quickstart stack without the callee agent.
 
 ### 3. Place calls
 
-Do step 3 of the quickstart, but set `NUMBER` to the number to call. For
-example, `NUMBER=+16504894546` is Twilio's "Play" test number. Calls to it are
-free, and you can reach it only through a trunk.
+Run the recipes of the quickstart, and give the number to call with `--to`.
+For example, `+16504894546` is Twilio's "Play" test number. Calls to it are
+free, and you can reach it only through a trunk:
+
+```bash
+RUN="docker compose -f docker-compose.quickstart.yml --env-file .env.twilio run --rm examples"
+$RUN first_call.py --to +16504894546
+```
 
 ### 4. Watch
 
 ```bash
 docker compose -f docker-compose.quickstart.yml logs -f node
-scripts/api.sh GET /v1/campaigns/1
+$RUN agentdialer.py GET /v1/campaigns/1
 e2e/twilio/run.sh calls +16504894546 2026-10-21T00:00:00Z   # Twilio's record
 ```
 
@@ -842,7 +1007,63 @@ The script does these steps:
    address in its Record-Route, so Twilio's later requests come back through
    the tunnel.
 4. It places one call to `TWILIO_C2C_TO` (default: Twilio's "Play" number,
-   `+16504894546`), as in step 3 of the quickstart.
+   `+16504894546`) through the API.
+
+## The API
+
+You use AgentDialer through its HTTP API, on port 8080 of the `api` role.
+Each endpoint takes and gives JSON. `examples/agentdialer.py` has one method
+for each endpoint. A reply that is not 2xx has `{"error": "..."}`.
+
+**Campaigns**
+
+| Request | What it does |
+|---|---|
+| `POST /v1/campaigns` | Create a campaign in the `draft` state: `org_id`, `name`, `concurrency_cap` (default 10), `agent`, and `retry` (the retry settings that differ from the defaults). |
+| `GET /v1/campaigns?org_id=1` | List the campaigns of an org. |
+| `GET /v1/campaigns/:id` | Get a campaign, with its state. |
+| `PATCH /v1/campaigns/:id` | Change `name`, `concurrency_cap`, `agent`, or `retry` keys, in any state. The next claim and the next settlement use the new values. |
+| `POST /v1/campaigns/:id/transition` | Change the state: `start` and then `sync_complete` (it runs), `pause`, `resume`, `complete`, `fail`. |
+
+**Leads and calls**
+
+| Request | What it does |
+|---|---|
+| `POST /v1/campaigns/:id/leads` | Load leads: `{"leads": [...], "default_region": "US"}`. It refuses the whole list if one lead is bad. |
+| `GET /v1/campaigns/:id/leads` | The leads, with the status, the calls placed, the priority, the next call time, and why the lead waits. |
+| `GET /v1/campaigns/:id/attempts` | The calls, oldest first, with the result, the disposition, the agent's outcome, the dial order, the pool window, and the times. Use `?lead_id=`, `?after=<id>`, and `?limit=`. |
+| `GET /v1/campaigns/:id/events` | The events of the campaign. Use `?after=<id>` and `?limit=`. |
+
+**Outcomes and compliance**
+
+| Request | What it does |
+|---|---|
+| `GET /v1/campaigns/:id/dispositions` | The codes that an agent can report: the system codes and the campaign's codes. |
+| `PUT /v1/campaigns/:id/dispositions` | Replace the campaign's codes: `[{"code", "name", "flags"}]`. |
+| `POST /v1/dnc` | Add a number to the DNC list: `phone_number`, `scope` (`system` or `campaign`), `campaign_id`, `note`. The reply gives the entry's `id`. |
+| `GET /v1/dnc?campaign_id=` | The system list, and the list of one campaign. |
+| `DELETE /v1/dnc/:id` | Remove an entry. |
+| `GET /v1/campaigns/:id/abandonment` | The abandonment rate of 30 days, and if the campaign can call the customer first. |
+| `POST /v1/compliance/check` | Ask the compliance engine if a lead can be called now. |
+
+**Pacing**
+
+| Request | What it does |
+|---|---|
+| `GET /v1/campaigns/:id/pacing` | The mode and the limit of the campaign, and the state of its agent pool. |
+| `PUT /v1/campaigns/:id/pacing` | Change the mode, the pool's settings, or start the pool again (`reset`). |
+| `GET /v1/agent-pools` | Every agent pool. |
+
+**Other**
+
+- `GET /health` answers when the API runs.
+- Agents report their outcome on the session stream, a gRPC stream on port
+  9090 (`proto/agentdialer/session/v1/session.proto`), not on the HTTP API.
+- `POST /v1/webhooks/livekit` takes LiveKit's webhooks.
+- `POST /v1/campaigns/:id/hopper/preview` shows which leads can dial now, and
+  why the others wait.
+- `POST /v1/campaigns/:id/dispatch/run-batch` is experimental. It places no
+  real calls.
 
 ## Crates
 
@@ -853,7 +1074,8 @@ The workspace is a set of crates under `crates/`. One crate has one concern.
 - `ad_core`: typed ids, errors, and a `Clock` trait for time in tests.
 - `ad_compliance`: the safe-hours gate, DNC, and the abandonment ledger. It
   fails closed.
-- `ad_campaign`: the campaign and its lifecycle state machine.
+- `ad_campaign`: the campaign, its lifecycle state machine, and its `retry`
+  settings (the defaults, the ranges, and the merge of a change).
 - `ad_lead`: the lead and the lead repository trait.
 - `ad_routing`: a routing rule engine on the FusionPBX dialplan model
   (conditions, actions, anti-actions, groups, break, `${}` and `$N`
@@ -867,8 +1089,9 @@ The workspace is a set of crates under `crates/`. One crate has one concern.
   from the agents' join times (slow start, a halving on a slow join), with
   the modes `adaptive` and `strict`.
 - `ad_orchestrator`: the scheduling gate, the run loop, the event reactor
-  (dispatch, or settle then dispatch), the retry decision, and the settlement
-  (what an ended attempt and its agent outcome do to the lead).
+  (dispatch, or settle then dispatch), the retry decision, the settlement
+  (what an ended attempt and its agent outcome do to the lead), and
+  `DueTimes` (the next due time of each campaign and each outcome wait).
 - `ad_contact`: phone numbers (E.164, on the vendored `phonenumber`, the
   libphonenumber data) and postal codes. Every crate reads numbers through
   it, so one change there replaces the library for all of them.
@@ -907,7 +1130,8 @@ The workspace is a set of crates under `crates/`. One crate has one concern.
   LISTEN/NOTIFY), the breaker window over the ended attempts, the DNC list
   (`dnc`), the agent sessions and their outcomes (`outcomes`), and `PgClock`
   (the Postgres time plus the monotonic time).
-- `ad_events`: the event contract: typed campaign events, the publisher and
+- `ad_events`: the event contract: typed campaign events (for example
+  `attempt_ended`, `leads_added`, `settings_changed`), the publisher and
   consumer traits, the breaker-store trait, and in-memory fakes for tests.
 - `ad_cluster`: coordination over kine: node membership, the leader, call
   assignment, and placement.
@@ -1003,7 +1227,7 @@ against the contract, so they cannot drift.
 | `AD_ROOM_PREFIX` | optional | `campaign` | Room name prefix. The room of a call is `<prefix>-<attempt id>`. |
 | `AD_BATCH_LIMIT` | optional | `20` | Leads claimed per claim. A claim takes no more than the free capacity of the campaign. |
 | `AD_CALLS_PER_SEC` | optional | `10` | Call starts per second. Calls run at the same time; this limits how fast they start. |
-| `AD_RETRY_SWEEP_MS` | optional | `1000` | Interval of the sweep that dials the leads that became due (a retry or a hold), updates leads from ended attempts, and completes idle campaigns. |
+| `AD_REPAIR_SWEEP_MS` | optional | `10000` | Interval of the leader's repair sweep. The leader dials a due lead at its time and settles a call when its outcome wait ends. The sweep recovers only the work that no event and no due time started. |
 | `AD_EVENT_SWEEP_MS` | optional | `2000` | The longest wait before the event table is read again, also when a notification is lost. |
 | `AD_ATTEMPT_CHECK_MS` | optional | `15000` | Interval of the check of live calls against LiveKit (is the call's participant still in its room). It ends a call whose node died, and it decides a dial whose result was lost. |
 | `AD_NODE_CAPACITY` | optional | `50` | The most calls that this node runs at one time. The leader gives each new call to the node with the most free capacity. |
@@ -1012,11 +1236,8 @@ against the contract, so they cannot drift.
 | `HOSTNAME` | optional | `orchestrator` | The node name: the node key in kine, and the node of each call attempt. Letters, digits, `-`, `_`, `.`. |
 | `RUST_LOG` | optional | `info` | Log filter (`tracing` `EnvFilter` syntax). |
 
-The retry policy is in the code for now (`crates/ad_orchestrator/src/retry.rs`).
-A lead gets at most 3 attempts. The wait before the next attempt is 5 minutes
-after busy, 30 minutes after no answer, 60 minutes after voicemail, and 15
-minutes after a failure, an abandoned call, or an error. No variable changes
-the policy yet.
+The retry policy is a setting of each campaign, not a variable: see
+"After the call: the settlement" (the `retry` settings).
 
 ### `api`
 
@@ -1084,7 +1305,7 @@ Twilio Elastic SIP Trunking termination:
 - E.164 and caller-ID checks;
 - symmetric RTP (it sends the audio back to the address that it comes from);
 - behaviors for each number: echo, tone, busy, decline, unavailable, failure,
-  and no answer.
+  no answer, and slow (it rings for 6 s, and then it answers).
 
 Its API (`/calls`) reports what it saw on each call, and the tests check that
 API.
@@ -1097,19 +1318,27 @@ container that changes the source port at random, as the AWS NAT gateway does.
 **The tests:**
 
 - `e2e/run_lkcloud_e2e.sh`: the quickstart, as a live test against LiveKit
-  Cloud. It runs setup, starts the quickstart stack, makes a campaign and a
-  lead through the API, and places a real call over the internet to the
-  project's LiveKit number. It checks the digest auth, that each agent hears
-  the other's tone, and that our BYE ends the call. It also places a
-  reference call from LiveKit's outbound trunk. It needs the LiveKit Cloud
-  keys and the SIP URI in `.env`.
+  Cloud. It runs setup, starts the quickstart stack, and places real calls
+  over the internet to the project's LiveKit number. It needs the LiveKit
+  Cloud keys and the SIP URI in `.env`. It checks these points:
+  - the digest auth, that each agent hears the other's tone, and that our
+    BYE ends the call;
+  - a reference call from LiveKit's outbound trunk;
+  - every recipe of `examples/` ("Recipes"), as a user runs them.
+
+  LiveKit has no test numbers, so every lead calls the project's number.
+  LiveKit answers each call, so the busy, failure, and no-answer paths are
+  tested with the carrier simulator.
 - `e2e/run_twilio_e2e.sh`: "Call through Twilio", as a test. It starts the
   quickstart stack, makes a campaign and a lead through the API, and places a
   real call through Twilio to its free "Play" number. It checks Twilio's
   audio at the agent and Twilio's own record of the call. It needs `.env` and
   an account with Elastic SIP Trunking. On a Trial account, set
   `TWILIO_E2E_TO` to a verified number. `--sim` runs the same stack and steps
-  with the simulator in Twilio's place, with no credentials.
+  with the simulator in Twilio's place, with no credentials. Then it runs
+  every recipe of `examples/` against the simulator. Last, an agent-first
+  agent leaves the room while a slow number rings. The test checks that the
+  node hangs up at the answer, and that the outcome is `abandoned`.
 - `e2e/run_twilio_c2c_e2e.sh`: "Click-to-call through Twilio", as a test.
   With `--sim`, the simulator is Twilio's Calls API and the phones. It has
   four leads:
@@ -1179,8 +1408,10 @@ container that changes the source port at random, as the AWS NAT gateway does.
 **CI.** CI runs the `e2e/` scripts on every change
 (`.github/workflows/ci.yml`):
 
-- `run_twilio_e2e.sh --sim` runs the quickstart stack with the carrier
-  simulator, so the stack keeps working without credentials.
+- `run_twilio_e2e.sh --sim` runs the quickstart stack and every recipe with
+  the carrier simulator, so the stack and the recipes keep working without
+  credentials. Its repair sweep is 10 min, so each recipe passes only when
+  the events and the due times start the work.
 - `run_twilio_c2c_e2e.sh --sim` runs click-to-call with the simulator.
 - `run_lkcloud_e2e.sh` (the LiveKit Cloud quickstart) runs when the
   repository has the secrets `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
@@ -1210,8 +1441,8 @@ one retry.
 - Set `database`, `livekit`, and `sip` (`sip.trunk`, and `sip.proxy` for
   Kamailio) in the values. The database and LiveKit values take an existing
   Secret, or an inline value for development.
-- The values `orchestrator.retrySweepMs`, `orchestrator.eventSweepMs`, and
-  `orchestrator.attemptCheckMs` set `AD_RETRY_SWEEP_MS`, `AD_EVENT_SWEEP_MS`,
+- The values `orchestrator.repairSweepMs`, `orchestrator.eventSweepMs`, and
+  `orchestrator.attemptCheckMs` set `AD_REPAIR_SWEEP_MS`, `AD_EVENT_SWEEP_MS`,
   and `AD_ATTEMPT_CHECK_MS`.
 - The chart does not deploy Kamailio or kine.
 
@@ -1229,7 +1460,7 @@ What works, and how we know:
 | Part | State | Proof |
 |---|---|---|
 | The call path: the node carries SIP and RTP behind Kamailio, and bridges the audio into the room (D-9) | Works through a NAT with a latching carrier | `e2e/run_e2e.sh`, `e2e/run_cluster_e2e.sh` |
-| The quickstart on LiveKit Cloud SIP | Works over the internet, through Docker's NAT and a home NAT (2026-10-24). No call went through the public phone network. | `e2e/run_lkcloud_e2e.sh` |
+| The quickstart on LiveKit Cloud SIP | Works over the internet, through Docker's NAT and a home NAT. Every recipe passed on 2026-11-01, with the repair sweep at 10 min. No call went through the public phone network. | `e2e/run_lkcloud_e2e.sh` |
 | Twilio Elastic SIP Trunking | Works with the simulator. Not run against Twilio: Twilio refused trunks for the test account (`GAPS.md` CARRIER-1). | `e2e/run_twilio_e2e.sh --sim`, `crates/ad_sip/tests/twilio.rs` |
 | Twilio click-to-call | Works with the simulator. The live run needs an upgraded account (`GAPS.md` CARRIER-2). | `e2e/run_twilio_c2c_e2e.sh --sim` |
 | The cluster: nodes, leader, call assignment over kine, fencing in Postgres | Works with three nodes in Docker Compose | `e2e/run_cluster_e2e.sh` |
@@ -1240,6 +1471,8 @@ What works, and how we know:
 | The agent's outcome on the session stream (`GAPS.md` AGNT-2, D-6): dispositions, callbacks, DNC requests | Works with both reference agents | `e2e/run_e2e.sh`, `crates/ad_session`, `crates/ad_db/tests/pg_outcomes.rs` |
 | Phone numbers in E.164 at the lead load, and the DNC list in Postgres (`GAPS.md` COMP-9, COMP-7) | Works | `crates/ad_contact`, `crates/ad_api/tests/outcomes_api.rs`, `e2e/run_e2e.sh` |
 | The event layer: LISTEN/NOTIFY, the breaker, retries on the lead row, campaign completion | Works | `e2e/run_events_e2e.sh` |
+| The leader wakes on events and at due times, with no poll (`GAPS.md` ORCH-4) | Works. A lead added to a running campaign dialed 1.7 s after the add on LiveKit Cloud, and a callback dialed at its time. | `e2e/run_twilio_e2e.sh --sim` and `e2e/run_lkcloud_e2e.sh`, both with the repair sweep at 10 min; `crates/ad_orchestrator` |
+| The `retry` settings of each campaign, changed at run time | Works | `examples/changes.py`, `crates/ad_db/tests/pg_campaign.rs`, `crates/ad_api/tests/campaign_api.rs` |
 | Call attempts: the state machine saved with its events | Works | `crates/ad_db/tests/pg_attempts.rs`, the e2e tests |
 | The WebRTC participant | Works: two-way audio | `e2e/run_webrtc_e2e.sh` |
 | Campaigns, leads, the hopper, the compliance engine | The engines work. Production passes a 24-hour window (`GAPS.md` COMP-1). | crate tests, API contract tests |
@@ -1275,7 +1508,12 @@ Other known limits (`GAPS.md` has the full list, by ID):
   has no traces (OTLP) yet (D-6).
 - **Holds.** The dialer checks a lead that the calling window holds again
   after 15 minutes. It does not compute the next window opening yet
-  (BETTER-3).
+  (BETTER-3). The 15 minutes, and the 1 minute after a dial with no agent,
+  are not campaign settings yet.
+- **Time.** The dialer does not correct the rate of a node's monotonic clock
+  yet (OPS-9).
+- **Agent first.** When the agent leaves while the phone rings, the dialer
+  hangs up at the answer. It does not cancel the dial yet (BETTER-1).
 - **Events.** The publish lock puts event inserts in a queue, and
   `campaign_events` and `attempt_events` have no retention yet (ORCH-2).
 - **Cluster.** kine is not etcd (no lease KeepAlive, no Election, no

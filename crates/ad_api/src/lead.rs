@@ -58,6 +58,12 @@ pub struct LeadDto {
     pub postal_code: Option<String>,
     pub status: LeadStatus,
     pub called_count: u32,
+    /// The claim takes a lead with a higher priority first (a callback: 50).
+    pub priority: i16,
+    /// The lead does not dial before this time, or `null`.
+    pub next_eligible_at: Option<String>,
+    /// Why the lead waits (`busy`, `no_answer`, `callback`, ...), or `null`.
+    pub retry_reason: Option<String>,
     pub context: BTreeMap<String, String>,
     pub created_at: String,
     pub updated_at: String,
@@ -74,6 +80,9 @@ impl From<Lead> for LeadDto {
             postal_code: l.postal_code,
             status: l.status,
             called_count: l.called_count,
+            priority: l.priority,
+            next_eligible_at: l.next_eligible_at.map(|t| t.to_rfc3339()),
+            retry_reason: l.retry_reason,
             context: l.context,
             created_at: l.created_at.to_rfc3339(),
             updated_at: l.updated_at.to_rfc3339(),

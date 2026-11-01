@@ -34,6 +34,15 @@ fn err(e: impl std::fmt::Display) -> AttemptError {
     AttemptError::Storage(e.to_string())
 }
 
+/// What a claim took.
+#[derive(Debug, Default)]
+pub struct Claim {
+    pub attempts: Vec<ClaimedAttempt>,
+    /// The pacing window of the agent pool allowed fewer leads than the
+    /// limit and the cap. Leads of the campaign can still be due.
+    pub held_by_pool: bool,
+}
+
 /// A new attempt and its lead, ready for the dispatch gate.
 #[derive(Debug, Clone)]
 pub struct ClaimedAttempt {
@@ -116,6 +125,8 @@ pub struct AttemptRow {
     pub agent: Option<serde_json::Value>,
     /// `leads.context`.
     pub lead_context: serde_json::Value,
+    /// `leads.called_count`: the calls placed to the lead before this one.
+    pub lead_called_count: u32,
 }
 
 /// An attempt as the API shows it.
@@ -124,7 +135,13 @@ pub struct AttemptView {
     pub id: i64,
     pub lead_id: i64,
     pub phone_number: String,
+    /// The room of the call on the dialer's LiveKit server.
+    pub room: String,
     pub state: String,
+    /// `customer_first` or `agent_first`: the order that this call used. It
+    /// can differ from the campaign's order (the abandonment cap, a retry of
+    /// an abandoned call). `None` without an agent.
+    pub dial_order: Option<String>,
     pub outcome: Option<String>,
     pub sip_code: Option<i32>,
     pub detail: Option<String>,
@@ -132,9 +149,20 @@ pub struct AttemptView {
     pub agent_outcome: Option<serde_json::Value>,
     pub node: Option<String>,
     pub pool: Option<String>,
+    /// The live calls of the pool when this call started, and the pool's
+    /// limit then.
+    pub pool_window: Option<i32>,
+    pub pool_limit: Option<i32>,
+    /// The agent's state in the room (`ready`, `left`, `failed`, ...).
+    pub agent_state: String,
+    pub agent_identity: Option<String>,
     pub created_at: DateTime<Utc>,
     pub dialed_at: Option<DateTime<Utc>>,
     pub answered_at: Option<DateTime<Utc>>,
+    /// When the dialer sent the agent's start request.
+    pub agent_started_at: Option<DateTime<Utc>>,
+    /// When the agent was in the room.
+    pub agent_ready_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub outcome_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
@@ -164,6 +192,8 @@ pub struct SettleInput<'a> {
     pub session: bool,
     /// `campaigns.agent`.
     pub agent: Option<serde_json::Value>,
+    /// `campaigns.retry`.
+    pub retry: ad_campaign::Retry,
 }
 
 /// The lead update that a settlement writes.
@@ -216,6 +246,7 @@ impl PgAttemptRepo {
             },
         )
         .await
+        .map(|c| c.attempts)
     }
 
     /// `claim`, also within the pacing window of the agent pool
@@ -225,7 +256,7 @@ impl PgAttemptRepo {
         &self,
         campaign_id: CampaignId,
         req: &ClaimRequest<'_>,
-    ) -> Result<Vec<ClaimedAttempt>, AttemptError> {
+    ) -> Result<Claim, AttemptError> {
         let ClaimRequest {
             worker,
             limit,
@@ -243,13 +274,13 @@ impl PgAttemptRepo {
         .await
         .map_err(err)?
         else {
-            return Ok(Vec::new());
+            return Ok(Claim::default());
         };
         let state: String = row.try_get("state").map_err(err)?;
         let cap: i32 = row.try_get("concurrency_cap").map_err(err)?;
         let agent: Option<serde_json::Value> = row.try_get("agent").map_err(err)?;
         if state != "running" {
-            return Ok(Vec::new());
+            return Ok(Claim::default());
         }
         let live: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM call_attempts WHERE campaign_id = $1 AND state <> 'ended'",
@@ -260,20 +291,28 @@ impl PgAttemptRepo {
         .map_err(err)?;
         let mut take = limit.min(i64::from(cap) - live);
         if take <= 0 {
-            return Ok(Vec::new());
+            return Ok(Claim::default());
         }
         let mut paced = None;
+        let mut held_by_pool = false;
         if let (Some(p), Some(_)) = (req.pace, &agent) {
             let (pool_limit, window) = lock_limit(&mut tx, p).await.map_err(err)?;
-            take = take.min(i64::from(pool_limit) - window);
+            let room = i64::from(pool_limit) - window;
+            if room < take {
+                held_by_pool = true;
+                take = room;
+            }
             if take <= 0 {
-                return Ok(Vec::new());
+                return Ok(Claim {
+                    attempts: Vec::new(),
+                    held_by_pool,
+                });
             }
             paced = Some((p.pool.as_str(), window, pool_limit as i32));
         }
 
         let sql = format!(
-            "SELECT {LEAD_COLS}, retry_reason FROM leads \
+            "SELECT {LEAD_COLS} FROM leads \
              WHERE campaign_id = $1 AND status IN ('new', 'queued') \
                AND (next_eligible_at IS NULL OR next_eligible_at <= $2) \
              ORDER BY priority DESC, called_count, id LIMIT $3 FOR UPDATE SKIP LOCKED"
@@ -289,10 +328,9 @@ impl PgAttemptRepo {
         let mut claimed = Vec::with_capacity(rows.len());
         for (i, row) in rows.iter().enumerate() {
             let lead = row_to_lead(row).map_err(err)?;
-            let prior: Option<String> = row.try_get("retry_reason").map_err(err)?;
             let first = match (&agent, agent_on_answer) {
                 (None, _) => Attempt::default(),
-                (Some(_), Some(ms)) if prior.as_deref() != Some("abandoned") => {
+                (Some(_), Some(ms)) if lead.retry_reason.as_deref() != Some("abandoned") => {
                     Attempt::with_agent_on_answer(ms)
                 }
                 (Some(_), _) => Attempt::with_agent(),
@@ -337,7 +375,10 @@ impl PgAttemptRepo {
             });
         }
         tx.commit().await.map_err(err)?;
-        Ok(claimed)
+        Ok(Claim {
+            attempts: claimed,
+            held_by_pool,
+        })
     }
 
     /// Apply one event to an attempt, from a source that does not own it (a
@@ -489,7 +530,8 @@ impl PgAttemptRepo {
     pub async fn get(&self, attempt_id: AttemptId) -> Result<AttemptRow, AttemptError> {
         let row = sqlx::query(
             "SELECT a.campaign_id, a.lead_id, a.phone_number, a.room, a.participant_identity, \
-                    a.snapshot, a.node, a.assign_gen, a.agent_identity, c.agent, l.context \
+                    a.snapshot, a.node, a.assign_gen, a.agent_identity, c.agent, l.context, \
+                    l.called_count \
              FROM call_attempts a JOIN campaigns c ON c.id = a.campaign_id \
                   JOIN leads l ON l.id = a.lead_id \
              WHERE a.id = $1",
@@ -512,6 +554,7 @@ impl PgAttemptRepo {
             agent_identity: row.try_get("agent_identity").map_err(err)?,
             agent: row.try_get("agent").map_err(err)?,
             lead_context: row.try_get("context").map_err(err)?,
+            lead_called_count: row.try_get::<i32, _>("called_count").map_err(err)? as u32,
         })
     }
 
@@ -558,7 +601,8 @@ impl PgAttemptRepo {
         let mut tx = self.pool.begin().await.map_err(err)?;
         let row = sqlx::query(
             "SELECT a.campaign_id, a.lead_id, a.snapshot, a.settled_at, a.agent_outcome, \
-                    a.session_token_sha256 IS NOT NULL AS session, l.called_count, c.agent \
+                    a.session_token_sha256 IS NOT NULL AS session, l.called_count, c.agent, \
+                    c.retry \
              FROM call_attempts a JOIN leads l ON l.id = a.lead_id \
                   JOIN campaigns c ON c.id = a.campaign_id \
              WHERE a.id = $1 FOR UPDATE OF a, l",
@@ -593,6 +637,7 @@ impl PgAttemptRepo {
             agent_outcome: agent_outcome.as_ref(),
             session: row.try_get("session").map_err(err)?,
             agent: row.try_get("agent").map_err(err)?,
+            retry: crate::retry_of(row.try_get("retry").map_err(err)?).map_err(err)?,
         }) else {
             return Ok(None);
         };
@@ -627,16 +672,24 @@ impl PgAttemptRepo {
     pub async fn page(
         &self,
         campaign_id: CampaignId,
+        lead_id: Option<LeadId>,
         after: i64,
         limit: i64,
     ) -> Result<Vec<AttemptView>, AttemptError> {
         let rows = sqlx::query(
-            "SELECT id, lead_id, phone_number, state, outcome, sip_code, detail, disposition, \
-                    agent_outcome, node, pool, created_at, dialed_at, answered_at, ended_at, \
-                    outcome_at, settled_at \
-             FROM call_attempts WHERE campaign_id = $1 AND id > $2 ORDER BY id LIMIT $3",
+            "SELECT id, lead_id, phone_number, room, state, outcome, sip_code, detail, \
+                    disposition, agent_outcome, node, pool, pool_window, pool_limit, \
+                    agent_state, agent_identity, created_at, dialed_at, answered_at, \
+                    agent_started_at, agent_ready_at, ended_at, outcome_at, settled_at, \
+                    CASE WHEN snapshot ? 'agent_within_ms' THEN 'customer_first' \
+                         WHEN snapshot->'agent'->>'state' <> 'none' THEN 'agent_first' \
+                    END AS dial_order \
+             FROM call_attempts \
+             WHERE campaign_id = $1 AND ($2::bigint IS NULL OR lead_id = $2) AND id > $3 \
+             ORDER BY id LIMIT $4",
         )
         .bind(campaign_id.0)
+        .bind(lead_id.map(|l| l.0))
         .bind(after)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -648,7 +701,9 @@ impl PgAttemptRepo {
                     id: r.try_get("id").map_err(err)?,
                     lead_id: r.try_get("lead_id").map_err(err)?,
                     phone_number: r.try_get("phone_number").map_err(err)?,
+                    room: r.try_get("room").map_err(err)?,
                     state: r.try_get("state").map_err(err)?,
+                    dial_order: r.try_get("dial_order").map_err(err)?,
                     outcome: r.try_get("outcome").map_err(err)?,
                     sip_code: r.try_get("sip_code").map_err(err)?,
                     detail: r.try_get("detail").map_err(err)?,
@@ -656,9 +711,15 @@ impl PgAttemptRepo {
                     agent_outcome: r.try_get("agent_outcome").map_err(err)?,
                     node: r.try_get("node").map_err(err)?,
                     pool: r.try_get("pool").map_err(err)?,
+                    pool_window: r.try_get("pool_window").map_err(err)?,
+                    pool_limit: r.try_get("pool_limit").map_err(err)?,
+                    agent_state: r.try_get("agent_state").map_err(err)?,
+                    agent_identity: r.try_get("agent_identity").map_err(err)?,
                     created_at: r.try_get("created_at").map_err(err)?,
                     dialed_at: r.try_get("dialed_at").map_err(err)?,
                     answered_at: r.try_get("answered_at").map_err(err)?,
+                    agent_started_at: r.try_get("agent_started_at").map_err(err)?,
+                    agent_ready_at: r.try_get("agent_ready_at").map_err(err)?,
                     ended_at: r.try_get("ended_at").map_err(err)?,
                     outcome_at: r.try_get("outcome_at").map_err(err)?,
                     settled_at: r.try_get("settled_at").map_err(err)?,

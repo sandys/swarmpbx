@@ -95,6 +95,11 @@ pub enum CampaignEvent {
     },
     /// No work is left, and the campaign is completed.
     CampaignCompleted { campaign_id: i64 },
+    /// The API loaded leads into the campaign.
+    LeadsAdded { campaign_id: i64, count: u32 },
+    /// The API changed a setting of the campaign: the cap, the agent, the
+    /// retry settings, or the pacing.
+    SettingsChanged { campaign_id: i64 },
 }
 
 impl CampaignEvent {
@@ -108,7 +113,9 @@ impl CampaignEvent {
             | CampaignEvent::CircuitBreakerTripped { campaign_id, .. }
             | CampaignEvent::AgentPoolTripped { campaign_id, .. }
             | CampaignEvent::AgentOutcome { campaign_id, .. }
-            | CampaignEvent::CampaignCompleted { campaign_id } => *campaign_id,
+            | CampaignEvent::CampaignCompleted { campaign_id }
+            | CampaignEvent::LeadsAdded { campaign_id, .. }
+            | CampaignEvent::SettingsChanged { campaign_id } => *campaign_id,
         }
     }
 
@@ -124,6 +131,8 @@ impl CampaignEvent {
             CampaignEvent::AgentPoolTripped { .. } => "agent_pool_tripped",
             CampaignEvent::AgentOutcome { .. } => "agent_outcome",
             CampaignEvent::CampaignCompleted { .. } => "campaign_completed",
+            CampaignEvent::LeadsAdded { .. } => "leads_added",
+            CampaignEvent::SettingsChanged { .. } => "settings_changed",
         }
     }
 

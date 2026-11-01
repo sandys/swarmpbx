@@ -147,6 +147,7 @@ fn call_facts<'a>(row: &'a AttemptRow, session: Option<&'a AgentSession>) -> Cal
         room: &row.room,
         callee_identity: &row.participant_identity,
         phone_number: &row.phone_number,
+        called_count: row.lead_called_count,
         lead_context: &row.lead_context,
         session: session.map(|(url, token)| SessionFacts { url, token }),
     }
@@ -339,16 +340,21 @@ async fn dial(
                 None => return Ok(()),
             }
         }
-        _ => live.run(None).await,
+        // Agent first: the agent was in the room before the dial. When it
+        // left during the dial, the call hangs up at once.
+        _ => {
+            let at_answer = live.answered();
+            live.run(Some(at_answer)).await
+        }
     };
     let at = times.now();
     let event = match &end {
         CallEnd::NoAgent => AttemptEvent::AgentFailed {
             at,
-            detail: format!(
-                "no agent in the room {} ms after the answer",
-                attempt.agent_within_ms.unwrap_or(0)
-            ),
+            detail: match attempt.agent_within_ms {
+                Some(ms) => format!("no agent in the room {ms} ms after the answer"),
+                None => "the agent left the room before the answer".into(),
+            },
         },
         CallEnd::CalleeHangup => AttemptEvent::Hangup {
             at,

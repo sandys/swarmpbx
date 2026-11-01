@@ -5,7 +5,8 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use ad_core::{AttemptId, CampaignId};
+use ad_campaign::repo::CampaignRepo;
+use ad_core::{AttemptId, CampaignId, LeadId};
 use ad_db::{Db, LeadUpdate, NewDnc, OutcomeError, Owner, Recorded};
 use ad_disposition::{
     check, AgentOutcome, CallbackRequest, Catalog, Disposition, DncScope, Flags, Report,
@@ -70,6 +71,7 @@ fn outcome(code: Option<&str>, f: impl FnOnce(&mut Report)) -> AgentOutcome {
         &Catalog::default(),
         Some("America/New_York"),
         Utc::now(),
+        chrono::Duration::seconds(60),
     )
     .unwrap()
 }
@@ -133,9 +135,25 @@ async fn the_first_outcome_stays() {
         db.outcomes().record(&s, b"wrong", &sale).await,
         Err(OutcomeError::Session)
     ));
-    let view = db.attempts().page(c, a.0 - 1, 1).await.unwrap().remove(0);
+    let view = db
+        .attempts()
+        .page(c, None, a.0 - 1, 1)
+        .await
+        .unwrap()
+        .remove(0);
     assert_eq!(view.disposition.as_deref(), Some("SALE"));
     assert!(view.outcome_at.is_some());
+    assert!(view.room.starts_with("room"), "{}", view.room);
+    let lead = LeadId(view.lead_id);
+    let of_lead = db.attempts().page(c, Some(lead), 0, 10).await.unwrap();
+    assert_eq!(of_lead.iter().map(|v| v.id).collect::<Vec<_>>(), [a.0]);
+    let other = LeadId(view.lead_id + 1_000_000);
+    assert!(db
+        .attempts()
+        .page(c, Some(other), 0, 10)
+        .await
+        .unwrap()
+        .is_empty());
     let events = db.events().list(c.0, 100).await.unwrap();
     assert!(events.iter().any(|(_, e)| matches!(
         e,
@@ -289,7 +307,20 @@ async fn settlement_can_wait_and_reads_the_outcome() {
     assert_eq!(waited, None);
     assert!(db.attempts().unsettled(1000).await.unwrap().contains(&a));
 
+    // The session and the settlement read the campaign's retry settings.
+    db.campaigns()
+        .update(
+            c,
+            ad_campaign::repo::CampaignChange {
+                retry: Some(serde_json::json!({"callback_min_s": 120, "busy_s": 42})),
+                ..Default::default()
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
     let s = db.outcomes().session(a, b"digest-1").await.unwrap();
+    assert_eq!(s.callback_min, Duration::seconds(120));
     let at = (Utc::now() + Duration::days(1))
         .with_timezone(&chrono_tz::America::New_York)
         .naive_local()
@@ -303,6 +334,7 @@ async fn settlement_can_wait_and_reads_the_outcome() {
     let update = db
         .attempts()
         .settle_or_wait(a, |input| {
+            assert_eq!(input.retry.busy_s, 42);
             let o = input.agent_outcome.unwrap();
             assert_eq!(o.callback.as_ref().unwrap().at_utc, due);
             Some((
@@ -319,15 +351,15 @@ async fn settlement_can_wait_and_reads_the_outcome() {
         .await
         .unwrap();
     assert!(update.is_some());
-    let lead: (i16, String) = sqlx::query_as(
-        "SELECT l.priority, l.retry_reason FROM leads l JOIN call_attempts a ON a.lead_id = l.id \
-         WHERE a.id = $1",
-    )
-    .bind(a.0)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(lead, (50, "callback".to_string()));
+    let lead = db.leads().list_by_campaign(c).await.unwrap().remove(0);
+    assert_eq!(
+        (
+            lead.priority,
+            lead.next_eligible_at,
+            lead.retry_reason.as_deref()
+        ),
+        (50, Some(due), Some("callback"))
+    );
 }
 
 #[tokio::test]

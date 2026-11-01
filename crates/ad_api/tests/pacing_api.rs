@@ -71,6 +71,7 @@ async fn every_pacing_value_changes_at_run_time() {
         LeadStore::Pg(db.leads()),
     );
     state.pacing = Some(db.pacing());
+    state.db = Some(db.clone());
     let app = router(state);
 
     let org = Utc::now().timestamp_nanos_opt().unwrap() & 0x7fff_ffff;
@@ -83,6 +84,7 @@ async fn every_pacing_value_changes_at_run_time() {
                     name: "pacing".into(),
                     concurrency_cap: 10,
                     agent,
+                    retry: None,
                 })
                 .await
                 .unwrap()
@@ -125,6 +127,13 @@ async fn every_pacing_value_changes_at_run_time() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["mode"], "strict");
     assert_eq!(v["pool"]["k"], 4);
+    let changed = db.events().page(c, 0, 100).await.unwrap();
+    assert!(
+        changed
+            .iter()
+            .any(|(_, _, e)| *e == ad_events::CampaignEvent::SettingsChanged { campaign_id: c }),
+        "the leader hears of the change: {changed:?}"
+    );
     assert_eq!(v["limit"], 1, "strict: the pool proved nothing yet");
     assert_eq!(
         (&v["pool"]["target_ms"], &v["pool"]["max_k"]),

@@ -6,14 +6,16 @@
 //!   GET    /v1/campaigns/:id/dispositions  {"system": [...], "campaign": [...]}
 //!   PUT    /v1/campaigns/:id/dispositions  [{"code", "name", "flags"}]: the
 //!                                          campaign codes (400 if invalid)
-//!   GET    /v1/campaigns/:id/attempts      ?after=<attempt id>&limit=<n>, with
-//!                                          the disposition and the agent outcome
+//!   GET    /v1/campaigns/:id/attempts      ?lead_id=<id>&after=<attempt id>&limit=<n>,
+//!                                          with the disposition, the agent
+//!                                          outcome, and the times of the call
 //!   GET    /v1/campaigns/:id/events        ?after=<event id>&limit=<n>
 //!   GET    /v1/dnc                         ?campaign_id=<id>: the system list
 //!                                          and that campaign's list, newest first
 //!   POST   /v1/dnc                         {"phone_number", "scope", "campaign_id",
 //!                                          "region", "note"}: 201, or 200 when
-//!                                          the entry exists
+//!                                          the entry exists; the reply has
+//!                                          the entry's id
 //!   DELETE /v1/dnc/:id                     204 (404 if missing)
 
 use axum::{
@@ -24,7 +26,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use ad_core::CampaignId;
+use ad_core::{CampaignId, LeadId};
 use ad_db::{AttemptView, DncEntry, NewDnc};
 use ad_disposition::{catalog, Catalog, Disposition, DncScope};
 
@@ -82,6 +84,16 @@ struct Page {
     limit: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct AttemptQuery {
+    #[serde(default)]
+    lead_id: Option<i64>,
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
 fn default_limit() -> i64 {
     100
 }
@@ -129,13 +141,13 @@ async fn put_catalog(
 async fn attempts(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Query(page): Query<Page>,
+    Query(q): Query<AttemptQuery>,
 ) -> Result<Json<Vec<AttemptView>>, ApiError> {
     let db = db(&state)?;
     let cid = campaign(&state, id).await?;
     let rows = db
         .attempts()
-        .page(cid, page.after, limit(&page))
+        .page(cid, q.lead_id.map(LeadId), q.after, q.limit.clamp(1, 1000))
         .await
         .map_err(storage)?;
     Ok(Json(rows))
@@ -212,6 +224,9 @@ struct NewDncDto {
 
 #[derive(Debug, Serialize)]
 pub struct AddedDto {
+    /// The entry: the new one, or the one that existed. `DELETE /v1/dnc/:id`
+    /// removes it.
+    pub id: i64,
     pub phone_number: String,
     pub created: bool,
     /// The waiting leads that the entry stopped.
@@ -258,6 +273,7 @@ async fn add_dnc(
     Ok((
         status,
         Json(AddedDto {
+            id: added.id,
             phone_number: phone.e164.into_string(),
             created: added.created,
             cancelled: added.cancelled,

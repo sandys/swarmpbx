@@ -24,11 +24,12 @@ import numpy as np
 from livekit import rtc
 from livekit.agents import AgentServer, AutoSubscribe, JobContext, JobExecutorType, cli
 
-from agent_session import Session, planned_outcome
+from agent_session import Session, leave_after_seconds, planned_outcome, talk_seconds
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "e2e-livekit")
 STATS_PORT = int(os.environ.get("STATS_PORT", "8088"))
 # Leave the call after this many seconds (0: stay until the callee leaves).
+# The lead context's "talk_s" sets it for one call.
 MAX_CALL_S = float(os.environ.get("MAX_CALL_S", "0"))
 # 16 kHz keeps one worker process light enough for a dozen calls at once.
 SAMPLE_RATE, CHANNELS, SAMPLES = 16000, 1, 160  # 10 ms frames
@@ -96,6 +97,7 @@ async def entrypoint(ctx: JobContext) -> None:
     callee = call.get("callee_identity")
     update(room, attempt_id=call.get("attempt_id"), callee=callee)
     stop = asyncio.Event()
+    arrived = asyncio.Event()
 
     def is_callee(participant) -> bool:
         nonlocal callee
@@ -118,7 +120,13 @@ async def entrypoint(ctx: JobContext) -> None:
     @ctx.room.on("track_subscribed")
     def _subscribed(track, _publication, participant):
         if track.kind == rtc.TrackKind.KIND_AUDIO and is_callee(participant):
+            arrived.set()
             asyncio.ensure_future(count(track))
+
+    @ctx.room.on("participant_connected")
+    def _joined(participant):
+        if is_callee(participant):
+            arrived.set()
 
     @ctx.room.on("participant_disconnected")
     def _left(participant):
@@ -129,6 +137,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     update(room, agent=ctx.room.local_participant.identity)
+    if any(is_callee(p) for p in ctx.room.remote_participants.values()):
+        arrived.set()
     source = rtc.AudioSource(SAMPLE_RATE, CHANNELS, queue_size_ms=200)
     track = rtc.LocalAudioTrack.create_audio_track("agent-tone", source)
     await ctx.room.local_participant.publish_track(
@@ -138,8 +148,19 @@ async def entrypoint(ctx: JobContext) -> None:
     opening = asyncio.ensure_future(open_session(room, call))
 
     n, idx = 0, np.arange(SAMPLES)
-    if MAX_CALL_S > 0:
-        asyncio.get_running_loop().call_later(MAX_CALL_S, stop.set)
+    # Agent first, the agent joins before the dial, so the talk time starts
+    # when the callee is in the room.
+    talk = talk_seconds(call, MAX_CALL_S)
+    if talk > 0:
+        async def talk_then_stop() -> None:
+            await arrived.wait()
+            await asyncio.sleep(talk)
+            stop.set()
+
+        asyncio.ensure_future(talk_then_stop())
+    leave = leave_after_seconds(call)
+    if leave > 0:
+        asyncio.get_running_loop().call_later(leave, stop.set)
     while not stop.is_set():
         pcm = (0.2 * 32767 * np.sin(2 * np.pi * 440 * (idx + n) / SAMPLE_RATE)).astype(np.int16)
         n += SAMPLES

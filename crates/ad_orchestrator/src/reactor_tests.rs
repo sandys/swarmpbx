@@ -37,6 +37,21 @@ fn an_agent_in_the_room_dispatches() {
 }
 
 #[test]
+fn new_leads_and_new_settings_dispatch() {
+    // Without an event, the leads or a higher cap would wait for the repair
+    // sweep.
+    for e in [
+        CampaignEvent::LeadsAdded {
+            campaign_id: 4,
+            count: 2,
+        },
+        CampaignEvent::SettingsChanged { campaign_id: 4 },
+    ] {
+        assert_eq!(react(&e), ReactorAction::Dispatch { campaign_id: 4 });
+    }
+}
+
+#[test]
 fn an_agent_outcome_settles_its_attempt() {
     assert_eq!(
         react(&CampaignEvent::AgentOutcome {

@@ -36,6 +36,7 @@ async fn campaign(db: &Db) -> i64 {
             name: "events-test".into(),
             concurrency_cap: 10,
             agent: None,
+            retry: None,
         })
         .await
         .unwrap()

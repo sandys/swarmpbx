@@ -20,8 +20,8 @@ pub mod leads;
 pub mod outcomes;
 pub mod pacing;
 pub use attempts::{
-    Applied, AttemptBrief, AttemptError, AttemptRow, AttemptView, ClaimRequest, ClaimedAttempt,
-    LeadUpdate, LiveAttempt, Owner, PgAttemptRepo, RoomAttempt, SettleInput,
+    Applied, AttemptBrief, AttemptError, AttemptRow, AttemptView, Claim, ClaimRequest,
+    ClaimedAttempt, LeadUpdate, LiveAttempt, Owner, PgAttemptRepo, RoomAttempt, SettleInput,
 };
 pub use breaker::PgBreakerStore;
 pub use clock::PgClock;
@@ -31,8 +31,8 @@ pub use leads::PgLeadRepo;
 pub use outcomes::{OutcomeError, PgOutcomeRepo, Recorded, Session};
 pub use pacing::{Listed, PaceClaim, PacingError, PgPacingRepo, PoolView, Recent, Trip};
 
-use ad_campaign::repo::{CampaignRepo, NewCampaign, RepoError};
-use ad_campaign::{Campaign, CampaignState, Counters, Transition, TransitionError};
+use ad_campaign::repo::{CampaignChange, CampaignRepo, NewCampaign, RepoError};
+use ad_campaign::{Campaign, CampaignState, Counters, Retry, Transition, TransitionError};
 use ad_core::{CampaignId, OrgId};
 use ad_events::CampaignEvent;
 
@@ -282,25 +282,38 @@ fn row_to_campaign(row: &PgRow) -> Result<Campaign, RepoError> {
             .try_get::<i32, _>("concurrency_cap")
             .map_err(to_repo_err)? as u32,
         agent: row.try_get("agent").map_err(to_repo_err)?,
+        retry: retry_of(row.try_get("retry").map_err(to_repo_err)?)?,
         created_at,
         updated_at,
     })
 }
 
+/// The stored retry settings. Settings that do not read are a storage error.
+pub(crate) fn retry_of(stored: serde_json::Value) -> Result<Retry, RepoError> {
+    serde_json::from_value(stored)
+        .map_err(|e| RepoError::Storage(format!("campaign retry settings do not read: {e}")))
+}
+
 const SELECT_COLS: &str = "id, org_id, name, state, total_rows, processed_rows, failed_rows, \
-     concurrency_cap, agent, created_at, updated_at";
+     concurrency_cap, agent, retry, created_at, updated_at";
 
 impl CampaignRepo for PgCampaignRepo {
     async fn create(&self, new: NewCampaign) -> Result<Campaign, RepoError> {
         let sql = format!(
-            "INSERT INTO campaigns (org_id, name, concurrency_cap, agent) VALUES ($1, $2, $3, $4) \
-             RETURNING {SELECT_COLS}"
+            "INSERT INTO campaigns (org_id, name, concurrency_cap, agent, retry) \
+             VALUES ($1, $2, $3, $4, COALESCE($5, '{{}}'::jsonb)) RETURNING {SELECT_COLS}"
         );
+        if let Some(retry) = &new.retry {
+            Retry::default()
+                .changed(retry)
+                .map_err(|e| RepoError::Storage(e.to_string()))?;
+        }
         let row = sqlx::query(&sql)
             .bind(new.org_id.0)
             .bind(&new.name)
             .bind(new.concurrency_cap as i32)
             .bind(&new.agent)
+            .bind(&new.retry)
             .fetch_one(&self.pool)
             .await
             .map_err(to_repo_err)?;
@@ -334,7 +347,7 @@ impl CampaignRepo for PgCampaignRepo {
         let sql = format!(
             "UPDATE campaigns SET name = $2, state = $3, total_rows = $4, \
              processed_rows = $5, failed_rows = $6, updated_at = $7, concurrency_cap = $8, \
-             agent = $9 \
+             agent = $9, retry = $10 \
              WHERE id = $1 RETURNING {SELECT_COLS}"
         );
         let row = sqlx::query(&sql)
@@ -347,6 +360,10 @@ impl CampaignRepo for PgCampaignRepo {
             .bind(campaign.updated_at)
             .bind(campaign.concurrency_cap as i32)
             .bind(&campaign.agent)
+            .bind(
+                serde_json::to_value(campaign.retry)
+                    .map_err(|e| RepoError::Storage(e.to_string()))?,
+            )
             .fetch_optional(&self.pool)
             .await
             .map_err(to_repo_err)?;
@@ -354,5 +371,48 @@ impl CampaignRepo for PgCampaignRepo {
             Some(r) => row_to_campaign(&r),
             None => Err(RepoError::NotFound(campaign.id)),
         }
+    }
+
+    async fn update(
+        &self,
+        id: CampaignId,
+        change: CampaignChange,
+        now: DateTime<Utc>,
+    ) -> Result<Campaign, RepoError> {
+        if let Some(retry) = &change.retry {
+            Retry::default()
+                .changed(retry)
+                .map_err(|e| RepoError::Storage(e.to_string()))?;
+        }
+        // Each retry setting has its own range, so a merge of checked keys
+        // stays in range. The merge in SQL keeps a concurrent change of other
+        // keys.
+        let sql = format!(
+            "UPDATE campaigns SET name = COALESCE($2, name), \
+             concurrency_cap = COALESCE($3, concurrency_cap), agent = COALESCE($4, agent), \
+             retry = retry || COALESCE($5, '{{}}'::jsonb), updated_at = $6 \
+             WHERE id = $1 RETURNING {SELECT_COLS}"
+        );
+        let mut tx = self.pool.begin().await.map_err(to_repo_err)?;
+        let row = sqlx::query(&sql)
+            .bind(id.0)
+            .bind(&change.name)
+            .bind(change.concurrency_cap.map(|c| c as i32))
+            .bind(&change.agent)
+            .bind(&change.retry)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(to_repo_err)?
+            .ok_or(RepoError::NotFound(id))?;
+        let saved = row_to_campaign(&row)?;
+        events::publish_in(
+            &mut tx,
+            &[CampaignEvent::SettingsChanged { campaign_id: id.0 }],
+        )
+        .await
+        .map_err(to_repo_err)?;
+        tx.commit().await.map_err(to_repo_err)?;
+        Ok(saved)
     }
 }

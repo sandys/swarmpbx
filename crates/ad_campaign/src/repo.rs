@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ad_core::{CampaignId, OrgId};
+use chrono::{DateTime, Utc};
 
 use crate::Campaign;
 
@@ -27,6 +28,43 @@ pub struct NewCampaign {
     pub name: String,
     pub concurrency_cap: u32,
     pub agent: Option<serde_json::Value>,
+    /// The retry settings that differ from the defaults: a JSON object that
+    /// `Retry::changed` accepts.
+    pub retry: Option<serde_json::Value>,
+}
+
+/// The settings that a caller can change after the create. `None` keeps the
+/// value. The state does not change here: use a transition.
+#[derive(Debug, Clone, Default)]
+pub struct CampaignChange {
+    pub name: Option<String>,
+    pub concurrency_cap: Option<u32>,
+    pub agent: Option<serde_json::Value>,
+    /// The retry settings to replace: a JSON object that `Retry::changed`
+    /// accepts. The other retry settings keep their values.
+    pub retry: Option<serde_json::Value>,
+}
+
+impl CampaignChange {
+    pub fn apply_to(&self, campaign: &mut Campaign, now: DateTime<Utc>) {
+        if let Some(name) = &self.name {
+            campaign.name = name.clone();
+        }
+        if let Some(cap) = self.concurrency_cap {
+            campaign.concurrency_cap = cap;
+        }
+        if let Some(agent) = &self.agent {
+            campaign.agent = Some(agent.clone());
+        }
+        if let Some(retry) = self
+            .retry
+            .as_ref()
+            .and_then(|r| campaign.retry.changed(r).ok())
+        {
+            campaign.retry = retry;
+        }
+        campaign.updated_at = now;
+    }
 }
 
 /// The persistence boundary. Native `async fn` in trait (Rust >= 1.75).
@@ -50,6 +88,15 @@ pub trait CampaignRepo: Send + Sync {
     fn save(
         &self,
         campaign: Campaign,
+    ) -> impl std::future::Future<Output = Result<Campaign, RepoError>> + Send;
+
+    /// Change only the given settings. A concurrent write of the state or the
+    /// counters stays.
+    fn update(
+        &self,
+        id: CampaignId,
+        change: CampaignChange,
+        now: DateTime<Utc>,
     ) -> impl std::future::Future<Output = Result<Campaign, RepoError>> + Send;
 }
 
@@ -83,6 +130,12 @@ impl CampaignRepo for InMemoryCampaignRepo {
         let mut campaign = Campaign::new(id, new.org_id, new.name, now);
         campaign.concurrency_cap = new.concurrency_cap;
         campaign.agent = new.agent;
+        if let Some(retry) = &new.retry {
+            campaign.retry = campaign
+                .retry
+                .changed(retry)
+                .map_err(|e| RepoError::Storage(e.to_string()))?;
+        }
         inner.by_id.insert(id.0, campaign.clone());
         Ok(campaign)
     }
@@ -126,6 +179,21 @@ impl CampaignRepo for InMemoryCampaignRepo {
         inner.by_id.insert(campaign.id.0, campaign.clone());
         Ok(campaign)
     }
+
+    async fn update(
+        &self,
+        id: CampaignId,
+        change: CampaignChange,
+        now: DateTime<Utc>,
+    ) -> Result<Campaign, RepoError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| RepoError::Storage(e.to_string()))?;
+        let campaign = inner.by_id.get_mut(&id.0).ok_or(RepoError::NotFound(id))?;
+        change.apply_to(campaign, now);
+        Ok(campaign.clone())
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +209,7 @@ mod tests {
                 name: "camp".into(),
                 concurrency_cap: 10,
                 agent: None,
+                retry: None,
             })
             .await
             .unwrap();

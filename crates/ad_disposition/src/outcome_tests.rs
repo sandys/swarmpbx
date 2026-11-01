@@ -26,6 +26,16 @@ fn ny() -> Option<&'static str> {
     Some("America/New_York")
 }
 
+/// The check with the default callback floor of a campaign.
+fn check(
+    report: &Report,
+    catalog: &Catalog,
+    lead_zone: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<AgentOutcome, Rejection> {
+    super::check(report, catalog, lead_zone, now, Duration::seconds(60))
+}
+
 #[test]
 fn a_system_code_passes_with_its_flags() {
     let o = check(&report("SALE"), &Catalog::default(), ny(), now()).unwrap();
@@ -209,12 +219,20 @@ fn callback_rules() {
     // In the past, and more than 90 days ahead.
     assert_eq!(
         check(&cb("2026-02-28T09:30"), &cat, ny(), now()),
-        Err(Rejection::CallbackRange)
+        Err(Rejection::CallbackRange(60))
     );
     assert_eq!(
         check(&cb("2026-06-30T09:30"), &cat, ny(), now()),
-        Err(Rejection::CallbackRange)
+        Err(Rejection::CallbackRange(60))
     );
+    // The campaign's floor: 10:00 in New York is 15:00 UTC, so 10:00:30 is
+    // 30 s after now.
+    let soon = cb("2026-03-01T10:00:30");
+    assert_eq!(
+        super::check(&soon, &cat, ny(), now(), Duration::seconds(31)),
+        Err(Rejection::CallbackRange(31))
+    );
+    assert!(super::check(&soon, &cat, ny(), now(), Duration::seconds(30)).is_ok());
     let zone = Report {
         callback: callback_at("2026-03-02T09:30", Some("Mars/Base")),
         ..report("CALLBK")

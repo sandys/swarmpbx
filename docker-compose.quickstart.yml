@@ -1,8 +1,9 @@
 # The quickstart stack (README.md): place calls through a SIP trunk.
 #
 # One agentdialer node carries the calls itself (SIP and RTP) behind Kamailio,
-# LiveKit runs the call rooms, and a demo agent joins each call (it plays a
-# tone and leaves after DEMO_AGENT_MAX_CALL_S). Every service is a normal
+# LiveKit runs the call rooms, and a demo agent joins each call: the LiveKit
+# agent `demo` or the pipecat bot. A demo agent plays a tone and leaves after
+# DEMO_AGENT_MAX_CALL_S, or after the lead's "talk_s". Every service is a normal
 # container on a bridge network: no host networking. The node reaches the
 # trunk through Docker's NAT; the far end sends the audio back to the address
 # that the audio comes from.
@@ -15,7 +16,8 @@
 # Twilio Elastic SIP Trunking (README.md, "Call through Twilio"):
 #   e2e/twilio/run.sh setup          # once: the trunk, its credentials, .env.twilio
 #   docker compose -f docker-compose.quickstart.yml --env-file .env.twilio up -d --build
-# Then create a campaign, load leads, and start it with scripts/api.sh.
+# Then run a recipe of examples/ (the API through Python), for example:
+#   docker compose -f docker-compose.quickstart.yml ... run --rm examples first_call.py
 #
 # e2e/run_lkcloud_e2e.sh and e2e/run_twilio_e2e.sh run these steps as tests.
 name: agentdialer-quickstart
@@ -71,6 +73,36 @@ services:
       AGENT_NAME: demo
       STATS_PORT: "8088"
       MAX_CALL_S: "${DEMO_AGENT_MAX_CALL_S:-30}"
+
+  # A demo pipecat bot (e2e/agents/pipecat). A campaign uses it with
+  # {"runtime": "pipecat", "start_url": "http://pipecat-bot:8089/start"}.
+  pipecat-bot:
+    build:
+      context: e2e/agents/pipecat
+      additional_contexts:
+        proto: proto
+        session: e2e/agents/session
+    image: ad-e2e-pipecat-bot
+    environment:
+      PORT: "8089"
+      MAX_CALL_S: "${DEMO_AGENT_MAX_CALL_S:-30}"
+
+  # The recipes and the API client (examples/). They use the API only. The
+  # profile keeps the service out of `up`; `run` starts it:
+  #   docker compose ... run --rm examples first_call.py
+  examples:
+    image: python:3.12-slim
+    profiles: [tools]
+    working_dir: /examples
+    entrypoint: ["python"]
+    volumes:
+      - ./examples:/examples:ro
+    environment:
+      AD_API_URL: http://api:8080
+      # The number of the recipes' leads (or give --to <number>).
+      QUICKSTART_NUMBER: ${QUICKSTART_NUMBER:-${LKCLOUD_NUMBER:-}}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
 
   # The SIP edge: the node sends its INVITEs here; Kamailio stays on each
   # call's path (Record-Route) and carries no audio.
@@ -139,4 +171,5 @@ services:
       - AD_SESSION_URL=${AD_SESSION_URL:-http://api:9090}
       - AD_ROOM_PREFIX=call
       - AD_NODE_CAPACITY=10
+      - AD_REPAIR_SWEEP_MS=${AD_REPAIR_SWEEP_MS:-10000}
       - RUST_LOG=info

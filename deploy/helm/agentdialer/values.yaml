@@ -67,7 +67,7 @@ orchestrator:
   replicas: 2
   batchLimit: 20            # AD_BATCH_LIMIT: leads claimed per claim (within the free capacity)
   callsPerSec: 10           # AD_CALLS_PER_SEC: call starts per second (calls run at the same time)
-  retrySweepMs: 1000        # AD_RETRY_SWEEP_MS: interval of the sweep that dials due leads
+  repairSweepMs: 10000      # AD_REPAIR_SWEEP_MS: interval of the leader's repair sweep (due leads dial at their time)
   eventSweepMs: 2000        # AD_EVENT_SWEEP_MS: max wait before the event table is read again
   attemptCheckMs: 15000     # AD_ATTEMPT_CHECK_MS: interval of the check of live calls against LiveKit
   resources: {}

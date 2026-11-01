@@ -2,11 +2,13 @@
 //! result on the lead (`next_eligible_at`) in the same transaction as the call
 //! outcome, so a retry survives a restart and never depends on an event.
 
+use ad_campaign::Retry;
 use ad_events::RetryReason;
 use chrono::{DateTime, Duration, Utc};
 
 /// Retry timing policy. The interval depends on why the call failed, matching
-/// VICIdial per-status retry rules.
+/// VICIdial per-status retry rules. The waits and the call limit are the
+/// campaign's settings (`ad_campaign::Retry`).
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     pub busy: Duration,
@@ -25,22 +27,27 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        // Minutes-scale defaults; tune per campaign later.
-        RetryPolicy {
-            busy: Duration::minutes(5),
-            no_answer: Duration::minutes(30),
-            voicemail: Duration::minutes(60),
-            failed: Duration::minutes(15),
-            error: Duration::minutes(15),
-            abandoned: Duration::minutes(15),
-            window_recheck: Duration::minutes(15),
-            agent_recheck: Duration::minutes(1),
-            max_attempts: 3,
-        }
+        Self::of(&Retry::default())
     }
 }
 
 impl RetryPolicy {
+    /// The policy of a campaign with these retry settings.
+    pub fn of(retry: &Retry) -> Self {
+        let s = |secs: u32| Duration::seconds(secs.into());
+        RetryPolicy {
+            busy: s(retry.busy_s),
+            no_answer: s(retry.no_answer_s),
+            voicemail: s(retry.voicemail_s),
+            failed: s(retry.failed_s),
+            error: s(retry.error_s),
+            abandoned: s(retry.abandoned_s),
+            window_recheck: Duration::minutes(15),
+            agent_recheck: Duration::minutes(1),
+            max_attempts: retry.max_calls,
+        }
+    }
+
     pub fn interval(&self, reason: RetryReason) -> Duration {
         match reason {
             RetryReason::Busy => self.busy,
@@ -108,6 +115,29 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_campaign_settings_set_the_waits_and_the_cap() {
+        let retry = Retry {
+            busy_s: 7,
+            no_answer_s: 11,
+            max_calls: 2,
+            ..Retry::default()
+        };
+        let p = RetryPolicy::of(&retry);
+        assert_eq!(
+            retry_decision(RetryReason::Busy, 1, &p, now()),
+            RetryDecision::RetryAt(now() + Duration::seconds(7))
+        );
+        assert_eq!(
+            retry_decision(RetryReason::NoAnswer, 1, &p, now()),
+            RetryDecision::RetryAt(now() + Duration::seconds(11))
+        );
+        assert_eq!(
+            retry_decision(RetryReason::Busy, 2, &p, now()),
+            RetryDecision::Exhausted
+        );
     }
 
     #[test]

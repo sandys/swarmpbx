@@ -5,7 +5,9 @@
 //! tests and local runs with no database; `Pg` backs a configured Postgres.
 //! Both arms call the same `CampaignRepo` implementation.
 
-use ad_campaign::repo::{CampaignRepo, InMemoryCampaignRepo, NewCampaign, RepoError};
+use ad_campaign::repo::{
+    CampaignChange, CampaignRepo, InMemoryCampaignRepo, NewCampaign, RepoError,
+};
 use ad_campaign::{Campaign, Transition, TransitionError};
 use ad_core::{CampaignId, LeadId, OrgId};
 use ad_db::PgCampaignRepo;
@@ -50,6 +52,18 @@ impl CampaignStore {
         match self {
             CampaignStore::InMemory(r) => r.save(campaign).await,
             CampaignStore::Pg(r) => r.save(campaign).await,
+        }
+    }
+
+    pub async fn update(
+        &self,
+        id: CampaignId,
+        change: CampaignChange,
+        now: DateTime<Utc>,
+    ) -> Result<Campaign, RepoError> {
+        match self {
+            CampaignStore::InMemory(r) => r.update(id, change, now).await,
+            CampaignStore::Pg(r) => r.update(id, change, now).await,
         }
     }
 

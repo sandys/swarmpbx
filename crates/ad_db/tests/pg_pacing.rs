@@ -32,6 +32,10 @@ fn pace(pool: &str, mode: Mode) -> PaceClaim {
 
 /// Claim customer first within the pool's window.
 async fn claim(db: &Db, c: CampaignId, p: &PaceClaim) -> Vec<ClaimedAttempt> {
+    claim_all(db, c, p).await.attempts
+}
+
+async fn claim_all(db: &Db, c: CampaignId, p: &PaceClaim) -> ad_db::Claim {
     db.attempts()
         .claim_paced(
             c,
@@ -146,8 +150,15 @@ async fn two_campaigns_of_one_pool_share_one_window() {
     let pool = pool_name(c1);
     first_k(&db, &pool, 2).await;
     let p = pace(&pool, Mode::Adaptive);
-    assert_eq!(claim(&db, c1, &p).await.len(), 2);
-    assert!(claim(&db, c2, &p).await.is_empty(), "the pool is full");
+    let first = claim_all(&db, c1, &p).await;
+    assert_eq!(first.attempts.len(), 2);
+    assert!(
+        first.held_by_pool,
+        "the window, not the leads, stopped the claim"
+    );
+    let held = claim_all(&db, c2, &p).await;
+    assert!(held.attempts.is_empty(), "the pool is full");
+    assert!(held.held_by_pool, "the leader wakes c2 when the pool frees");
     let mut tasks = Vec::new();
     for c in [c1, c2] {
         let (db, p) = (db.clone(), p.clone());

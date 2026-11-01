@@ -56,6 +56,7 @@ fn call(context: &Value) -> CallFacts<'_> {
         room: "campaign-42",
         callee_identity: "sip-attempt-42",
         phone_number: "+15550100",
+        called_count: 0,
         lead_context: context,
         session: None,
     }

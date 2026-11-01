@@ -31,6 +31,7 @@ async fn make_campaign(db: &Db) -> CampaignId {
             name: "lead-test".into(),
             concurrency_cap: 10,
             agent: None,
+            retry: None,
         })
         .await
         .unwrap()
@@ -84,6 +85,24 @@ async fn bulk_create_and_list_scoped_per_campaign() {
         .await
         .unwrap();
     repo.bulk_create(vec![nl(c2, "+2a")]).await.unwrap();
+    // Each load tells the leader, so it dials the new leads at once.
+    for (c, count) in [(c1, 3), (c2, 1)] {
+        let events: Vec<_> = db
+            .events()
+            .page(c.0, 0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, e)| e)
+            .collect();
+        assert_eq!(
+            events,
+            [ad_events::CampaignEvent::LeadsAdded {
+                campaign_id: c.0,
+                count
+            }]
+        );
+    }
 
     assert_eq!(repo.list_by_campaign(c1).await.unwrap().len(), 3);
     assert_eq!(repo.list_by_campaign(c2).await.unwrap().len(), 1);
@@ -128,4 +147,65 @@ async fn unknown_status_in_db_fails_closed() {
         Err(RepoError::Storage(msg)) => assert!(msg.contains("unknown lead status")),
         other => panic!("expected Storage error on unknown status, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn the_next_due_time_is_the_earliest_waiting_lead_of_a_running_campaign() {
+    let Some(db) = db().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let now = chrono::Utc::now();
+    let running = make_campaign(&db).await;
+    for t in [
+        ad_campaign::Transition::Start,
+        ad_campaign::Transition::SyncComplete,
+    ] {
+        db.campaigns()
+            .transition(running, t, now)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let draft = make_campaign(&db).await;
+    let wait = |c: CampaignId, phone: &'static str, status: &'static str, after_s: i64| {
+        let db = db.clone();
+        async move {
+            let lead = db.leads().create(nl(c, phone)).await.unwrap();
+            sqlx::query("UPDATE leads SET status = $2, next_eligible_at = $3 WHERE id = $1")
+                .bind(lead.id.0)
+                .bind(status)
+                .bind(now + chrono::Duration::seconds(after_s))
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    };
+    wait(running, "+1d1", "queued", 600).await;
+    wait(running, "+1d2", "queued", 300).await;
+    // Not waiting, or due already: the claim or nothing takes these.
+    wait(running, "+1d3", "dnc", 60).await;
+    wait(running, "+1d4", "queued", -60).await;
+    wait(draft, "+1d5", "queued", 30).await;
+
+    let due = db.leads().next_due(running, now).await.unwrap().unwrap();
+    assert!(
+        (due - (now + chrono::Duration::seconds(300)))
+            .num_milliseconds()
+            .abs()
+            < 1
+    );
+    let all = db.leads().next_due_running(now).await.unwrap();
+    assert!(all.contains(&(running, due)), "{all:?}");
+    assert!(
+        all.iter().all(|(c, _)| *c != draft),
+        "a campaign that does not run has no due time"
+    );
+    assert_eq!(
+        db.leads()
+            .next_due(running, now + chrono::Duration::seconds(600))
+            .await
+            .unwrap(),
+        None
+    );
 }

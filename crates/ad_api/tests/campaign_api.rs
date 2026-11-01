@@ -232,3 +232,142 @@ async fn the_abandonment_ledger_needs_postgres() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(v["error"].as_str().unwrap().contains("Postgres"));
 }
+
+#[tokio::test]
+async fn patch_changes_only_the_given_settings_in_any_state() {
+    let app = app();
+    let agent = json!({"runtime": "livekit", "agent_name": "a"});
+    let (_, c) = send(
+        app.clone(),
+        "POST",
+        "/v1/campaigns",
+        Some(json!({"org_id": 1, "name": "spring", "concurrency_cap": 2, "agent": agent})),
+    )
+    .await;
+    let id = c["id"].as_i64().unwrap();
+    let uri = format!("/v1/campaigns/{id}");
+    for t in ["start", "sync_complete"] {
+        send(
+            app.clone(),
+            "POST",
+            &format!("{uri}/transition"),
+            Some(json!({"transition": t})),
+        )
+        .await;
+    }
+
+    let (status, v) = send(
+        app.clone(),
+        "PATCH",
+        &uri,
+        Some(json!({"concurrency_cap": 5})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        (&v["name"], &v["concurrency_cap"], &v["agent"], &v["state"]),
+        (&json!("spring"), &json!(5), &agent, &json!("running"))
+    );
+
+    let other =
+        json!({"runtime": "pipecat", "start_url": "http://bot/start", "dial_order": "agent_first"});
+    let (status, v) = send(
+        app.clone(),
+        "PATCH",
+        &uri,
+        Some(json!({"name": "autumn", "agent": other})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        (&v["name"], &v["concurrency_cap"], &v["agent"]),
+        (&json!("autumn"), &json!(5), &other)
+    );
+    let (_, got) = send(app, "GET", &uri, None).await;
+    assert_eq!(got, v);
+}
+
+#[tokio::test]
+async fn retry_settings_have_defaults_and_change_by_key() {
+    let app = app();
+    let (status, c) = send(
+        app.clone(),
+        "POST",
+        "/v1/campaigns",
+        Some(json!({"org_id": 1, "name": "fast", "retry": {"busy_s": 60}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{c}");
+    assert_eq!(
+        c["retry"],
+        json!({"busy_s": 60, "no_answer_s": 1800, "voicemail_s": 3600, "failed_s": 900,
+               "error_s": 900, "abandoned_s": 900, "max_calls": 3, "callback_min_s": 60})
+    );
+    let uri = format!("/v1/campaigns/{}", c["id"]);
+    let (status, v) = send(
+        app.clone(),
+        "PATCH",
+        &uri,
+        Some(json!({"retry": {"max_calls": 5, "callback_min_s": 5}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        (
+            &v["retry"]["busy_s"],
+            &v["retry"]["max_calls"],
+            &v["retry"]["callback_min_s"]
+        ),
+        (&json!(60), &json!(5), &json!(5)),
+        "the other keys keep their values"
+    );
+    for bad in [
+        json!({"retry": {"busy_s": 0}}),
+        json!({"retry": {"max_calls": 101}}),
+        json!({"retry": {"bogus_s": 5}}),
+        json!({"retry": {"busy_s": "5"}}),
+        json!({"retry": 5}),
+    ] {
+        let (status, e) = send(app.clone(), "PATCH", &uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {e}");
+        let mut create = json!({"org_id": 1, "name": "bad"});
+        create["retry"] = bad["retry"].clone();
+        let (status, _) = send(app.clone(), "POST", "/v1/campaigns", Some(create)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "create with {bad}");
+    }
+    let (_, got) = send(app, "GET", &uri, None).await;
+    assert_eq!(got["retry"], v["retry"], "a refused change changed nothing");
+}
+
+#[tokio::test]
+async fn patch_refuses_bad_settings_and_a_missing_campaign() {
+    let app = app();
+    let (_, c) = send(
+        app.clone(),
+        "POST",
+        "/v1/campaigns",
+        Some(json!({"org_id": 1, "name": "spring"})),
+    )
+    .await;
+    let uri = format!("/v1/campaigns/{}", c["id"]);
+    for bad in [
+        json!({"concurrency_cap": 0}),
+        json!({"name": " "}),
+        json!({"agent": {"runtime": "livekit", "agent_name": ""}}),
+        json!({"agent": {"runtime": "pipecat", "start_url": "bot"}}),
+        json!({"cap": 3}),
+    ] {
+        let (status, _) = send(app.clone(), "PATCH", &uri, Some(bad.clone())).await;
+        assert!(status.is_client_error(), "{bad}: {status}");
+        let (_, got) = send(app.clone(), "GET", &uri, None).await;
+        assert_eq!(got, c, "{bad} changed the campaign");
+    }
+    let (status, _) = send(
+        app,
+        "PATCH",
+        "/v1/campaigns/999",
+        Some(json!({"concurrency_cap": 3})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

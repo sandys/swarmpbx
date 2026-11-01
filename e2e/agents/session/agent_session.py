@@ -10,6 +10,7 @@ of the call, it sends one Outcome, and the dialer answers Ack or Rejected.
 The contract is proto/agentdialer/session/v1/session.proto.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import grpc
@@ -101,16 +102,42 @@ class Session:
             await self._channel.close()
 
 
-# The test control of the reference agents: the outcome that they report.
+# The controls of the demo agents, in the lead context. A real agent decides
+# the outcome from the talk; the demo agents take it from the lead.
 DEFAULT_OUTCOME = {"disposition": "DONE", "answered_by": "human"}
 
 
 def planned_outcome(call_facts: dict) -> "dict | None":
     """The lead context's "outcome", else DONE. "outcome": null reports none.
-    A callback {"in_s": N} becomes the UTC time N seconds after now."""
-    context = (call_facts.get("lead") or {}).get("context") or {}
+    The lead API takes only strings, so the outcome can also be its JSON as a
+    string ("null" too). A list gives one outcome for each call to the lead,
+    in order (lead.called_count); the last one repeats. A callback
+    {"in_s": N} becomes the UTC time N seconds after now."""
+    lead = call_facts.get("lead") or {}
+    context = lead.get("context") or {}
     outcome = context.get("outcome", DEFAULT_OUTCOME)
+    if isinstance(outcome, str):
+        outcome = json.loads(outcome)
+    if isinstance(outcome, list):
+        outcome = outcome[min(int(lead.get("called_count", 0)), len(outcome) - 1)] if outcome else None
     if outcome and "in_s" in outcome.get("callback", {}):
         at = datetime.now(timezone.utc) + timedelta(seconds=outcome["callback"]["in_s"])
-        outcome = {**outcome, "callback": {"local_time": at.strftime("%Y-%m-%dT%H:%M"), "zone": "UTC"}}
+        outcome = {**outcome, "callback": {"local_time": at.strftime("%Y-%m-%dT%H:%M:%S"), "zone": "UTC"}}
     return outcome
+
+
+def talk_seconds(call_facts: dict, default: float) -> float:
+    """The lead context's "talk_s": the agent leaves the call this many
+    seconds after the callee is in the room (0: it stays until the callee
+    leaves). Else `default`."""
+    context = (call_facts.get("lead") or {}).get("context") or {}
+    return float(context.get("talk_s", default))
+
+
+def leave_after_seconds(call_facts: dict) -> float:
+    """The lead context's "leave_after_s": the agent leaves this many seconds
+    after it joins, also when the callee is not there yet (0: no limit). A
+    test of an agent that leaves during the dial uses it."""
+    context = (call_facts.get("lead") or {}).get("context") or {}
+    return float(context.get("leave_after_s", 0))
+

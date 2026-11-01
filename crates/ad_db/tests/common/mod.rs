@@ -45,6 +45,7 @@ pub async fn campaign(db: &Db, cap: u32) -> CampaignId {
             name: "test".into(),
             concurrency_cap: cap,
             agent: None,
+            retry: None,
         })
         .await
         .unwrap()
